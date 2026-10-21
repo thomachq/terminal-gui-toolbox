@@ -1,0 +1,4 @@
+# 开发 / 打包依赖
+-r requirements.txt
+pillow>=10.0        # 截图比对（_shots.py / _texe.py）与图标生成（_mkicon.py）
+pyinstaller>=6.0    # 打包单文件 exe（toolbox.spec）

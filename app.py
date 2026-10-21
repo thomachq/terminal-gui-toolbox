@@ -1,0 +1,2093 @@
+# -*- coding: utf-8 -*-
+"""Terminal GUI Toolbox —— 主程序。
+
+多协议终端工具箱：SSH / Telnet / 本机，连接后自动探测操作系统，
+底部状态栏实时显示 CPU / 内存 / 网络 / 运行时长，命令日志是可分离的侧边栏。
+
+模块：
+  · 连接与设备    —— 会话、探测、系统概览
+  · 网络工具      —— ping / 路由追踪 / 端口 / 接口 / 路由表（表格化）
+  · 系统信息      —— 版本、负载、磁盘、进程（表格化）
+  · 路由表        —— 读 + 增删
+  · 防火墙        —— nftables / iptables / netsh / pf / ipfw 读 + 增删
+  · Docker        —— 容器 / 镜像 / 资源占用，未安装时明确提示
+  · VPN 证书      —— 群晖 OpenVPN 证书控制台（独立窗口形态）
+  · 智能体接入    —— 本地 HTTP API，给 AI 智能体保持 SSH 连接
+"""
+from __future__ import annotations
+
+import json
+import queue
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+import crypto_store
+import lockmgr
+import wbtui as U
+from api.server import make_default as make_api
+from core import parsers, routes
+from core import redact
+from core.detect import DeviceInfo, capabilities, detect, dialect_for
+from core.metrics import (Sampler, human_bytes, human_gb, human_rate,
+                          human_uptime)
+from core.session import (ConnSpec, LocalSession, SSHSession, SessionError,
+                          open_session)
+from pages.api_page import ApiPage
+from pages.docker_page import DockerPage
+from pages.files_page import FilesPage
+from pages.firewall_page import FirewallPage
+from pages.routes_page import RoutesPage
+from profiles import ProfileStore, discover_keys, inspect_key, norm_path
+from ui import forms
+from ui.icon import apply_icon, set_app_id
+from ui.logpanel import LogModel, LogPanel
+from ui.statusbar import StatusBar
+from ui.table import KVGrid, Column, DataTable, Segmented
+from ui.tray import Tray
+
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+SAMPLE_MS = 3000
+
+
+def _asset(name: str) -> Path:
+    """找资源文件：优先 exe 同级的 assets\\，其次一行打包时解压出来的临时目录。
+
+    onefile 模式下 datas 会解到 sys._MEIPASS，如果用户只拷了 exe 却没带
+    assets\\ 目录，图标不该跟着消失 —— 所以这里做两级兜底。
+    """
+    local = APP_DIR / "assets" / name
+    if local.is_file():
+        return local
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bundled = Path(meipass) / "assets" / name
+        if bundled.is_file():
+            return bundled
+    return local
+
+
+ICON_ICO = _asset("app.ico")
+
+APP_NAME = "Terminal GUI Toolbox"
+APP_SUB = "多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 实时性能 · 路由 / 防火墙 / Docker"
+
+
+SYS_COLS = {
+    "disk": [Column("fs", "文件系统 / 卷", 200, mono=True, stretch=True),
+             Column("total", "总容量", 100, anchor="e",
+                    format=lambda v, r: human_bytes(v or 0)),
+             Column("used", "已用", 100, anchor="e",
+                    format=lambda v, r: human_bytes(v or 0)),
+             Column("free", "可用", 100, anchor="e",
+                    format=lambda v, r: human_bytes(v or 0)),
+             Column("use_pct", "使用率", 90, anchor="e",
+                    format=lambda v, r: f"{v}%"),
+             Column("mount", "挂载点", 180, stretch=True)],
+    "proc": [Column("pid", "PID", 80, anchor="e"),
+             Column("comm", "进程", 220, stretch=True),
+             Column("cpu", "CPU %", 80, anchor="e",
+                    format=lambda v, r: f"{float(v or 0):.1f}"),
+             Column("mem", "内存 %", 80, anchor="e",
+                    format=lambda v, r: f"{float(v or 0):.1f}"),
+             Column("ppid", "父 PID", 80, anchor="e")],
+    # Windows 的 Get-Process 给的是「累计 CPU 秒」和「工作集字节」，不是百分比，
+    # 列名必须跟着改，否则会让人以为某个进程占了 3000% CPU。
+    "proc_win": [Column("pid", "PID", 80, anchor="e"),
+                 Column("comm", "进程", 220, stretch=True),
+                 Column("cpu_sec", "CPU 时间 (秒)", 120, anchor="e",
+                        format=lambda v, r: f"{float(v or 0):.1f}"),
+                 Column("mem_mb", "内存 (MB)", 120, anchor="e",
+                        format=lambda v, r: f"{float(v or 0):.1f}")],
+}
+
+TOOL_COLS = {
+    "ip": [Column("iface", "接口", 130), Column("cidr", "地址 / 掩码", 190, mono=True),
+           Column("scope", "作用域", 96), Column("mac", "MAC", 150, mono=True),
+           Column("state", "状态", 78)],
+    "route": [Column("dst", "目标网段", 170, mono=True, stretch=True),
+              Column("gateway", "网关", 140, mono=True),
+              Column("dev", "接口", 120),
+              Column("metric", "跃点", 64, anchor="center"),
+              Column("kind", "类型", 70)],
+    "ports": [Column("proto", "协议", 70, mono=True),
+              Column("addr", "监听地址", 130, mono=True),
+              Column("port", "端口", 80, mono=True, anchor="e"),
+              Column("proc", "进程 / PID", 150),
+              Column("state", "状态", 80)],
+    "dns": [Column("kind", "类型", 130), Column("value", "值", 320, mono=True,
+                                                 stretch=True)],
+    "ping": [Column("seq", "序号", 70, anchor="center"),
+             Column("rtt", "往返 (ms)", 110, anchor="e"),
+             Column("note", "结果", 200)],
+    "trace": [Column("hop", "跳", 60, anchor="center"),
+              Column("host", "节点", 190, mono=True),
+              Column("rtt", "RTT (ms)", 200, mono=True),
+              Column("raw", "原始", 240, stretch=True)],
+}
+
+
+class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        self.geometry(f"{U.px(1360)}x{U.px(880)}")
+        self.minsize(U.px(1150), U.px(720))
+        self.configure(bg=U.T.page)
+
+        # ---- 状态
+        self.session = None
+        self.device = DeviceInfo()
+        self.dialect = None
+        self.sampler: Sampler | None = None
+        self.log_model = LogModel()
+        self.q: queue.Queue = queue.Queue()
+        self._pages: dict[str, tk.Frame] = {}
+        self._log_panel: LogPanel | None = None
+        self._log_win: tk.Toplevel | None = None
+        self._log_visible = True
+        self._keypw_job = None
+        self._lock_overlay = None
+        self._last_active = time.time()
+        self._sampling = False
+        self._local_dev: DeviceInfo | None = None
+        self._toast_job = None
+        self._tray: Tray | None = None
+        self._close_to_tray = True
+        self._dk_probed = False
+        self._routes_loaded = False
+        self._fw_probed = False
+        self._api_inited = False
+        self._vpn_booted = False
+        self._term: tk.Toplevel | None = None
+        self._term_cwd_val = ""
+
+        # ---- 机密与档案
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        crypto_store.set_key_dir(DATA_DIR)
+        self.settings = lockmgr.Settings(DATA_DIR / "settings.json")
+        self.lock = lockmgr.LockManager(self.settings)
+        self.profiles = ProfileStore(DATA_DIR / "profiles.dat")
+
+        # ---- 本地 API（智能体接入）
+        self.api_cfg, self.api_pool, self.api_server = make_api(
+            DATA_DIR, on_log=self._api_event)
+
+        # ---- 图标 / 任务栏身份
+        set_app_id("TerminalToolbox.App.1")
+        apply_icon(self, ICON_ICO)
+
+        U.configure_ttk(self)
+        self._header()
+        self._body()
+        self._statusbar()
+        self.after(80, self._drain)
+        self._load_last_profile()
+        self._watch_activity()
+        self._start_sampler()
+        self._init_tray()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._maybe_lock_on_start()
+        self.after(600, self._boot_api)
+
+    # ============================================================ 骨架
+    def _header(self):
+        bar = U.wframe(self, "page")
+        bar.pack(fill="x", padx=U.px(18), pady=(U.px(14), U.px(8)))
+
+        left = U.wframe(bar, "page")
+        left.pack(side="left")
+        U.wlabel(left, APP_NAME, "page", U.FONT_H).pack(anchor="w")
+        U.wlabel(left, APP_SUB, "pagedim", U.FONT_S).pack(anchor="w", pady=(2, 0))
+
+        right = U.wframe(bar, "page")
+        right.pack(side="right")
+        self.btn_lock = U.RoundButton(right, self._lock_btn_text(), self._lock_dialog,
+                                      variant="ghost", font=U.FONT_S, height=28, padx=12)
+        self.btn_lock.pack(side="right", padx=(U.px(8), 0))
+        self.btn_theme = U.RoundButton(right, "浅色" if U.T.name == "dark" else "深色",
+                                       self._toggle_theme, variant="ghost",
+                                       font=U.FONT_S, height=28, padx=12)
+        self.btn_theme.pack(side="right", padx=(U.px(8), 0))
+        self.btn_term = U.RoundButton(right, "终端", self.open_terminal,
+                                      variant="secondary", font=U.FONT_S,
+                                      height=28, padx=12)
+        self.btn_term.pack(side="right", padx=(U.px(8), 0))
+        self.pill_dev = U.Pill(right, "未连接", "mute")
+        self.pill_dev.pack(side="right", padx=U.px(5))
+        self.pill_proto = U.Pill(right, "—", "mute")
+        self.pill_proto.pack(side="right", padx=U.px(5))
+
+    def _body(self):
+        body = U.wframe(self, "page")
+        body.pack(fill="both", expand=True, padx=U.px(10))
+        body.pack_propagate(False)
+
+        self.nav = U.Nav(body, [
+            ("conn", "连接与设备"),
+            ("tools", "网络工具"),
+            ("sys", "系统信息"),
+            ("files", "文件管理"),
+            ("routes", "路由表"),
+            ("fw", "防火墙"),
+            ("docker", "Docker"),
+            ("vpn", "VPN 证书"),
+            ("api", "智能体接入"),
+        ], on_change=self._show, width=176)
+        self.nav.pack(side="left", fill="y", padx=(U.px(6), 0), pady=(U.px(2), U.px(8)))
+
+        # 内容 + 日志 的分隔容器（可拖拽）
+        self.paned = tk.PanedWindow(body, orient="horizontal", bg=U.T.page,
+                                    bd=0, sashwidth=U.px(6), sashrelief="flat",
+                                    showhandle=False)
+        self.paned.pack(side="left", fill="both", expand=True,
+                        padx=(U.px(6), U.px(8)), pady=(U.px(2), U.px(8)))
+
+        self.stack = U.wframe(self.paned, "page")
+        self.stack.grid_propagate(False)
+        self.stack.rowconfigure(0, weight=1)
+        self.stack.columnconfigure(0, weight=1)
+        self.paned.add(self.stack, stretch="always", minsize=U.px(620))
+
+        for key, builder in (("conn", self._build_conn),
+                             ("tools", self._build_tools),
+                             ("sys", self._build_sys),
+                             ("files", self.build_files),
+                             ("routes", self.build_routes),
+                             ("fw", self.build_fw),
+                             ("docker", self.build_docker),
+                             ("vpn", self._build_vpn),
+                             ("api", self.build_api)):
+            page = U.wframe(self.stack, "page")
+            page.grid(row=0, column=0, sticky="nsew")
+            self._pages[key] = page
+            builder(page)
+
+        # 日志 dock
+        self.log_dock = U.wframe(self.paned, "page")
+        self.paned.add(self.log_dock, stretch="never", minsize=U.px(320))
+        self._mount_log(self.log_dock)
+        self.after(180, self._init_sash)
+        # 所有页都 grid 在同一格，后建的在最上层 —— 必须显式选一页。
+        # 但命令行 --page 已经选过的话就别覆盖（否则截图/调试永远停在第一页）。
+        self.after(20, self._ensure_first_page)
+
+    def _ensure_first_page(self) -> None:
+        if not getattr(self.nav, "current", None):
+            self.nav.select("conn")
+
+    def _init_sash(self) -> None:
+        """给日志侧边栏一个合理的初始宽度（约 1/3），别一开窗就半屏黑。"""
+        try:
+            total = self.paned.winfo_width()
+            if total > U.px(700):
+                self.paned.sash_place(0, int(total * 0.64), 0)
+        except tk.TclError:
+            pass
+
+    def _mount_log(self, parent) -> None:
+        if self._log_panel is not None:
+            self._log_panel.destroy()
+        self._log_panel = LogPanel(
+            parent, self.log_model, floating=(parent is not self.log_dock),
+            on_float=self._float_log, on_dock=self._dock_log)
+        self._log_panel.pack(fill="both", expand=True)
+
+    def _float_log(self) -> None:
+        """分离成独立窗口，可拖到第二块屏。"""
+        if self._log_win is not None:
+            return
+        win = tk.Toplevel(self)
+        win.title("命令日志 — Terminal GUI Toolbox")
+        win.geometry(f"{U.px(760)}x{U.px(460)}+{U.px(120)}+{U.px(120)}")
+        win.configure(bg=U.T.card)
+        self._log_win = win
+        self._log_panel.destroy()
+        self._log_panel = LogPanel(win, self.log_model, floating=True,
+                                   on_dock=self._dock_log,
+                                   on_close=self._dock_log)
+        self._log_panel.pack(fill="both", expand=True)
+        win.protocol("WM_DELETE_WINDOW", self._dock_log)
+        # 分离后把 dock 从分隔器里拿掉，内容区自动占满
+        try:
+            self.paned.forget(self.log_dock)
+        except tk.TclError:
+            pass
+        self._log_visible = False
+        self.status.set_state("日志已分离为独立窗口", "ok")
+
+    def _docked(self) -> bool:
+        """日志侧边栏当前是否停在分隔器里。
+
+        注意：`PanedWindow.panes()` 在 Tk 8.6 返回字符串路径，在 Tk 9 返回
+        `Tcl_Obj`，`str(pane) in panes()` 在 9 上恒为 False —— 必须两边都转字符串。
+        """
+        try:
+            return str(self.log_dock) in [str(p) for p in self.paned.panes()]
+        except tk.TclError:
+            return False
+
+    def _dock_log(self) -> None:
+        if self._log_win is not None:
+            try:
+                self._log_win.destroy()
+            except tk.TclError:
+                pass
+            self._log_win = None
+        if not self._docked():
+            self.paned.add(self.log_dock, stretch="never", minsize=U.px(320))
+        self._log_visible = True
+        self._mount_log(self.log_dock)
+        self.status.set_state("日志已归位", "ok")
+
+    def _toggle_log(self, show: bool | None = None) -> None:
+        want = (not self._log_visible) if show is None else show
+        if want:
+            if self._log_win is None and not self._docked():
+                self.paned.add(self.log_dock, stretch="never", minsize=U.px(320))
+                self._mount_log(self.log_dock)
+            self._log_visible = True
+        else:
+            if self._log_win is None and self._docked():
+                try:
+                    self.paned.forget(self.log_dock)
+                except tk.TclError:
+                    pass
+            self._log_visible = False
+        self.status.set_state("日志已展开" if want else "日志已折叠")
+
+    def _statusbar(self):
+        bar = U.wframe(self, "page")
+        bar.pack(fill="x", padx=U.px(10), pady=(0, U.px(8)))
+        self.status = StatusBar(bar, on_fold=lambda: self._toggle_log(False),
+                                on_unfold=lambda: self._toggle_log(True),
+                                on_disconnect=self._disconnect)
+        self.status.pack(fill="x")
+
+    def _show(self, key: str):
+        for k, page in self._pages.items():
+            if k == key:
+                page.tkraise()
+        # 页面懒加载：连上设备后再探测，免得开局就对着本机乱跑
+        if key == "docker" and not self._dk_probed:
+            self._dk_probed = True
+            self.after(200, self.docker_probe)
+        elif key == "api":
+            self.after(80, self.api_refresh)
+        elif key == "files":
+            self.after(120, self.files_sync)
+        elif key == "vpn":
+            self.after(150, self._vpn_boot)
+        # 没连设备时也照样读 —— 和 Docker 一致，按本机读，别让页面空着
+        elif key == "routes" and not self._routes_loaded:
+            self._routes_loaded = True
+            self.after(200, self.routes_refresh)
+        elif key == "fw" and not self._fw_probed:
+            self._fw_probed = True
+            self.after(200, self.fw_probe)
+
+    # ============================================================ 托盘
+    def _refresh_current_page(self) -> None:
+        """连上/断开设备后，把当前页的数据按新设备重取一遍。"""
+        key = getattr(self.nav, "current", None)
+        if key == "routes" and self.session:
+            self._routes_loaded = True
+            self.after(150, self.routes_refresh)
+        elif key == "fw" and self.session:
+            self._fw_probed = True
+            self.after(150, self.fw_probe)
+        elif key == "docker":
+            self._dk_probed = True
+            self.after(150, self.docker_probe)
+        elif key == "files":
+            self.after(150, self.files_sync)
+    def _init_tray(self) -> None:
+        try:
+            self._tray = Tray(self, APP_NAME, str(ICON_ICO),
+                              menu_factory=self._tray_menu,
+                              on_show=self._show_from_tray,
+                              post=self.post)
+            if not self._tray.start():
+                self._log_raw("meta", f"[托盘] 未能启动：{self._tray.last_error}\n")
+        except Exception as e:  # noqa: BLE001
+            self._tray = None
+            self._log_raw("meta", f"[托盘] 初始化失败：{e}\n")
+
+    def _tray_menu(self):
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="显示主窗口", command=self._show_from_tray)
+        m.add_separator()
+        state = "已锁定" if self._lock_overlay is not None else "未锁定"
+        m.add_command(label=f"状态：{state} · {self._conn_summary()}",
+                      state="disabled")
+        m.add_separator()
+        if self._lock_overlay is None and self.lock.enabled():
+            m.add_command(label="立即锁定", command=lambda: self._show_lock("已手动锁定"))
+        m.add_command(label="应用锁设置…", command=self._open_lock_window)
+        m.add_separator()
+        api_on = bool(self.api_server and self.api_server.running)
+        m.add_command(label=("停止 API 服务" if api_on else "启动 API 服务"),
+                      command=self.api_toggle)
+        m.add_separator()
+        m.add_command(label="隐藏到托盘", command=self._hide_to_tray)
+        m.add_command(label="退出", command=self._quit_app)
+        return m
+
+    def _conn_summary(self) -> str:
+        if self.session and self.session.alive:
+            return self.session.label or "已连接"
+        return "未连接"
+
+    def _hide_to_tray(self) -> None:
+        if self._tray is None or not self._tray.running:
+            self.iconify()
+            return
+        self.withdraw()
+        try:
+            self._tray.notify(APP_NAME, "已最小化到托盘，双击图标恢复")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _show_from_tray(self) -> None:
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _on_close(self) -> None:
+        if self._close_to_tray and self._tray and self._tray.running:
+            self._hide_to_tray()
+            return
+        self._quit_app()
+
+    def _quit_app(self) -> None:
+        try:
+            if self._tray:
+                self._tray.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.api_server.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self.destroy()
+
+    # ============================================================ API
+    def _boot_api(self) -> None:
+        """上次退出前是开着的，就自动恢复。"""
+        if self._api_inited:
+            return
+        self._api_inited = True
+        if bool(self.api_cfg.data.get("enabled")):
+            ok, msg = self.api_server.start()
+            self._log_raw("meta", f"[API] {msg}\n")
+        self.api_refresh()
+
+    def _api_event(self, kind: str, text: str) -> None:
+        """池里的事件（建连 / 关闭 / 重连）走日志与状态栏。"""
+        self.post(self._log_raw, kind, f"[API] {text}\n")
+        if kind in ("ok", "warn", "bad"):
+            self.post(self.status.set_state, text, kind)
+
+    def _api_log_line(self, kind: str, text: str) -> None:
+        self._log_raw(kind, f"[API] {text}\n")
+
+    # 给 api_page 用的别名
+    def api_log_line(self, kind: str, text: str) -> None:
+        self._api_log_line(kind, text)
+
+    # ============================================================ 统一小件
+    def _effective_device(self) -> DeviceInfo:
+        """当前该按哪套系统方言办事：连着就是设备，没连就是本机。"""
+        if self.session and self.session.alive and self.device.os_family:
+            return self.device
+        if self._local_dev is None:
+            d = DeviceInfo()
+            d.os_family = {"win32": "windows", "darwin": "darwin"}.get(
+                sys.platform, "linux")
+            names = {"windows": "Windows（本机）", "darwin": "macOS（本机）"}
+            d.os_name = names.get(d.os_family, "Linux（本机）")
+            d.shell = "powershell" if d.os_family == "windows" else "sh"
+            d.user = self._local_user()
+            d.is_root = self._local_is_root()
+            self._local_dev = d
+        return self._local_dev
+
+    @staticmethod
+    def _local_user() -> str:
+        import os
+        return os.environ.get("USERNAME") or os.environ.get("USER") or ""
+
+    def _local_is_root(self) -> bool:
+        if sys.platform != "win32":
+            import os
+            try:
+                return os.geteuid() == 0
+            except AttributeError:
+                return False
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def toast(self, text: str, tone: str = "ok", ms: int = 3200) -> None:
+        """状态栏上的临时提示（比 messagebox 轻，不打断操作）。"""
+        try:
+            self.status.set_state(text, tone)
+        except Exception:  # noqa: BLE001
+            pass
+        if self._toast_job:
+            try:
+                self.after_cancel(self._toast_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._toast_job = self.after(ms, lambda: self.status.set_state("就绪"))
+
+    def _toggle_theme(self):
+        U.toggle_theme()
+        self.configure(bg=U.T.page)
+        self.btn_theme.set_text("深色" if U.T.name == "light" else "浅色")
+        self.status.paint_all()
+        if self._log_panel:
+            self._log_panel.destroy()
+            self._mount_log(self._log_win or self.log_dock)
+
+    # ============================================================ 线程与队列
+    def post(self, fn, *a):
+        self.q.put((fn, a))
+
+    def bg(self, fn, ok=None, err=None):
+        def run():
+            try:
+                r = fn()
+                if ok:
+                    self.post(ok, r)
+            except Exception as e:  # noqa: BLE001
+                tb = traceback.format_exc()
+                msg = str(e) or e.__class__.__name__
+                if err:
+                    self.post(err, msg)
+                else:
+                    self.post(self.status.set_state, msg, "err")
+                self.post(self._log_raw, "bad", f"[异常] {msg}\n{tb}")
+        threading.Thread(target=run, daemon=True).start()
+
+    def _drain(self):
+        try:
+            while True:
+                fn, a = self.q.get_nowait()
+                try:
+                    fn(*a)
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        self.after(80, self._drain)
+
+    # ============================================================ 日志
+    # 脱敏规则统一放在 core/redact.py：日志、工具输出、系统信息、终端、
+    # VPN 控制台共用一套，避免加一个面板就漏一个出口。
+    SCRUB = redact.PEM
+
+    def _scrub(self, text: str) -> str:
+        return redact.scrub(text)
+
+    def _log_raw(self, kind: str, text: str) -> None:
+        self.log_model.add(kind, text)
+        if self._log_panel:
+            self._log_panel.append(kind, text)
+
+    def _trace_cmd(self, display, rc, out, err, ms):
+        def render():
+            self._log_raw("meta", time.strftime("[%H:%M:%S] "))
+            self._log_raw("ok" if rc == 0 else "bad", f"rc={rc}  {ms}ms\n")
+            self._log_raw("cmd", "$ " + redact.scrub_cmd(str(display)) + "\n")
+            o, e = self._scrub(out), self._scrub(err)
+            if o.strip():
+                self._log_raw("out", o if o.endswith("\n") else o + "\n")
+            if e.strip():
+                self._log_raw("bad", e if e.endswith("\n") else e + "\n")
+            self._log_raw("meta", "\n")
+            # 终端开着就把同一条记录也送过去（终端自己敲的命令会被它标记跳过）
+            self._term_feed(display, rc, out, err, ms)
+        self.post(render)
+
+    # ============================================================ 采样
+    def _start_sampler(self):
+        def tick():
+            if (not self._sampling and self.session is not None
+                    and self.session.alive and self.sampler is not None):
+                self._sampling = True
+
+                def work():
+                    try:
+                        s = self.sampler.sample(timeout=12)
+                    except Exception as e:  # noqa: BLE001
+                        from core.metrics import Sample
+                        s = Sample(ok=False, error=str(e))
+                    self.post(self._on_sample, s)
+                threading.Thread(target=work, daemon=True).start()
+            self.after(SAMPLE_MS, tick)
+        self.after(600, tick)
+
+    def _on_sample(self, s):
+        self._sampling = False
+        if self.sampler:
+            self.status.update_sample(s, list(self.sampler.cpu_hist))
+            if not s.ok and s.error:
+                self.status.set_state(s.error[:80], "err")
+
+    # ============================================================ 连接
+    def _build_conn(self, pg):
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(2, weight=1)
+
+        # ---- 会话
+        c = U.Card(pg, title="会话", hint="SSH / Telnet / 本机")
+        c.grid(row=0, column=0, sticky="we")
+        b = c.body
+
+        self.v_proto = tk.StringVar(value="ssh")
+        r = U.wframe(b, "card")
+        r.pack(fill="x")
+        for val, label in (("ssh", "SSH"), ("telnet", "Telnet"), ("local", "本机")):
+            ttk.Radiobutton(r, text=label, value=val, variable=self.v_proto,
+                            style="Card.TRadiobutton",
+                            command=self._proto_changed).pack(side="left", padx=(0, 20))
+
+        self.v_prof = tk.StringVar()
+        self.v_remember = tk.BooleanVar(value=False)
+        self.v_host = tk.StringVar(value="192.168.3.12")
+        self.v_port = tk.StringVar(value="22")
+        self.v_user = tk.StringVar(value="")
+        self.v_mode = tk.StringVar(value="key")
+        self.v_key = tk.StringVar()
+        self.v_keypw = tk.StringVar()
+        self.v_pw = tk.StringVar()
+        self.v_sudopw = tk.StringVar()
+
+        # 档案
+        rowp = U.wframe(b, "card")
+        rowp.pack(fill="x", pady=(10, 0))
+        U.wlabel(rowp, "档案", "card", U.FONT_S).pack(side="left")
+        self.cb_prof = ttk.Combobox(rowp, textvariable=self.v_prof,
+                                    state="readonly", width=20)
+        self.cb_prof.pack(side="left", padx=(8, 6))
+        self.cb_prof.bind("<<ComboboxSelected>>", self._on_profile_pick)
+        U.RoundButton(rowp, "保存", self._profile_save, variant="secondary",
+                      font=U.FONT_S, height=27, padx=11).pack(side="left")
+        U.RoundButton(rowp, "删除", self._profile_delete, variant="danger",
+                      font=U.FONT_S, height=27, padx=11).pack(side="left", padx=5)
+        U.RoundButton(rowp, "导入 ssh config", self._profile_import, variant="ghost",
+                      font=U.FONT_S, height=27, padx=9).pack(side="right")
+
+        # 地址行
+        row = U.wframe(b, "card")
+        row.pack(fill="x", pady=(9, 0))
+        row.columnconfigure(1, weight=1)
+        U.wlabel(row, "地址", "card", U.FONT_S).grid(row=0, column=0, sticky="w")
+        self.e_host = ttk.Entry(row, textvariable=self.v_host)
+        self.e_host.grid(row=0, column=1, sticky="we", padx=(10, 8))
+        U.wlabel(row, "端口", "card", U.FONT_S).grid(row=0, column=2, sticky="w")
+        ttk.Entry(row, textvariable=self.v_port, width=7).grid(
+            row=0, column=3, sticky="w", padx=(8, 0))
+        U.wlabel(row, "用户", "card", U.FONT_S).grid(row=1, column=0,
+                                                     sticky="w", pady=(7, 0))
+        ttk.Entry(row, textvariable=self.v_user).grid(
+            row=1, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=(7, 0))
+
+        # 认证
+        self.row_auth = U.wframe(b, "card")
+        self.row_auth.pack(fill="x", pady=(9, 0))
+        ra = U.wframe(self.row_auth, "card")
+        ra.pack(fill="x")
+        ttk.Radiobutton(ra, text="私钥", value="key", variable=self.v_mode,
+                        style="Card.TRadiobutton",
+                        command=self._mode_changed).pack(side="left")
+        ttk.Radiobutton(ra, text="登录密码", value="password", variable=self.v_mode,
+                        style="Card.TRadiobutton",
+                        command=self._mode_changed).pack(side="left", padx=18)
+
+        self.row_key = U.wframe(self.row_auth, "card")
+        self.row_key.pack(fill="x", pady=(7, 0))
+        self.row_key.columnconfigure(0, weight=1)
+        self.e_key = ttk.Entry(self.row_key, textvariable=self.v_key)
+        self.e_key.grid(row=0, column=0, sticky="we")
+        self.e_key.bind("<FocusOut>", lambda e: self._refresh_key_info())
+        U.RoundButton(self.row_key, "浏览…", self._pick_key, variant="secondary",
+                      font=U.FONT_S, height=27, padx=10).grid(row=0, column=1, padx=(6, 0))
+        U.RoundButton(self.row_key, "发现 ▾", self._key_menu, variant="secondary",
+                      font=U.FONT_S, height=27, padx=10).grid(row=0, column=2, padx=(6, 0))
+        self.lbl_key = U.wlabel(self.row_key, "未选择私钥", "dim", U.FONT_XS,
+                                justify="left")
+        self.lbl_key.grid(row=1, column=0, columnspan=3, sticky="w", pady=(5, 0))
+
+        rk = U.wframe(self.row_auth, "card")
+        rk.pack(fill="x", pady=(6, 0))
+        self.row_keypw = rk
+        U.wlabel(rk, "私钥口令", "card", U.FONT_S).pack(side="left")
+        self.e_keypw = ttk.Entry(rk, textvariable=self.v_keypw, show="*", width=18)
+        self.e_keypw.pack(side="left", padx=(8, 0))
+        self.v_keypw.trace_add("write", self._on_keypw_changed)
+        # 口令框旁边就地给一个「保存」勾选：它和下面的总开关是同一个变量，
+        # 所以只要用户在这里勾上，档案里就会留下口令 —— 不必先滚下去找开关。
+        U.Check(rk, "保存口令", self.v_remember,
+                command=self._remember_changed).pack(side="left", padx=(8, 0))
+        self.btn_eye = U.RoundButton(rk, "👁", self._toggle_keypw_eye,
+                                     variant="ghost", font=U.FONT_S,
+                                     height=24, padx=7)
+        self.btn_eye.pack(side="left", padx=(2, 0))
+
+        self.row_pw = U.wframe(self.row_auth, "card")
+        self.row_pw.pack(fill="x", pady=(6, 0))
+        U.wlabel(self.row_pw, "登录密码", "card", U.FONT_S).pack(side="left")
+        self.e_pw = ttk.Entry(self.row_pw, textvariable=self.v_pw, show="*", width=22)
+        self.e_pw.pack(side="left", padx=(8, 0))
+        U.RoundButton(self.row_pw, "👁", lambda: self._toggle_eye(self.e_pw),
+                      variant="ghost", font=U.FONT_S, height=24,
+                      padx=7).pack(side="left", padx=(2, 0))
+
+        # 提权
+        rs = U.wframe(b, "card")
+        rs.pack(fill="x", pady=(9, 0))
+        U.wlabel(rs, "sudo 密码", "card", U.FONT_S).pack(side="left")
+        self.e_sudopw = ttk.Entry(rs, textvariable=self.v_sudopw, show="*", width=18)
+        self.e_sudopw.pack(side="left", padx=(8, 0))
+        U.RoundButton(rs, "👁", lambda: self._toggle_eye(self.e_sudopw),
+                      variant="ghost", font=U.FONT_S, height=24,
+                      padx=7).pack(side="left", padx=(2, 0))
+
+        # 凭据保存：一个总开关 + 一行实时说明「现在到底存了什么」
+        rc = U.wframe(b, "card")
+        rc.pack(fill="x", pady=(9, 0))
+        U.Check(rc, "记住凭据（私钥口令 · 登录密码 · sudo 密码，本机加密保存）",
+                self.v_remember, command=self._remember_changed).pack(side="left")
+        self.lbl_cred = U.wlabel(rc, "", "dim", U.FONT_XS, anchor="e")
+        self.lbl_cred.pack(side="right")
+
+        act = U.wframe(b, "card")
+        act.pack(fill="x", pady=(11, 0))
+        self.btn_connect = U.RoundButton(act, "连接并探测", self.do_connect,
+                                         variant="primary", height=34, padx=20)
+        self.btn_connect.pack(side="left")
+        U.RoundButton(act, "断开", self._disconnect, variant="ghost",
+                      height=34, padx=14).pack(side="left", padx=(8, 0))
+
+        # 任何一项凭据变化都重算一次「将加密保存：…」，用户不用猜勾选框管谁
+        for var in (self.v_remember, self.v_keypw, self.v_pw, self.v_sudopw):
+            var.trace_add("write", lambda *_: self._refresh_cred_hint())
+        self._refresh_cred_hint()
+
+        # ---- 设备概览
+        c2 = U.Card(pg, title="设备概览", hint="连接后自动探测")
+        c2.grid(row=1, column=0, sticky="we", pady=(10, 0))
+        self.kv_holder = c2.body
+        self._kv_empty()
+
+        # ---- 最近输出
+        c3 = U.Card(pg, title="最近输出", hint="右侧日志保留完整历史")
+        c3.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        self.txt_out = tk.Text(c3.body, bg=U.T.console_bg, fg=U.T.console_fg,
+                               font=U.MONO_S, bd=0, relief="flat",
+                               highlightthickness=0, wrap="none",
+                               padx=U.px(10), pady=U.px(8), height=8)
+        self.txt_out.pack(fill="both", expand=True)
+        self.txt_out.configure(state="disabled")
+
+        self._mode_changed()
+
+    def _kv_empty(self):
+        for w in self.kv_holder.winfo_children():
+            w.destroy()
+        U.wlabel(self.kv_holder, "尚未连接。填好上面几项后点「连接并探测」。",
+                 "dim", U.FONT_S).pack(anchor="w")
+
+    def _kv(self, label: str, value: str, tone: str = "card"):
+        row = U.wframe(self.kv_holder, "card")
+        row.pack(fill="x", pady=2)
+        row.columnconfigure(1, weight=1)
+        U.wlabel(row, label, "dim", U.FONT_S).grid(row=0, column=0, sticky="nw")
+        role = {"ok": "ok", "err": "err", "warn": "warn", "dim": "dim"}.get(tone, "card")
+        U.wlabel(row, value or "—", role, U.FONT_S, justify="left",
+                 wraplength=U.px(560)).grid(row=0, column=1, sticky="w", padx=(14, 0))
+
+    # ---------------- 交互
+    def _proto_changed(self):
+        proto = self.v_proto.get()
+        if proto == "local":
+            self.v_port.set("")
+            self.e_host.configure(state="disabled")
+            self.row_auth.pack_forget()
+        elif proto == "telnet":
+            self.v_port.set("23")
+            self.e_host.configure(state="normal")
+            self.row_auth.pack_forget()
+        else:
+            self.e_host.configure(state="normal")
+            if self.v_port.get() in ("", "23"):
+                self.v_port.set("22")
+            if not self.row_auth.winfo_ismapped():
+                self.row_auth.pack(fill="x", pady=(9, 0))
+            self._mode_changed()
+
+    def _mode_changed(self):
+        if self.v_mode.get() == "key":
+            self.row_pw.pack_forget()
+            if not self.row_key.winfo_ismapped():
+                self.row_key.pack(fill="x", pady=(7, 0), before=self.row_keypw)
+        else:
+            self.row_key.pack_forget()
+            if not self.row_pw.winfo_ismapped():
+                self.row_pw.pack(fill="x", pady=(6, 0))
+
+    def _on_keypw_changed(self, *_):
+        if self._keypw_job:
+            try:
+                self.after_cancel(self._keypw_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._keypw_job = self.after(450, self._refresh_key_info)
+
+    # ---------------- 凭据保存
+    def _toggle_eye(self, entry) -> None:
+        """口令框的显示/隐藏。输错了看不见是最常见的「存不上」误判来源。"""
+        try:
+            entry.configure(show="" if entry.cget("show") else "*")
+        except tk.TclError:
+            pass
+
+    def _toggle_keypw_eye(self) -> None:
+        self._toggle_eye(self.e_keypw)
+
+    def _remember_changed(self, *_):
+        self._refresh_cred_hint()
+
+    def _refresh_cred_hint(self) -> None:
+        """把「现在到底会存什么」直接写出来，不用用户猜勾选框管哪些字段。"""
+        lbl = getattr(self, "lbl_cred", None)
+        if lbl is None:
+            return
+        try:
+            if not self.v_remember.get():
+                lbl.configure(text="未勾选 · 口令只留在本次运行的内存里",
+                              fg=U.T.text_mute)
+                return
+            keep = []
+            if self.v_keypw.get():
+                keep.append("私钥口令")
+            if self.v_pw.get():
+                keep.append("登录密码")
+            if self.v_sudopw.get():
+                keep.append("sudo 密码")
+            if not keep:
+                lbl.configure(text="已勾选 · 填好口令后点「保存」即落盘",
+                              fg=U.T.text_dim)
+                return
+            lbl.configure(text="将加密保存：" + "、".join(keep), fg=U.T.ok)
+        except tk.TclError:
+            pass
+
+    def _pick_key(self):
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(
+            title="选择 SSH 私钥", parent=self,
+            filetypes=[("私钥文件", "id_* *.pem *.key *"), ("所有文件", "*.*")])
+        if p:
+            self.v_key.set(norm_path(p))
+            self._refresh_key_info()
+
+    def _key_menu(self):
+        keys = discover_keys()
+        if not keys:
+            return messagebox.showinfo("没有发现私钥",
+                                       "在 ~/.ssh 下没找到可用的私钥文件，请用「浏览…」手动选择。",
+                                       parent=self)
+        m = tk.Menu(self, tearoff=0)
+        for k in keys[:18]:
+            m.add_command(label=f"{k['name']}    ({k['dir']})",
+                          command=lambda p=k["path"]: self._use_key(p))
+        m.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+
+    def _use_key(self, path: str):
+        self.v_key.set(norm_path(path))
+        self._refresh_key_info()
+
+    def _refresh_key_info(self):
+        self._keypw_job = None
+        path = norm_path(self.v_key.get())
+        if not path:
+            self.lbl_key.configure(text="未选择私钥", fg=U.T.text_mute)
+            return
+        self.lbl_key.configure(text="正在读取密钥信息…", fg=U.T.text_mute)
+        pp = self.v_keypw.get() or None
+
+        def done(info):
+            if not info.get("ok"):
+                if info.get("format") == "ppk":
+                    self.lbl_key.configure(
+                        text="⚠ PuTTY .ppk 无法直接读取 —— 用 PuTTYgen 导出 OpenSSH 私钥",
+                        fg=U.T.err)
+                elif info.get("encrypted") and not pp:
+                    self.lbl_key.configure(text="🔑 " + info.get("error", ""),
+                                           fg=U.T.warn)
+                else:
+                    self.lbl_key.configure(text="⚠ " + info.get("error", "无法读取"),
+                                           fg=U.T.err)
+                return
+            txt = (f"{info['type']} {info['bits']} 位 · {info['fingerprint']}"
+                   + ("  🔒 带口令" if info.get("encrypted") else ""))
+            self.lbl_key.configure(text=txt, fg=U.T.text_dim)
+
+        self.bg(lambda: inspect_key(path, pp), ok=done,
+                err=lambda m: self.lbl_key.configure(text="⚠ " + m, fg=U.T.err))
+
+    # ---------------- 档案
+    def _collect_profile(self) -> dict:
+        p = {
+            "name": self.v_prof.get().strip(),
+            "host": self.v_host.get().strip(),
+            "port": self.v_port.get().strip() or "22",
+            "user": self.v_user.get().strip(),
+            "auth": self.v_mode.get(),
+            "key_path": norm_path(self.v_key.get()),
+            "remember": bool(self.v_remember.get()),
+        }
+        if p["remember"]:
+            p["password"] = self.v_pw.get()
+            p["key_passphrase"] = self.v_keypw.get()
+            p["sudo_password"] = self.v_sudopw.get()
+        return p
+
+    def _refresh_profile_list(self):
+        names = self.profiles.names()
+        self.cb_prof["values"] = names
+        if self.v_prof.get() not in names:
+            self.v_prof.set("")
+
+    def _apply_profile(self, p: dict):
+        self.v_prof.set(p.get("name", ""))
+        self.v_host.set(p.get("host", ""))
+        self.v_port.set(p.get("port", "22") or "22")
+        self.v_user.set(p.get("user", ""))
+        auth = p.get("auth", "key")
+        self.v_mode.set(auth if auth in ("key", "password") else "key")
+        self._mode_changed()
+        self.v_key.set(norm_path(p.get("key_path")))
+        self.v_keypw.set(p.get("key_passphrase", "") or "")
+        self.v_pw.set(p.get("password", "") or "")
+        self.v_sudopw.set(p.get("sudo_password", "") or "")
+        self.v_remember.set(bool(p.get("remember")))
+        if self.v_key.get():
+            self._refresh_key_info()
+        else:
+            self.lbl_key.configure(text="未选择私钥", fg=U.T.text_mute)
+        self._refresh_cred_hint()
+
+    def _on_profile_pick(self, _e=None):
+        p = self.profiles.get(self.v_prof.get())
+        if p:
+            self._apply_profile(p)
+
+    def _profile_save(self, quiet: bool = False) -> bool:
+        name = self.v_prof.get().strip()
+        if not name:
+            if quiet:
+                return False
+            from tkinter import simpledialog
+            name = simpledialog.askstring("保存档案", "档案名：", parent=self) or ""
+            if not name:
+                return False
+            self.v_prof.set(name)
+        rec = self._collect_profile()
+        try:
+            self.profiles.upsert(rec)
+        except ValueError as e:
+            if quiet:
+                return False
+            messagebox.showwarning("无法保存", str(e), parent=self)
+            return False
+        self._refresh_profile_list()
+        self._refresh_cred_hint()
+        if rec.get("remember"):
+            kept = [n for n, k in (("私钥口令", "key_passphrase"),
+                                   ("登录密码", "password"),
+                                   ("sudo 密码", "sudo_password"))
+                    if rec.get(k)]
+            tail = f" · 已加密保存 {'、'.join(kept)}" if kept else " · 未填口令"
+            self.status.set_state(f"档案已保存：{name}{tail}", "ok")
+        else:
+            self.status.set_state(
+                f"档案已保存：{name} · 未勾「记住凭据」，口令没有落盘", "warn")
+        return True
+
+    def _autosave_creds(self) -> None:
+        """连接成功后静默落盘凭据。
+
+        档案名为空时用 `user@host` 造一个 —— 用户勾了「记住凭据」，
+        意思就是「下次别再问我」，不该因为没有档案名而失败。
+        """
+        name = self.v_prof.get().strip()
+        if not name:
+            host = self.v_host.get().strip()
+            user = self.v_user.get().strip()
+            if not host:
+                return
+            name = f"{user}@{host}" if user else host
+            self.v_prof.set(name)
+            try:
+                self.cb_prof["values"] = self.profiles.names() + [name]
+            except tk.TclError:
+                pass
+        try:
+            self.profiles.upsert(self._collect_profile())
+        except ValueError:
+            return
+        self._refresh_profile_list()
+        self.v_prof.set(name)
+        kept = [n for n, k in (("私钥口令", "key_passphrase"),
+                               ("登录密码", "password"),
+                               ("sudo 密码", "sudo_password"))
+                if self._collect_profile().get(k)]
+        if kept:
+            self.toast(f"凭据已加密保存到档案「{name}」：{'、'.join(kept)}", "ok")
+
+    def _profile_delete(self):
+        name = self.v_prof.get().strip()
+        if not name:
+            return
+        if not messagebox.askyesno("删除档案", f"删除「{name}」？", parent=self):
+            return
+        self.profiles.remove(name)
+        self._refresh_profile_list()
+        self.status.set_state("档案已删除")
+
+    def _profile_import(self):
+        added, skipped = self.profiles.import_from_ssh_config()
+        self._refresh_profile_list()
+        messagebox.showinfo("导入完成",
+                            f"新增 {added} 个，跳过 {skipped} 个（同名已存在）。",
+                            parent=self)
+
+    def _load_last_profile(self):
+        try:
+            names = self.profiles.names()
+            self.cb_prof["values"] = names
+            last = self.profiles.last
+            if last and last in names:
+                self.v_prof.set(last)
+                self._apply_profile(self.profiles.get(last))
+            elif names:
+                self.v_prof.set(names[0])
+                self._apply_profile(self.profiles.get(names[0]))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------------- 连接动作
+    def do_connect(self):
+        proto = self.v_proto.get()
+        self.btn_connect.set_enabled(False)
+        self.status.set_state("正在连接…")
+
+        spec = ConnSpec(proto=proto,
+                        host=self.v_host.get().strip(),
+                        port=int(self.v_port.get() or (23 if proto == "telnet" else 22)),
+                        user=self.v_user.get().strip(),
+                        auth=self.v_mode.get(),
+                        key_path=norm_path(self.v_key.get()),
+                        password=self.v_pw.get(),
+                        key_passphrase=self.v_keypw.get())
+
+        if proto == "ssh":
+            if spec.auth == "key":
+                if not spec.key_path:
+                    self.btn_connect.set_enabled(True)
+                    return messagebox.showwarning("缺少参数", "请选择私钥文件", parent=self)
+                info = inspect_key(spec.key_path, spec.key_passphrase or None)
+                if not info.get("ok"):
+                    self.btn_connect.set_enabled(True)
+                    if info.get("format") == "ppk":
+                        return messagebox.showerror(
+                            "私钥格式不支持",
+                            "PuTTY 的 .ppk 无法直接读取。\n"
+                            "用 PuTTYgen → Conversions → Export OpenSSH key 导出后再选。",
+                            parent=self)
+                    if info.get("encrypted") and not spec.key_passphrase:
+                        return messagebox.showwarning("缺少私钥口令",
+                                                      "这把私钥带口令保护，请先填「私钥口令」。",
+                                                      parent=self)
+                    return messagebox.showerror("私钥不可用",
+                                                info.get("error", "无法读取"), parent=self)
+            elif not spec.password:
+                self.btn_connect.set_enabled(True)
+                return messagebox.showwarning("缺少参数", "请填登录密码", parent=self)
+
+        def work():
+            old = self.session
+            if old:
+                try:
+                    old.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            s = open_session(spec)
+            s.tracer = self._trace_cmd
+            if isinstance(s, SSHSession) and spec.proto == "ssh" and self.v_sudopw.get():
+                s.sudo_ok(self.v_sudopw.get())
+            dev = detect(s)
+            return s, dev
+
+        def ok(res):
+            s, dev = res
+            self.session = s
+            self.device = dev
+            self.dialect = dialect_for(dev)
+            self.sampler = Sampler(s, self.dialect)
+            self.btn_connect.set_enabled(True)
+            self._render_device(dev, s)
+            self.status.set_device(dev.hostname or dev.os_name or s.label, dev.os_family)
+            self.status.set_state("已连接", "ok")
+            self.pill_dev.set(dev.os_name or "已连接", "ok")
+            self.pill_proto.set(s.kind.upper(), "ok")
+            # 换了设备：页面上的旧数据全部作废，重新按新设备探测
+            self._local_dev = None
+            self._routes_loaded = False
+            self._fw_probed = False
+            self._dk_probed = False
+            self.fw_backend = None
+            self._log_raw("meta", f"[设备] {dev.os_name or dev.os_family} · "
+                                  f"{dev.kernel or ''} · {dev.arch or ''}\n")
+            # 勾了「记住凭据」就顺手把档案落盘 —— 口令要真的进文件，
+            # 不能指望用户连通之后还想起来点一次「保存」。
+            if self.v_remember.get() and self.v_prof.get().strip():
+                self._autosave_creds()
+            self._refresh_current_page()
+
+        def err(msg):
+            self.btn_connect.set_enabled(True)
+            self.status.set_state(msg, "err")
+            messagebox.showerror("连接失败", msg, parent=self)
+
+        self.bg(work, ok=ok, err=err)
+
+    def _disconnect(self):
+        if self.session:
+            try:
+                self.session.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.session = None
+        self.sampler = None
+        self.device = DeviceInfo()
+        self.dialect = None
+        self._local_dev = None
+        self._routes_loaded = False
+        self._fw_probed = False
+        self._dk_probed = False
+        self.fw_backend = None
+        self.status.clear()
+        self.pill_dev.set("未连接", "mute")
+        self.pill_proto.set("—", "mute")
+        self._kv_empty()
+        # 工具页的目标与提示也要跟着复位，否则还挂着上一台设备的值
+        try:
+            self.lbl_tool_os.configure(text="未连接 · 将使用本机命令")
+            self.lbl_route.configure(text="点「刷新」读取设备当前路由表。")
+            self.lbl_fw.configure(text="点「探测后端」判断设备用哪套防火墙。")
+        except (AttributeError, tk.TclError):
+            pass
+        # 终端跟着断：目录缓存作废，标题栏回到「未连接」
+        self._term_cwd_val = ""
+        self._term_refresh_head()
+
+    # ============================================================ 终端（默认不打开）
+    def open_terminal(self):
+        w = self._term
+        if w is not None:
+            try:
+                if w.winfo_exists():
+                    w.deiconify()
+                    w.lift()
+                    w.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        from ui.terminal import TerminalWindow
+        self._term = TerminalWindow(self, self)
+        self.status.set_state("终端已打开 · 命令跑在当前会话上", "ok")
+
+    def term_closed(self, w) -> None:
+        if self._term is w:
+            self._term = None
+
+    def _term_refresh_head(self) -> None:
+        w = self._term
+        if w is None:
+            return
+        try:
+            if w.winfo_exists():
+                w._refresh_head()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _term_feed(self, display, rc, out, err, ms) -> None:
+        """tracer 的旁路：终端开着就把同一条命令推过去。"""
+        w = self._term
+        if w is None:
+            return
+        try:
+            if w.winfo_exists():
+                w.feed(display, rc, out, err, ms)
+        except tk.TclError:
+            pass
+
+    # ---- 终端要的四个接口
+    def term_ready(self) -> bool:
+        s = self.session
+        try:
+            return s is not None and bool(s.alive)
+        except Exception:  # noqa: BLE001
+            return s is not None
+
+    def term_describe(self) -> str:
+        s = self.session
+        if s is None:
+            return "未连接"
+        dev = self._effective_device()
+        name = dev.hostname or dev.os_name or s.label or "设备"
+        return f"{name} · {s.kind.upper()}"
+
+    def term_cwd(self) -> str:
+        return self._term_cwd_val or self._term_probe_cwd()
+
+    def _term_probe_cwd(self) -> str:
+        s = self.session
+        win = self._effective_device().os_family == "windows"
+        fallback = "C:\\" if win else "/"
+        if s is None:
+            return fallback
+        try:
+            rc, out, err = s.run("pwd", timeout=8)
+            lines = [x.strip() for x in (out or "").splitlines() if x.strip()]
+            got = lines[-1] if lines else ""
+        except Exception:  # noqa: BLE001
+            got = ""
+        self._term_cwd_val = got or fallback
+        return self._term_cwd_val
+
+    def term_prompt(self) -> str:
+        s = self.session
+        if s is None:
+            return "$ "
+        cwd = self.term_cwd()
+        if s.kind == "local":
+            return f"{cwd}> " if self._effective_device().os_family == "windows" \
+                else f"{cwd}$ "
+        user = getattr(s, "user", "") or "user"
+        host = getattr(s, "host", "") or self._effective_device().hostname or "host"
+        mark = "#" if getattr(s, "is_root", False) else "$"
+        return f"{user}@{host} {cwd}{mark} "
+
+    def term_chdir(self, path: str) -> tuple[bool, str]:
+        s = self.session
+        if s is None:
+            return False, "未连接"
+        win = self._effective_device().os_family == "windows"
+        if win:
+            cmd = f"Set-Location -LiteralPath '{path}' -ErrorAction Stop; pwd"
+        else:
+            cmd = f"cd -- {shlex.quote(path)} 2>/dev/null && pwd"
+        try:
+            rc, out, err = s.run(cmd, timeout=10)
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+        lines = [x.strip() for x in (out or "").splitlines() if x.strip()]
+        if rc != 0 or not lines:
+            return False, (err or "目录不存在").strip().splitlines()[-1]
+        self._term_cwd_val = lines[-1]
+        return True, self._term_cwd_val
+
+    def term_run(self, cmd: str, done) -> None:
+        """在后台跑，结果回投到 Tk 线程。拼上当前目录，但终端只回显用户敲的那行。"""
+        s = self.session
+        if s is None:
+            done(1, "", "未连接", 0)
+            return
+        cwd = self.term_cwd()
+        win = self._effective_device().os_family == "windows"
+        if win:
+            full = f"Set-Location -LiteralPath '{cwd}' -ErrorAction SilentlyContinue; {cmd}"
+        else:
+            full = f"cd -- {shlex.quote(cwd)} 2>/dev/null; {cmd}"
+
+        def work():
+            t0 = time.time()
+            try:
+                rc, out, err = s.run_traced(full, timeout=180)
+            except Exception as e:  # noqa: BLE001
+                rc, out, err = 1, "", str(e)
+            done(rc, out, err, int((time.time() - t0) * 1000))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_device(self, dev: DeviceInfo, s):
+        for w in self.kv_holder.winfo_children():
+            w.destroy()
+        self._kv("连接", f"{s.kind.upper()} · {s.label}", "ok")
+        self._kv("操作系统", dev.os_name)
+        self._kv("内核", dev.kernel)
+        self._kv("架构", dev.arch)
+        self._kv("主机名", dev.hostname)
+        self._kv("设备类型", dev.device_type)
+        self._kv("Shell", dev.shell)
+        self._kv("当前用户", dev.user + ("（root）" if dev.is_root else ""))
+        caps = capabilities(dev)
+        if caps:
+            self._kv("可用能力", " · ".join(caps), "ok")
+
+    # ============================================================ 网络工具
+    def _build_tools(self, pg):
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(1, weight=1)
+
+        c = U.Card(pg, title="目标", hint="留空则对本机执行")
+        c.grid(row=0, column=0, sticky="we")
+        b = c.body
+        self.v_target = tk.StringVar()
+        row = U.wframe(b, "card")
+        row.pack(fill="x")
+        U.wlabel(row, "主机 / IP", "card", U.FONT_S).pack(side="left")
+        ttk.Entry(row, textvariable=self.v_target, width=30).pack(
+            side="left", padx=(10, 0))
+        self.lbl_tool_os = U.wlabel(row, "未连接 · 将使用本机命令", "dim", U.FONT_XS)
+        self.lbl_tool_os.pack(side="right")
+
+        grid = U.wframe(b, "card")
+        grid.pack(fill="x", pady=(U.px(10), 0))
+        tools = [
+            ("Ping 测试", "ping"), ("路由追踪", "trace"),
+            ("IP 地址", "ip"), ("路由表", "route"),
+            ("监听端口", "ports"), ("DNS 配置", "dns"),
+        ]
+        for i, (label, key) in enumerate(tools):
+            U.RoundButton(grid, label, lambda k=key: self.do_tool(k),
+                          variant="secondary", font=U.FONT_S,
+                          height=30, padx=14).grid(
+                row=0, column=i, padx=(0, 8), pady=2, sticky="w")
+
+        c3 = U.Card(pg, title="输出", hint="表格是解析后的视图，原始回显随时可切回")
+        c3.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        head = U.wframe(c3.body, "card")
+        head.pack(fill="x")
+        self.seg_tool = Segmented(head, [("table", "表格"), ("raw", "原始输出")],
+                                  command=self._tool_view)
+        self.seg_tool.pack(side="left")
+        self.lbl_ping = U.wlabel(head, "", "dim", U.FONT_XS, justify="right",
+                                 wraplength=U.px(420))
+        self.lbl_ping.pack(side="right", padx=(U.px(10), 0))
+
+        holder = U.wframe(c3.body, "card")
+        holder.pack(fill="both", expand=True, pady=(U.px(8), 0))
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+
+        self.tbl_tool = DataTable(
+            holder, TOOL_COLS["ip"], height=9, searchable=True,
+            empty_title="还没有执行工具",
+            empty_hint="上面选一个工具跑一下，结果会以表格显示。")
+        self.tbl_tool.grid(row=0, column=0, sticky="nsew")
+
+        self.raw_tool = tk.Frame(holder, bg=U.T.card, bd=0)
+        self.raw_tool.grid(row=0, column=0, sticky="nsew")
+        self.txt_tool = tk.Text(self.raw_tool, bg=U.T.console_bg, fg=U.T.console_fg,
+                                font=U.MONO_S, bd=0, relief="flat",
+                                highlightthickness=0, wrap="none",
+                                padx=U.px(10), pady=U.px(8))
+        sb = tk.Scrollbar(self.raw_tool, command=self.txt_tool.yview,
+                          width=U.px(11))
+        self.txt_tool.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.txt_tool.pack(side="left", fill="both", expand=True)
+        self.txt_tool.configure(state="disabled")
+        self.raw_tool.grid_remove()
+
+    def _tool_view(self, key: str):
+        if key == "raw":
+            self.raw_tool.grid()
+            self.tbl_tool.grid_remove()
+            self.raw_tool.tkraise()
+        else:
+            self.tbl_tool.grid()
+            self.raw_tool.grid_remove()
+            self.tbl_tool.tkraise()
+
+    def _active_session(self):
+        """工具默认跑在当前会话上；没连接就跑本机。"""
+        if self.session and self.session.alive:
+            return self.session
+        if not getattr(self, "_local", None):
+            self._local = LocalSession()
+            self._local.tracer = self._trace_cmd
+        return self._local
+
+    def _active_dialect(self):
+        if self.dialect:
+            return self.dialect
+        # 本机
+        from core.detect import WindowsDialect, DarwinDialect
+        if sys.platform == "win32":
+            return WindowsDialect()
+        if sys.platform == "darwin":
+            return DarwinDialect()
+        from core.detect import Dialect
+        return Dialect()
+
+    def do_tool(self, key: str):
+        s = self._active_session()
+        d = self._active_dialect()
+        target = self.v_target.get().strip()
+        if key in ("ping", "trace") and not target:
+            return messagebox.showwarning("缺少目标", "请填一个主机名或 IP", parent=self)
+
+        cmds = {
+            "ping": d.ping_cmd(target, 4),
+            "trace": d.traceroute_cmd(target),
+            "ip": d.ip_cmd(),
+            "route": d.route_cmd(),
+            "ports": d.listen_ports_cmd(),
+            "dns": d.dns_cmd(),
+        }
+        cmd = cmds[key]
+        self.lbl_ping.configure(text=f"正在执行…", fg=U.T.text_dim)
+        self.status.set_state("执行中…")
+
+        def work():
+            rc, out, err = s.run_traced(cmd, timeout=60)
+            return key, rc, out, err
+
+        def done(res):
+            k, rc, out, err = res
+            self._set_tool_out(out + (("\n[stderr]\n" + err) if err.strip() else ""))
+            rows, cols, summary = self._tool_rows(k, out, rc)
+            self.tbl_tool.set_columns(cols)
+            self.tbl_tool.set_rows(rows)
+            self.tbl_tool.set_empty(
+                "这条命令没有可结构化的内容",
+                f"{cmd} 的输出无法解析成表格，切到「原始输出」看原文。")
+            self.lbl_ping.configure(
+                text=summary, fg=U.T.text if rc == 0 else U.T.warn)
+            if rows:
+                self.seg_tool.select("table", fire=False)
+                self._tool_view("table")
+            else:
+                self.seg_tool.select("raw", fire=False)
+                self._tool_view("raw")
+            self.status.set_state("完成" if rc == 0 else f"rc={rc}",
+                                  "ok" if rc == 0 else "warn")
+
+        self.bg(work, ok=done, err=lambda m: (
+            self.lbl_ping.configure(text="失败：" + m, fg=U.T.err),
+            self.status.set_state(m, "err")))
+
+    def _set_tool_out(self, text: str) -> None:
+        self.txt_tool.configure(state="normal")
+        self.txt_tool.delete("1.0", "end")
+        self.txt_tool.insert("1.0", self._scrub(text))
+        self.txt_tool.configure(state="disabled")
+
+    def _tool_rows(self, key: str, out: str, rc: int):
+        """返回 (rows, columns, 一句话摘要)。解析不出来就回退到原始输出。"""
+        cols = TOOL_COLS.get(key, TOOL_COLS["ip"])
+        rows: list[dict] = []
+        summary = ""
+        if key == "ip":
+            rows = parsers.ip_table("", out)
+            summary = f"{len(rows)} 个地址"
+        elif key == "route":
+            rows = parsers.route_table(out)
+            for r in rows:
+                r["kind"] = "默认" if routes.is_default(r) else (
+                    "直连" if not r.get("gateway") else "静态")
+            summary = f"{len(rows)} 条路由"
+        elif key == "ports":
+            rows = parsers.port_table(out)
+            summary = f"{len(rows)} 个监听端口"
+        elif key == "dns":
+            rows = parsers.dns_rows(out)
+            summary = f"{len(rows)} 条 DNS 配置"
+        elif key == "ping":
+            series = parsers.ping_series(out)
+            rows = [{"seq": x["seq"],
+                     "rtt": "" if x["rtt"] is None else f"{x['rtt']:.1f}",
+                     "note": "超时 / 不可达" if x["rtt"] is None else "响应",
+                     "_tone": "err" if x["rtt"] is None else "ok"}
+                    for x in series]
+            summary = self._ping_summary(out)
+        elif key == "trace":
+            rows = parsers.traceroute_rows(out)
+            summary = f"{len(rows)} 跳"
+        if rc != 0:
+            summary = (summary + " · " if summary else "") + f"rc={rc}"
+        return rows, cols, summary
+
+    @staticmethod
+    def _ping_summary(out: str) -> str:
+        """把 ping 回显压成一行人话。
+
+        三种格式都要认：
+          Linux     4 packets transmitted, 4 received, 0% packet loss
+          Win 英文  Sent = 4, Received = 4, Lost = 0 (0% loss)
+          Win 中文  已发送 = 4，已接收 = 4，丢失 = 0 (0% 丢失)
+        """
+        if not out.strip():
+            return "无输出"
+        sent = recv = loss = None
+        rtt = ""
+        avg = mn = mx = None
+
+        # ---- 包数
+        m = re.search(r"(\d+)\s+packets transmitted,\s*(\d+)\s+(?:packets\s+)?received",
+                      out)
+        if m:
+            sent, recv = int(m.group(1)), int(m.group(2))
+            loss = 0 if sent == 0 else round((sent - recv) * 100 / sent)
+        if sent is None:
+            m = re.search(r"Sent\s*=\s*(\d+)\s*[,，]\s*Received\s*=\s*(\d+)"
+                          r"\s*[,，]\s*Lost\s*=\s*(\d+)", out)
+            if m:
+                sent, recv, loss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if sent is None:
+            m = re.search(r"已发送\s*=\s*(\d+)\s*[，,]\s*已接收\s*=\s*(\d+)"
+                          r"\s*[，,]\s*丢失\s*=\s*(\d+)", out)
+            if m:
+                sent, recv, loss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if sent is None:
+            # 兜底：从「X% 丢失 / X% loss」反推
+            m = re.search(r"(\d+)%\s*(?:丢失|loss)", out)
+            if m:
+                loss = int(m.group(1))
+                sent = 4
+                recv = round(sent * (100 - loss) / 100)
+
+        # ---- 往返时间
+        m = re.search(r"=\s*[\d.]+/([\d.]+)/([\d.]+)/[\d.]+\s*ms", out)
+        if m:
+            avg, mx = m.group(1), m.group(2)
+            mn = re.search(r"=\s*([\d.]+)/", out)
+            mn = mn.group(1) if mn else avg
+        if avg is None:
+            m = re.search(r"Minimum\s*=\s*(\d+)ms\s*[,，]\s*Maximum\s*=\s*(\d+)ms"
+                          r"\s*[,，]\s*Average\s*=\s*(\d+)ms", out)
+            if m:
+                mn, mx, avg = m.group(1), m.group(2), m.group(3)
+        if avg is None:
+            m = re.search(r"最短\s*=\s*(\d+)ms\s*[，,]\s*最长\s*=\s*(\d+)ms"
+                          r"\s*[，,]\s*平均\s*=\s*(\d+)ms", out)
+            if m:
+                mn, mx, avg = m.group(1), m.group(2), m.group(3)
+        if avg is not None:
+            rtt = f" · 平均 {avg} ms（最小/最大 {mn}/{mx}）"
+
+        if sent is None:
+            # 连不上时 Windows 只给一句人话，没有统计
+            for hint in ("请求超时", "无法访问目标主机", "找不到主机",
+                         "could not find host", "Request timed out",
+                         "Destination host unreachable", "100% packet loss"):
+                if hint.lower() in out.lower():
+                    return f"目标无响应（{hint}）"
+            return "已执行（输出格式未识别）"
+        return f"发送 {sent} · 接收 {recv} · 丢包 {loss}%{rtt}"
+
+    # ============================================================ 系统信息
+    def _build_sys(self, pg):
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(2, weight=1)
+
+        c = U.Card(pg, title="系统概览", hint="按探测到的系统生成命令")
+        c.grid(row=0, column=0, sticky="we")
+        b = c.body
+        row = U.wframe(b, "card")
+        row.pack(fill="x")
+        for label, key in (("版本信息", "os"), ("负载", "uptime"),
+                           ("磁盘", "disk"), ("进程 TOP", "top")):
+            U.RoundButton(row, label, lambda k=key: self.do_sys(k),
+                          variant="secondary", font=U.FONT_S,
+                          height=30, padx=14).pack(side="left", padx=(0, 8))
+        U.RoundButton(row, "重新探测设备", self._redetect, variant="ghost",
+                      font=U.FONT_S, height=30, padx=12).pack(side="right")
+
+        self.kk_sys = KVGrid(b, columns=3)
+        self.kk_sys.pack(fill="x", pady=(U.px(12), 0))
+        self.kk_sys.set_items([("系统", "尚未读取", None), ("内核", "—", None),
+                               ("架构", "—", None)])
+
+        head = U.wframe(pg, "page")
+        head.grid(row=1, column=0, sticky="we", pady=(U.px(10), 0))
+        self.seg_sys = Segmented(head, [("disk", "磁盘"), ("proc", "进程"),
+                                        ("raw", "原始输出")],
+                                 command=self._sys_view)
+        self.seg_sys.pack(side="left")
+        self.lbl_sys = U.wlabel(head, "", "pagedim", U.FONT_XS)
+        self.lbl_sys.pack(side="right")
+
+        c2 = U.Card(pg, title="明细")
+        c2.grid(row=2, column=0, sticky="nsew", pady=(U.px(8), 0))
+        holder = U.wframe(c2.body, "card")
+        holder.pack(fill="both", expand=True)
+        holder.rowconfigure(0, weight=1)
+        holder.columnconfigure(0, weight=1)
+
+        self.tbl_disk = DataTable(holder, SYS_COLS["disk"], height=8,
+                                  searchable=False,
+                                  empty_title="还没有读取磁盘",
+                                  empty_hint="点上面的「磁盘」。")
+        self.tbl_proc = DataTable(holder, SYS_COLS["proc"], height=8,
+                                  searchable=True,
+                                  empty_title="还没有读取进程",
+                                  empty_hint="点上面的「进程 TOP」。")
+        self.raw_sys = tk.Frame(holder, bg=U.T.card, bd=0)
+        self.txt_sys = tk.Text(self.raw_sys, bg=U.T.console_bg, fg=U.T.console_fg,
+                               font=U.MONO_S, bd=0, relief="flat",
+                               highlightthickness=0, wrap="none",
+                               padx=U.px(10), pady=U.px(8))
+        sb = tk.Scrollbar(self.raw_sys, command=self.txt_sys.yview, width=U.px(11))
+        self.txt_sys.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.txt_sys.pack(side="left", fill="both", expand=True)
+        self.txt_sys.configure(state="disabled")
+
+        for w in (self.tbl_disk, self.tbl_proc, self.raw_sys):
+            w.grid(row=0, column=0, sticky="nsew")
+        self._sys_views = {"disk": self.tbl_disk, "proc": self.tbl_proc,
+                           "raw": self.raw_sys}
+        self._sys_view("disk")
+
+    def _sys_view(self, key: str):
+        for k, w in self._sys_views.items():
+            if k == key:
+                w.grid()
+                w.tkraise()
+            else:
+                w.grid_remove()
+
+    def do_sys(self, key: str):
+        s = self._active_session()
+        d = self._active_dialect()
+        cmd = {"os": d.os_info_cmd(), "uptime": d.uptime_cmd(),
+               "disk": d.disk_cmd(), "top": d.top_cmd()}[key]
+        self.status.set_state("执行中…")
+
+        def work():
+            return key, s.run_traced(cmd, timeout=60)
+
+        def done(res):
+            k, (rc, out, err) = res
+            body = out or err
+            self.txt_sys.configure(state="normal")
+            self.txt_sys.delete("1.0", "end")
+            self.txt_sys.insert("1.0", self._scrub(body))
+            self.txt_sys.configure(state="disabled")
+            if k == "os":
+                self.kk_sys.set_items(self._os_overview(body))
+                self._sys_view("raw")
+                self.seg_sys.select("raw", fire=False)
+                self.lbl_sys.configure(text="版本信息已解析到上方概览")
+            elif k == "uptime":
+                rows = self._uptime_rows(body)
+                self.kk_sys.set_items(rows[:3] + self.kk_sys_items_keep())
+                self._sys_view("raw")
+                self.seg_sys.select("raw", fire=False)
+                self.lbl_sys.configure(text=body.strip().splitlines()[0][:80]
+                                       if body.strip() else "")
+            elif k == "disk":
+                rows = parsers.disk_table(body)
+                self.tbl_disk.set_rows(rows)
+                self._sys_view("disk")
+                self.seg_sys.select("disk", fire=False)
+                self.lbl_sys.configure(text=f"{len(rows)} 个分区")
+            elif k == "top":
+                rows = parsers.proc_table(body)
+                fam = self._effective_device().os_family
+                self.tbl_proc.set_columns(
+                    SYS_COLS["proc_win"] if fam == "windows" else SYS_COLS["proc"])
+                self.tbl_proc.set_rows(rows)
+                self._sys_view("proc")
+                self.seg_sys.select("proc", fire=False)
+                self.lbl_sys.configure(text=f"{len(rows)} 个进程")
+            self.status.set_state("完成" if rc == 0 else f"rc={rc}",
+                                  "ok" if rc == 0 else "warn")
+
+        self.bg(work, ok=done, err=lambda m: self.status.set_state(m, "err"))
+
+    def kk_sys_items_keep(self):
+        """切换概览内容时保留「系统 / 内核 / 架构」这三项。"""
+        d = self.device if self.device.os_family else self._effective_device()
+        return [("系统", d.os_name or d.os_family, "brand"),
+                ("内核", d.kernel or "—", None),
+                ("架构", d.arch or "—", None)]
+
+    def _os_overview(self, text: str) -> list[tuple]:
+        d = self.device if self.device.os_family else self._effective_device()
+        items = [("系统", d.os_name or d.os_family, "brand"),
+                 ("内核", d.kernel or "—", None),
+                 ("架构", d.arch or "—", None)]
+        pairs = []
+        for ln in text.splitlines():
+            if ":" in ln:
+                k, _, v = ln.partition(":")
+                if v.strip():
+                    pairs.append((k.strip(), v.strip().strip('"')))
+        want = ("PRETTY_NAME", "VERSION", "NAME", "ID", "OS 名称", "OS 版本",
+                "系统型号", "系统类型", "处理器", "物理内存总量", "OS Name",
+                "OS Version", "System Model", "Processor", "Total Physical Memory")
+        seen = set()
+        for k, v in pairs:
+            if k in want and k not in seen:
+                seen.add(k)
+                label = {"PRETTY_NAME": "发行版", "VERSION": "版本",
+                         "NAME": "名称", "ID": "ID"}.get(k, k)
+                items.append((label, v[:52], None))
+        # uname 行
+        m = re.search(r"^(Linux|Darwin|FreeBSD)\s+(\S+)\s+(\S+)", text, re.M)
+        if m:
+            items.append(("主机名", m.group(2), None))
+        if len(items) < 5:
+            items.append(("提示", "未识别到发行版信息，原始输出里有完整内容", "warn"))
+        return items[:9]
+
+    def _uptime_rows(self, text: str) -> list[tuple]:
+        out = []
+        m = re.search(r"up\s+([^,]+)", text)
+        if m:
+            out.append(("已运行", m.group(1).strip(), "brand"))
+        m = re.search(r"load averages?:\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)",
+                      text)
+        if m:
+            out.append(("负载 (1/5/15)", "/".join(m.groups()), None))
+        m = re.search(r"\busers?,\s*|(\d+)\s+users?", text)
+        if m and m.group(1):
+            out.append(("登录用户", m.group(1), None))
+        if not out:
+            out.append(("负载", text.strip().splitlines()[0][:60] if text.strip() else "—", None))
+        return out
+
+    def _redetect(self):
+        s = self._active_session()
+
+        def work():
+            return detect(s)
+
+        def ok(dev):
+            self.device = dev
+            self.dialect = dialect_for(dev)
+            if self.session:
+                self.sampler = Sampler(self.session, self.dialect)
+                self._render_device(dev, self.session)
+            self.status.set_device(dev.hostname or dev.os_name, dev.os_family)
+            self.pill_dev.set(dev.os_name or "已连接", "ok")
+            messagebox.showinfo("探测完成",
+                                f"{dev.os_name}\n{dev.kernel}\n{dev.device_type}",
+                                parent=self)
+
+        self.bg(work, ok=ok, err=lambda m: messagebox.showerror("探测失败", m, parent=self))
+
+    # ============================================================ VPN 模块
+    def _build_vpn(self, pg):
+        """证书控制台直接长在这一页里（不再是独立进程）。
+
+        它本身就是个 tk.Frame，这里只负责挂上去 + 首次进入时才读磁盘。
+        """
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(0, weight=1)
+        from vpncert_gui import App as VpnConsole
+        self.vpn_console = VpnConsole(pg, embedded=True,
+                                      on_status=self._vpn_status,
+                                      on_quit=self._quit_app)
+        self.vpn_console.grid(row=0, column=0, sticky="nsew")
+
+    def _vpn_status(self, text: str) -> None:
+        """控制台内部的状态文案转发到主程序状态栏。"""
+        try:
+            tone = "err" if str(text).startswith("✗") else \
+                "ok" if str(text).startswith("✓") else None
+            self.status.set_state(str(text)[:110], tone)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _vpn_boot(self) -> None:
+        if getattr(self, "_vpn_booted", True):
+            return
+        self._vpn_booted = True
+        try:
+            self.vpn_console.boot()
+        except Exception as e:  # noqa: BLE001
+            self.status.set_state(f"证书控制台初始化失败：{e}", "err")
+
+    # ============================================================ 防火墙模块
+    # ============================================================ 应用锁
+    def _lock_btn_text(self) -> str:
+        return "🔒 锁定" if self.lock.enabled() else "设置锁"
+
+    def _watch_activity(self):
+        for seq in ("<Any-KeyPress>", "<Any-ButtonPress>", "<MouseWheel>"):
+            self.bind_all(seq, self._touch, add="+")
+        self._lock_tick()
+
+    def _touch(self, _e=None):
+        self._last_active = time.time()
+
+    def _lock_tick(self):
+        try:
+            if self._lock_overlay is None and self.lock.enabled():
+                t = self.lock.timeout()
+                if t and time.time() - self._last_active > t:
+                    self._show_lock("闲置超时，已自动锁定")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.after(5000, self._lock_tick)
+        except tk.TclError:
+            pass
+
+    def _maybe_lock_on_start(self):
+        if not self.lock.enabled():
+            return
+        if self.lock.auto_login():
+            ok, _ = self.lock.unlock_with_remembered()
+            if ok:
+                return
+        self._show_lock("启动需要解锁")
+
+    def _show_lock(self, reason: str = ""):
+        """锁屏：紧凑卡片 + 明确的解锁按钮。
+
+        之前用 `U.Card` 自适应高度，在部分 DPI / ttk 环境下输入框和按钮会被
+        算成 0 高而看不见 —— 这里改成固定宽度 + 逐项显式 pack，并保留抖动反馈。
+        """
+        if self._lock_overlay is not None:
+            return
+        try:
+            self._disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        self.lock.forget()
+
+        ov = tk.Frame(self, bg=U.T.page, bd=0, highlightthickness=0)
+        ov.place(x=0, y=0, relwidth=1, relheight=1)
+        ov.lift()
+        wrap = tk.Frame(ov, bg=U.T.page, bd=0)
+        wrap.place(relx=0.5, rely=0.42, anchor="center")
+
+        card = tk.Frame(wrap, bg=U.T.card, bd=0, highlightthickness=1,
+                        highlightbackground=U.T.border)
+        card.pack()
+        body = tk.Frame(card, bg=U.T.card, bd=0)
+        body.pack(padx=U.px(26), pady=U.px(22))
+
+        # 一把锁的小图标（Canvas 自绘，不依赖图片资源）
+        icon = tk.Canvas(body, width=U.px(46), height=U.px(46),
+                         bg=U.T.card, highlightthickness=0, bd=0)
+        icon.pack()
+        icon.create_arc(U.px(11), U.px(4), U.px(35), U.px(28), start=0,
+                        extent=180, style="arc", outline=U.T.brand,
+                        width=max(2, U.px(2.2)))
+        icon.create_rectangle(U.px(8), U.px(18), U.px(38), U.px(42),
+                              outline=U.T.brand, width=max(2, U.px(2.2)),
+                              fill=U.T.brand_soft)
+        icon.create_oval(U.px(21), U.px(26), U.px(25), U.px(30),
+                         outline="", fill=U.T.brand)
+        icon.create_line(U.px(23), U.px(30), U.px(23), U.px(35),
+                         fill=U.T.brand, width=max(2, U.px(2)))
+
+        tk.Label(body, text="应用已锁定", bg=U.T.card, fg=U.T.text,
+                 font=U.FONT_T).pack(pady=(U.px(10), 0))
+        tk.Label(body, text=reason or "输入密码解锁", bg=U.T.card,
+                 fg=U.T.text_dim, font=U.FONT_XS).pack(pady=(U.px(3), 0))
+
+        v = tk.StringVar()
+        e = ttk.Entry(body, textvariable=v, show="*", width=26, font=U.FONT)
+        e.pack(fill="x", pady=(U.px(14), 0), ipady=U.px(2))
+        msg = tk.Label(body, text="", bg=U.T.card, fg=U.T.err, font=U.FONT_XS)
+        msg.pack(pady=(U.px(6), 0))
+
+        btn = U.RoundButton(body, "解 锁", None, variant="primary",
+                            height=34, padx=18, font=U.FONT_B)
+        btn.pack(fill="x", pady=(U.px(8), 0))
+        quit_btn = U.RoundButton(body, "退出程序", lambda: self._quit_app(),
+                                 variant="ghost", height=30, padx=12,
+                                 font=U.FONT_S)
+        quit_btn.pack(pady=(U.px(6), 0))
+
+        def shake(i: int = 0):
+            if i >= 6:
+                try:
+                    wrap.place_configure(x=0)
+                except tk.TclError:
+                    pass
+                return
+            try:
+                wrap.place_configure(x=U.px(9 if i % 2 == 0 else -9))
+            except tk.TclError:
+                return
+            self.after(45, shake, i + 1)
+
+        def unlock(_e=None):
+            if self.lock.check(v.get()):
+                self.lock.adopt(v.get())
+                self._last_active = time.time()
+                ov.destroy()
+                self._lock_overlay = None
+                self.status.set_state("已解锁", "ok")
+                return
+            msg.configure(text="密码不对，再试一次")
+            v.set("")
+            e.focus_set()
+            shake()
+
+        btn.command = unlock
+        e.bind("<Return>", unlock)
+        self._lock_overlay = ov
+        self.after(60, lambda: (e.focus_force(), e.icursor("end")))
+
+    def _lock_dialog(self):
+        if not self.lock.enabled():
+            self._open_lock_window()
+            return
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="立即锁定", command=lambda: self._show_lock("已手动锁定"))
+        m.add_command(label="锁设置…", command=self._open_lock_window)
+        m.add_separator()
+        m.add_command(label="关闭应用锁", command=self._open_lock_window)
+        m.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+
+    def _open_lock_window(self):
+        """锁设置。已启用时必须先输当前密码才能改 / 关 —— 否则锁没意义。"""
+        enabled = self.lock.enabled()
+        dlg = tk.Toplevel(self)
+        dlg.title("应用锁")
+        dlg.configure(bg=U.T.page)
+        dlg.transient(self)
+        dlg.resizable(False, False)
+
+        card = U.Card(dlg, pad=20)
+        card.pack(fill="both", expand=True, padx=U.px(12), pady=U.px(12))
+        b = card.body
+        U.wlabel(b, "应用锁", "card", U.FONT_H).pack(anchor="w")
+        U.wlabel(b, self.lock.describe(), "dim", U.FONT_S).pack(
+            anchor="w", pady=(U.px(3), U.px(12)))
+
+        v_old = tk.StringVar()
+        v_pw, v_pw2 = tk.StringVar(), tk.StringVar()
+        v_min = tk.StringVar(value=str(max(0, self.lock.timeout() // 60)))
+        v_rem = tk.BooleanVar(value=self.lock.auto_login())
+
+        def field(label: str, var: tk.StringVar, hint: str = ""):
+            U.wlabel(b, label, "card", U.FONT_S).pack(anchor="w")
+            ent = ttk.Entry(b, textvariable=var, show="*", width=32)
+            ent.pack(fill="x", pady=(U.px(3), U.px(8)))
+            if hint:
+                U.wlabel(b, hint, "mute", U.FONT_XS).pack(
+                    anchor="w", pady=(0, U.px(8)))
+            return ent
+
+        e_old = None
+        if enabled:
+            e_old = field("当前密码（修改必须验证）", v_old,
+                          "已启用应用锁，改密码或关闭都要先输对当前密码。")
+        field("新密码（至少 6 位）", v_pw)
+        field("再输一次", v_pw2)
+
+        r = U.wframe(b, "card")
+        r.pack(fill="x", pady=(U.px(2), 0))
+        U.wlabel(r, "闲置", "card", U.FONT_S).pack(side="left")
+        ttk.Entry(r, textvariable=v_min, width=6).pack(side="left", padx=(6, 4))
+        U.wlabel(r, "分钟后锁定（0 = 永不）", "card", U.FONT_S).pack(side="left")
+        U.Check(b, "记住密码（本机加密保存，启动自动解锁）", v_rem).pack(
+            anchor="w", pady=(U.px(10), 0))
+
+        msg = U.wlabel(b, "", "err", U.FONT_XS, justify="left",
+                       wraplength=U.px(400))
+        msg.pack(anchor="w", pady=(U.px(8), 0))
+        act = U.wframe(b, "card")
+        act.pack(fill="x", pady=(U.px(12), 0))
+
+        def apply_pw(close_lock: bool = False):
+            old = v_old.get() if enabled else None
+            if v_pw.get() != v_pw2.get():
+                return msg.configure(text="两次输入不一致")
+            try:
+                mins = int(v_min.get() or "30")
+            except ValueError:
+                return msg.configure(text="分钟数必须是数字")
+            if close_lock:
+                ok, text = self.lock.clear_password(old_password=old)
+                if not ok:
+                    return msg.configure(text=text)
+                self.btn_lock.set_text(self._lock_btn_text())
+                self.toast(text, "ok")
+                dlg.destroy()
+                return
+            ok, text = self.lock.set_password(
+                v_pw.get(), timeout=0 if mins <= 0 else mins * 60,
+                remember=v_rem.get(), old_password=old)
+            if not ok:
+                return msg.configure(text=text)
+            self.btn_lock.set_text(self._lock_btn_text())
+            self.toast(text, "ok")
+            dlg.destroy()
+
+        U.RoundButton(act, "保存" if enabled else "启用", apply_pw,
+                      variant="primary", height=32, padx=18).pack(side="left")
+        if enabled:
+            U.RoundButton(act, "关闭应用锁",
+                          lambda: apply_pw(close_lock=True),
+                          variant="danger", height=32, padx=14).pack(
+                side="left", padx=(U.px(8), 0))
+        U.RoundButton(act, "取消", dlg.destroy, variant="ghost",
+                      height=32, padx=14).pack(side="right")
+
+        w = U.px(470)
+        dlg.update_idletasks()
+        h = dlg.winfo_reqheight()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - h) // 3)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        if e_old is not None:
+            e_old.focus_set()
+        else:
+            dlg.focus_set()
+        dlg.grab_set()
+
+def main():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 证书控制台已经内嵌在「VPN 证书」页里，不再有 --vpncert 子进程形态。
+    # 想单独调它可以直接 `python vpncert_gui.py`（它自己能独立跑）。
+
+    if "--dark" in sys.argv:
+        U.T = U.DARK
+    app = ToolboxApp()
+    if "--page" in sys.argv:
+        i = sys.argv.index("--page")
+        if i + 1 < len(sys.argv) and sys.argv[i + 1] in app._pages:
+            app.nav.select(sys.argv[i + 1])
+    if "--smoke" in sys.argv:
+        app.after(1500, app.destroy)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+# 统一换行：源码与文档一律 LF，Windows 批处理保留 CRLF
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.spec  text eol=lf
+
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# 二进制
+*.png   binary
+*.ico   binary
+*.exe   binary

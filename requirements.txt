@@ -1,0 +1,7 @@
+# 运行时依赖（只这两个；其余全是标准库）
+paramiko>=5.0          # SSH / SFTP，LGPL-2.1
+cryptography>=42.0     # AES-GCM / 证书操作，Apache-2.0 OR BSD-3-Clause
+
+# 开发 / 打包（pip install -r requirements-dev.txt）
+#   pillow        截图与图标生成
+#   pyinstaller   单文件打包
