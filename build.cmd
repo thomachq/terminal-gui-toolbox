@@ -14,6 +14,8 @@ if exist "%~dp0.venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
 if not defined PY (
     for %%I in (python.exe) do if not "%%~$PATH:I"=="" set "PY=%%~$PATH:I"
 )
+rem explicit override wins:  set TERMTOOLBOX_PYTHON=D:\some\venv\Scripts\python.exe
+if defined TERMTOOLBOX_PYTHON if exist "%TERMTOOLBOX_PYTHON%" set "PY=%TERMTOOLBOX_PYTHON%"
 if not defined PY (
     echo [ERROR] No Python interpreter found.
     echo.

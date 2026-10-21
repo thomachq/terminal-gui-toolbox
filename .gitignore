@@ -22,6 +22,10 @@ dbg*.txt
 out.txt
 err.txt
 
+# ── 本机专用的启动器（写死了本机解释器路径，不进仓库）──
+*.local.cmd
+.venv/
+
 # ── 编辑器 / 系统 ──
 .vscode/
 .idea/
