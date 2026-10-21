@@ -214,6 +214,78 @@ def parse_route_linux(text: str) -> list[dict]:
     return rows
 
 
+_CIDR = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})")
+_VIA = re.compile(r"via\s+(\d{1,3}(?:\.\d{1,3}){3})", re.I)
+_DIRECT = re.compile(r"directly connected,\s*(\S+)", re.I)
+_CISCO_CODE = {"S": "static", "C": "connected", "L": "local", "R": "rip",
+               "O": "ospf", "B": "bgp", "D": "eigrp", "i": "isis", "M": "mobile"}
+
+
+def parse_route_network(text: str) -> list[dict]:
+    """网络设备的路由表：Cisco `show ip route` 与 H3C/华为 `display ip routing-table`。
+
+    两种格式差得挺远：
+      Cisco  "S*  0.0.0.0/0 [1/0] via 192.168.1.1"
+             "C   192.168.1.0/24 is directly connected, Vlan1"
+      H3C    "0.0.0.0/0   Static  60  0  192.168.1.1  GE1/0/1"
+
+    共同点是每行都带一个 CIDR，所以先用它定位，再按有没有 via / directly
+    connected 分流，剩下的当表格按列切。
+    """
+    rows: list[dict] = []
+    for ln in _lines(text):
+        s = ln.strip()
+        m = _CIDR.search(s)
+        if not m:
+            continue
+        # "10.0.0.0/8 is variably subnetted, 2 subnets, 2 masks" 是分节标题，
+        # 不是一条路由 —— 它有 CIDR，不排掉就会在表里多出一行假的。
+        low = s.lower()
+        if "subnetted" in low or "subnets" in low:
+            continue
+        row = {"dst": f"{m.group(1)}/{m.group(2)}", "gateway": "", "dev": "",
+               "metric": "", "proto": "", "scope": "", "src": "", "flags": ""}
+        via = _VIA.search(s)
+        direct = _DIRECT.search(s)
+        toks = s.split()
+        head = toks[0]
+
+        if re.fullmatch(r"\*?[A-Za-z]{1,2}\*?", head):
+            # Cisco 风格：行首是路由码，可能带 * （候选默认路由）
+            code = head.replace("*", "")
+            row["proto"] = _CISCO_CODE.get(code[:1], code.lower())
+            row["flags"] = "*" if "*" in head else ""
+            if direct:
+                row["dev"] = direct.group(1).rstrip(",")
+                row["proto"] = row["proto"] or "connected"
+            elif via:
+                row["gateway"] = via.group(1)
+            mv = re.search(r"\[(\d+)/(\d+)\]", s)
+            if mv:
+                row["metric"] = mv.group(1)
+        else:
+            # 表格风格：CIDR 之后是 Proto / Pre / Cost / NextHop / Interface
+            idx = next((i for i, t in enumerate(toks) if _CIDR.search(t)), -1)
+            rest = toks[idx + 1:] if idx >= 0 else []
+            if rest and not re.match(r"^[\d.]+$", rest[0]):
+                row["proto"] = rest[0].lower()
+            nums = [t for t in rest if re.match(r"^[\d.]+$", t)]
+            if nums:
+                row["metric"] = nums[0]                       # Pre（优先级）
+            ips = [t for t in rest if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", t)]
+            if ips:
+                row["gateway"] = ips[0]
+            if len(rest) >= 2:
+                tail = rest[-1]
+                if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", tail) and not tail.isdigit():
+                    row["dev"] = tail
+        if not row["gateway"] and row["proto"] in ("direct", "connected", "local"):
+            row["gateway"] = "直连"
+        row["_tone"] = "brand" if row["dst"] == "0.0.0.0/0" else ""
+        rows.append(row)
+    return rows
+
+
 def parse_route_win(text: str) -> list[dict]:
     rows = []
     started = False

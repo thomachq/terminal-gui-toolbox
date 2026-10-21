@@ -18,7 +18,7 @@ except Exception:  # noqa: BLE001
 
 HERE = Path(__file__).resolve().parent
 EXE = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "VPNCertConsole.exe"
-TITLE = "VPN Cert Console"
+TITLE = "Client Cert Console"
 OUT = Path(r"C:\Users\Thomas\AppData\Local\Temp\vpn_exe.png")
 
 u = ctypes.windll.user32

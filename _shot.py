@@ -18,7 +18,7 @@ from PIL import Image
 HERE = Path(__file__).resolve().parent
 PY = sys.executable
 OUT = Path(r"C:\Users\Thomas\AppData\Local\Temp")
-TITLE = "VPN Cert Console"
+TITLE = "Client Cert Console"
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)

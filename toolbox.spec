@@ -31,7 +31,7 @@ hidden = [
     'cryptography.hazmat.primitives.ciphers.aead',
     # 本工具箱自身的分层（页面是 Mixin，靠多继承拼进 ToolboxApp，
     # 静态分析有时扫不到，全部显式列出）
-    'core.detect', 'core.session', 'core.metrics',
+    'core.detect', 'core.session', 'core.telnet_session', 'core.metrics',
     'core.parsers', 'core.routes', 'core.firewall', 'core.docker',
     'core.files', 'core.redact',
     'ui.statusbar', 'ui.logpanel', 'ui.table', 'ui.forms',

@@ -25,6 +25,25 @@ class SessionError(Exception):
     pass
 
 
+class NeedElevation(SessionError):
+    """需要更高权限，但手上没有凭据。
+
+    上层（主程序的 bg() 统一出口）会弹一个输入框要 sudo 密码，
+    或者提示「以管理员身份重启」。所以这里只描述「缺什么」，不自己弹窗 ——
+    run_admin() 可能在后台线程里跑，Tk 窗口只能在主线程开。
+
+    kind:
+      sudo   —— 类 Unix，需要 sudo 密码（本机或 SSH 都一样）
+      uac    —— Windows 本机，需要整个进程以管理员身份运行
+      enable —— 网络设备（Cisco / H3C），需要进特权模式
+    """
+
+    def __init__(self, message: str, kind: str = "sudo", target: str = "") -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.target = target      # 显示给用户看的目标（user@host 或 本机）
+
+
 # ------------------------------------------------------------------ 编码
 def _ansi_enc() -> str:
     """Windows 下控制台输出的默认编码（中文系统是 cp936/GBK）。"""
@@ -169,20 +188,49 @@ class LocalSession(BaseSession):
         self.ps_native = self.is_windows
         self.platform_hint = {"win32": "windows", "darwin": "darwin"}.get(
             sys.platform, "linux")
+        self.sudo_pw: str | None = None
+        # 允许外部指定「这次当自己是不是管理员」：自测要模拟普通用户，
+        # 界面上「以管理员身份运行」勾选后也可以先假定提权成功再重启。
+        self._admin_override: bool | None = None
+        self.is_root = self.is_admin
+
+    @property
+    def admin_kind(self) -> str:
+        """这一端提权靠什么：Windows 是整个进程 UAC，类 Unix 是 sudo。"""
+        return "uac" if self.is_windows else "sudo"
+
+    @property
+    def is_admin(self) -> bool:
+        """当前进程是否已经具备管理员权限。"""
+        if self._admin_override is not None:
+            return self._admin_override
+        if self.is_windows:
+            try:
+                import ctypes
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:  # noqa: BLE001
+                return False
+        try:
+            return os.geteuid() == 0
+        except AttributeError:
+            return False
+
+    @is_admin.setter
+    def is_admin(self, value) -> None:
+        self._admin_override = None if value is None else bool(value)
 
     @property
     def alive(self) -> bool:
         return True
 
-    def run(self, cmd: str, timeout: int = 30) -> tuple[int, str, str]:
+    def _exec(self, args: list[str], timeout: int,
+              stdin_text: str = "") -> tuple[int, str, str]:
         try:
-            if self.is_windows:
-                args = windows_argv(cmd)
-            else:
-                args = ["/bin/sh", "-c", cmd]
-            p = subprocess.run(args, capture_output=True, timeout=timeout,
-                               creationflags=(subprocess.CREATE_NO_WINDOW
-                                              if self.is_windows else 0))
+            p = subprocess.run(
+                args, capture_output=True, timeout=timeout,
+                input=(stdin_text.encode("utf-8") if stdin_text else None),
+                creationflags=(subprocess.CREATE_NO_WINDOW
+                               if self.is_windows else 0))
             return p.returncode, decode_bytes(p.stdout), decode_bytes(p.stderr)
         except subprocess.TimeoutExpired:
             return 124, "", f"命令超时（{timeout}s）"
@@ -191,22 +239,52 @@ class LocalSession(BaseSession):
         except OSError as e:
             return 126, "", str(e)
 
+    def run(self, cmd: str, timeout: int = 30) -> tuple[int, str, str]:
+        args = windows_argv(cmd) if self.is_windows else ["/bin/sh", "-c", cmd]
+        return self._exec(args, timeout)
+
+    def sudo_ok(self, pw: str) -> bool:
+        """在本机类 Unix 上验一次 sudo 密码（sudo -v 只刷时间戳，不执行命令）。"""
+        if self.is_windows:
+            return False
+        self.sudo_pw = pw
+        rc, _, _ = self._exec(["sudo", "-S", "-p", "", "-v"], 20, pw + "\n")
+        return rc == 0
+
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
         if self.is_windows:
-            # Windows 没有 sudo：要么本程序以管理员启动，要么命令自己失败
+            # Windows 没有 sudo：要么整个进程以管理员启动，要么命令自己失败。
+            # 这里必须先判断，否则报错会伪装成「系统找不到路径」这种误导信息。
+            if not self.is_admin:
+                raise NeedElevation(
+                    "这一步要管理员权限：请以管理员身份运行本程序，"
+                    "或在「连接与设备」里勾选「以管理员身份运行」。",
+                    kind="uac", target="本机")
             return self.run_traced(cmd, timeout)
-        try:
-            root = os.geteuid() == 0
-        except AttributeError:
-            root = False
-        if root:
+
+        if self.is_admin:
             return self.run_traced(cmd, timeout)
-        return self.run_traced("sudo -n " + shlex.quote(cmd), timeout)
+        if not self.sudo_pw:
+            raise NeedElevation(
+                "这一步要 root 权限：请提供 sudo 密码。",
+                kind="sudo", target=self.user or "本机")
+        # 密码走 stdin，不进命令行 —— 进程列表里查不到，日志里也不会留痕。
+        t0 = time.time()
+        rc, out, err = self._exec(
+            ["sudo", "-S", "-p", "", "-H", "sh", "-c", cmd],
+            timeout, self.sudo_pw + "\n")
+        self._trace("sudo " + cmd, rc, out, err,
+                    int((time.time() - t0) * 1000))
+        return rc, out, err
 
     def can_admin(self) -> tuple[bool, str]:
+        if self.is_admin:
+            return True, ""
         if self.is_windows:
-            return True, "Windows 下需要以管理员身份运行本程序才能改路由 / 防火墙"
-        return True, ""
+            return False, "需要以管理员身份运行"
+        if self.sudo_pw:
+            return True, ""
+        return False, "需要 sudo 密码"
 
 
 # ------------------------------------------------------------------ SSH
@@ -304,13 +382,18 @@ class SSHSession(BaseSession):
             return False
 
     # ---------------- 提权
+    @property
+    def admin_kind(self) -> str:
+        return "sudo"
+
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
         if self.is_root or self.user == "root":
             return self.run_traced(cmd, timeout)
         if not self.sudo_pw:
-            raise SessionError(
-                "该操作需要 root 权限：请在「连接与设备」里填写 sudo 密码，"
-                "或改用 root 账户登录")
+            raise NeedElevation(
+                "这一步要 root 权限：请提供 sudo 密码。",
+                kind="sudo", target=f"{self.user}@{self.host}" if self.host
+                else self.user)
         t0 = time.time()
         try:
             rc, out, err = self.run(cmd, timeout=timeout, sudo=True)
@@ -349,12 +432,16 @@ class TelnetSession(BaseSession):
     def __init__(self) -> None:
         super().__init__()
         self._impl = None
+        self.sudo_pw: str | None = None
+        self.enabled = False
 
-    def connect(self, host: str, port: int = 23, timeout: int = 15) -> None:
+    def connect(self, host: str, port: int = 23, timeout: int = 15,
+                user: str = "", password: str = "") -> None:
         from core.telnet_session import TelnetClient  # 延迟导入，避免循环
         self._impl = TelnetClient(host, port, timeout=timeout)
+        self._impl.login(user, password)
         self.host, self.port = host, int(port)
-        self.user = ""
+        self.user = user
         self.label = f"telnet://{host}:{port}"
 
     @property
@@ -372,6 +459,36 @@ class TelnetSession(BaseSession):
         out = self._impl.command(cmd, timeout=timeout)
         return 0, out, ""
 
+    # ---------------- 提权：网络设备没有 sudo，只有 enable 特权模式
+    @property
+    def admin_kind(self) -> str:
+        return "enable"
+
+    def can_admin(self) -> tuple[bool, str]:
+        if self.enabled or self.is_root:
+            return True, ""
+        return False, "需要 enable 密码"
+
+    def sudo_ok(self, pw: str) -> bool:
+        """网络设备上「提权」= 进 enable 模式，密码就是 enable 密码。"""
+        if not self._impl:
+            return False
+        ok = self._impl.enable(pw)
+        self.enabled = bool(ok)
+        if ok:
+            self.sudo_pw = pw
+            self.is_root = True
+        return ok
+
+    def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
+        if not self._impl:
+            raise SessionError("尚未连接")
+        if not self.enabled:
+            raise NeedElevation(
+                "这一步要进入特权模式：请提供 enable 密码。",
+                kind="enable", target=self.host)
+        return self.run_traced(cmd, timeout)
+
 
 # ------------------------------------------------------------------ 工厂
 @dataclass
@@ -384,18 +501,29 @@ class ConnSpec:
     key_path: str = ""
     password: str = ""
     key_passphrase: str = ""
+    # 提权：给了密码就连上后自动提权（类 Unix 上是 sudo -i，网络设备是 enable）
+    sudo_password: str = ""
+    elevate: bool = False
 
 
 def open_session(spec: ConnSpec) -> BaseSession:
     if spec.proto == "local":
-        return LocalSession()
+        s = LocalSession()
+        if spec.elevate and not s.is_windows and spec.sudo_password:
+            s.sudo_ok(spec.sudo_password)
+        return s
     if spec.proto == "telnet":
         s = TelnetSession()
-        s.connect(spec.host, spec.port or 23)
+        s.connect(spec.host, spec.port or 23,
+                  user=spec.user, password=spec.password)
+        if spec.elevate and spec.sudo_password:
+            s.sudo_ok(spec.sudo_password)
         return s
     s = SSHSession()
     s.connect(spec.host, spec.port or 22, spec.user,
               password=spec.password if spec.auth == "password" else None,
               key_path=spec.key_path if spec.auth == "key" else None,
               key_passphrase=spec.key_passphrase or None)
+    if spec.elevate and spec.sudo_password:
+        s.sudo_ok(spec.sudo_password)
     return s

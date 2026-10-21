@@ -11,12 +11,13 @@
   · 路由表        —— 读 + 增删
   · 防火墙        —— nftables / iptables / netsh / pf / ipfw 读 + 增删
   · Docker        —— 容器 / 镜像 / 资源占用，未安装时明确提示
-  · VPN 证书      —— 群晖 OpenVPN 证书控制台（独立窗口形态）
+  · 隧道客户端证书管理 —— 建 CA / 签证书 / 多平台打包 / 吊销（内嵌页）
   · 智能体接入    —— 本地 HTTP API，给 AI 智能体保持 SSH 连接
 """
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
 import shlex
@@ -39,8 +40,8 @@ from core import redact
 from core.detect import DeviceInfo, capabilities, detect, dialect_for
 from core.metrics import (Sampler, human_bytes, human_gb, human_rate,
                           human_uptime)
-from core.session import (ConnSpec, LocalSession, SSHSession, SessionError,
-                          open_session)
+from core.session import (ConnSpec, LocalSession, NeedElevation, SSHSession,
+                          SessionError, open_session)
 from pages.api_page import ApiPage
 from pages.docker_page import DockerPage
 from pages.files_page import FilesPage
@@ -243,7 +244,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             ("routes", "路由表"),
             ("fw", "防火墙"),
             ("docker", "Docker"),
-            ("vpn", "VPN 证书"),
+            ("vpn", "隧道客户端证书管理"),
             ("api", "智能体接入"),
         ], on_change=self._show, width=176)
         self.nav.pack(side="left", fill="y", padx=(U.px(6), 0), pady=(U.px(2), U.px(8)))
@@ -571,21 +572,89 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
     def post(self, fn, *a):
         self.q.put((fn, a))
 
-    def bg(self, fn, ok=None, err=None):
+    def bg(self, fn, ok=None, err=None, allow_elev: bool = True):
         def run():
             try:
                 r = fn()
                 if ok:
                     self.post(ok, r)
+            except NeedElevation as e:
+                # 缺 sudo / enable 密码：交给主线程弹窗问一次，问到就重跑这条任务。
+                # 重跑时 allow_elev=False，避免密码一直错导致无限弹窗。
+                if allow_elev:
+                    self.post(self._ask_elevation, e, fn, ok, err)
+                else:
+                    self.post(self._fail_bg, str(e), err)
             except Exception as e:  # noqa: BLE001
                 tb = traceback.format_exc()
                 msg = str(e) or e.__class__.__name__
-                if err:
-                    self.post(err, msg)
-                else:
-                    self.post(self.status.set_state, msg, "err")
-                self.post(self._log_raw, "bad", f"[异常] {msg}\n{tb}")
+                self.post(self._fail_bg, msg, err, tb)
         threading.Thread(target=run, daemon=True).start()
+
+    def _fail_bg(self, msg, err=None, tb: str = "") -> None:
+        if err:
+            try:
+                err(msg)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+        else:
+            self.status.set_state(msg, "err")
+        if tb:
+            self._log_raw("bad", f"[异常] {msg}\n{tb}")
+
+    def _ask_elevation(self, exc, fn, ok, err) -> None:
+        """需要提权时的唯一入口：Windows 问要不要重启到管理员，其他问密码。
+
+        用户的要求是「不勾选 sudo 密码时，需要提权就弹窗」——
+        所以密码框不预填、不落盘，用完只在内存里留到本次会话结束。
+        """
+        s = self.session
+        if exc.kind == "uac":
+            if messagebox.askyesno(
+                    "需要管理员权限",
+                    f"{exc}\n\n要现在以管理员身份重新启动吗？\n"
+                    "（会关闭当前窗口并重开一个）",
+                    parent=self):
+                self._restart_as_admin()
+            else:
+                self.status.set_state("需要管理员权限", "warn")
+            return
+
+        if s is None or not hasattr(s, "sudo_ok"):
+            self.status.set_state(str(exc), "warn")
+            return
+
+        want_enable = exc.kind == "enable"
+        data = forms.FormDialog.open(
+            self,
+            "进入特权模式" if want_enable else "需要 sudo 密码",
+            [{"key": "pw",
+              "label": "enable 密码" if want_enable else "sudo 密码",
+              "kind": "password", "required": True, "width": 26,
+              "hint": "只在内存里用到本次会话结束，不写进档案"}],
+            subtitle=f"{exc}\n目标：{exc.target or '当前会话'}",
+            submit="提权并继续")
+        if not data:
+            self.status.set_state("已取消提权", "warn")
+            return
+        pw = str(data.get("pw") or "")
+
+        def work():
+            return bool(s.sudo_ok(pw))
+
+        def done(good):
+            if good:
+                self._log_raw("ok", "[提权] 密码通过，重试刚才的操作\n")
+                self.bg(fn, ok=ok, err=err, allow_elev=False)
+            else:
+                self._log_raw("bad", "[提权] 密码没通过\n")
+                messagebox.showwarning("提权失败", "密码没通过，操作已取消。",
+                                       parent=self)
+                self.status.set_state("提权失败", "warn")
+
+        self.bg(work, ok=done,
+                err=lambda m: self.status.set_state(m, "err"),
+                allow_elev=False)
 
     def _drain(self):
         try:
@@ -683,6 +752,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
 
         # 档案
         rowp = U.wframe(b, "card")
+        self.row_prof = rowp
         rowp.pack(fill="x", pady=(10, 0))
         U.wlabel(rowp, "档案", "card", U.FONT_S).pack(side="left")
         self.cb_prof = ttk.Combobox(rowp, textvariable=self.v_prof,
@@ -698,6 +768,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
 
         # 地址行
         row = U.wframe(b, "card")
+        self.row_addr = row
         row.pack(fill="x", pady=(9, 0))
         row.columnconfigure(1, weight=1)
         U.wlabel(row, "地址", "card", U.FONT_S).grid(row=0, column=0, sticky="w")
@@ -762,21 +833,21 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                       variant="ghost", font=U.FONT_S, height=24,
                       padx=7).pack(side="left", padx=(2, 0))
 
-        # 提权
-        rs = U.wframe(b, "card")
-        rs.pack(fill="x", pady=(9, 0))
-        U.wlabel(rs, "sudo 密码", "card", U.FONT_S).pack(side="left")
-        self.e_sudopw = ttk.Entry(rs, textvariable=self.v_sudopw, show="*", width=18)
-        self.e_sudopw.pack(side="left", padx=(8, 0))
-        U.RoundButton(rs, "👁", lambda: self._toggle_eye(self.e_sudopw),
-                      variant="ghost", font=U.FONT_S, height=24,
-                      padx=7).pack(side="left", padx=(2, 0))
+        # 提权：内容随「协议 + 本机系统」变，见 _rebuild_elevation()
+        self.v_elevate = tk.BooleanVar(value=False)
+        self.v_admin = tk.BooleanVar(value=False)
+        self.row_elev = U.wframe(b, "card")
+        self.row_elev.pack(fill="x", pady=(9, 0))
+        self.elev_holder = self.row_elev
 
         # 凭据保存：一个总开关 + 一行实时说明「现在到底存了什么」
-        rc = U.wframe(b, "card")
+        self.row_cred = U.wframe(b, "card")
+        rc = self.row_cred
         rc.pack(fill="x", pady=(9, 0))
-        U.Check(rc, "记住凭据（私钥口令 · 登录密码 · sudo 密码，本机加密保存）",
-                self.v_remember, command=self._remember_changed).pack(side="left")
+        self.chk_remember = U.Check(rc, "记住凭据（私钥口令 · 登录密码 · sudo 密码，"
+                                        "本机加密保存）",
+                                    self.v_remember, command=self._remember_changed)
+        self.chk_remember.pack(side="left")
         self.lbl_cred = U.wlabel(rc, "", "dim", U.FONT_XS, anchor="e")
         self.lbl_cred.pack(side="right")
 
@@ -810,6 +881,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self.txt_out.configure(state="disabled")
 
         self._mode_changed()
+        self._rebuild_elevation()
 
     def _kv_empty(self):
         for w in self.kv_holder.winfo_children():
@@ -830,20 +902,41 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
     def _proto_changed(self):
         proto = self.v_proto.get()
         if proto == "local":
+            # 本机不需要 IP / 端口 / 用户 / 私钥，那些是给远程设备准备的；
+            # 档案行也一并收起来 —— 本机没有「设备档案」这个概念。
             self.v_port.set("")
             self.e_host.configure(state="disabled")
-            self.row_auth.pack_forget()
-        elif proto == "telnet":
-            self.v_port.set("23")
-            self.e_host.configure(state="normal")
+            self.row_prof.pack_forget()
+            self.row_addr.pack_forget()
             self.row_auth.pack_forget()
         else:
+            if not self.row_prof.winfo_manager():
+                self.row_prof.pack(fill="x", pady=(10, 0), before=self.row_elev)
+            if not self.row_addr.winfo_manager():
+                self.row_addr.pack(fill="x", pady=(9, 0), before=self.row_elev)
             self.e_host.configure(state="normal")
-            if self.v_port.get() in ("", "23"):
-                self.v_port.set("22")
-            if not self.row_auth.winfo_ismapped():
-                self.row_auth.pack(fill="x", pady=(9, 0))
-            self._mode_changed()
+            if proto == "telnet":
+                self.v_port.set("23")
+                self.row_auth.pack_forget()
+            else:
+                if self.v_port.get() in ("", "23"):
+                    self.v_port.set("22")
+                if not self.row_auth.winfo_manager():
+                    self.row_auth.pack(fill="x", pady=(9, 0),
+                                       before=self.row_elev)
+                self._mode_changed()
+        # 本机 Windows 没有要输的口令，这行留着只会让人以为还有东西没填
+        local_win = proto == "local" and sys.platform == "win32"
+        if local_win:
+            self.row_cred.pack_forget()
+        else:
+            if not self.row_cred.winfo_manager():
+                self.row_cred.pack(fill="x", pady=(9, 0))
+            self.chk_remember.set_text({
+                "telnet": "记住凭据（enable 密码，本机加密保存）",
+                "local": "记住凭据（sudo 密码，本机加密保存）",
+            }.get(proto, "记住凭据（私钥口令 · 登录密码 · sudo 密码，本机加密保存）"))
+        self._rebuild_elevation()
 
     def _mode_changed(self):
         if self.v_mode.get() == "key":
@@ -854,6 +947,114 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             self.row_key.pack_forget()
             if not self.row_pw.winfo_ismapped():
                 self.row_pw.pack(fill="x", pady=(6, 0))
+
+    # ---------------- 提权区（随平台与协议变形）
+    def _is_admin(self) -> bool:
+        """当前进程是否已经是管理员（Windows UAC / Unix root）。"""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:  # noqa: BLE001
+                return False
+        try:
+            return os.geteuid() == 0
+        except AttributeError:
+            return False
+
+    def _rebuild_elevation(self) -> None:
+        """Windows 本机没有 sudo，说的是 UAC；类 Unix 才是 sudo 密码。
+
+        用户的原话：「Windows 不适用 sudo 密码，终端得有管理员权限运行的勾选；
+        只有本机是 Linux 才有勾选并输入 sudo 密码，进去后自动执行 sudo -i」。
+        """
+        holder = getattr(self, "elev_holder", None)
+        if holder is None:
+            return
+        for w in holder.winfo_children():
+            w.destroy()
+        self.e_sudopw = None
+        proto = self.v_proto.get()
+        local_win = proto == "local" and sys.platform == "win32"
+
+        if local_win:
+            row = U.wframe(holder, "card")
+            row.pack(fill="x")
+            admin = self._is_admin()
+            U.Check(row, "以管理员身份运行（UAC）", self.v_admin,
+                    command=self._admin_toggled).pack(side="left")
+            U.wlabel(row, "已具备管理员权限" if admin else "当前是普通用户",
+                     "ok" if admin else "dim", U.FONT_XS).pack(
+                side="left", padx=(12, 0))
+            U.wlabel(holder,
+                     "本机 Windows 没有 sudo：改路由 / 防火墙、终端里的提权命令，"
+                     "都要整个程序以管理员身份运行。没勾选时遇到这类操作会提示你。",
+                     "dim", U.FONT_XS, justify="left").pack(
+                anchor="w", pady=(6, 0))
+            self._refresh_cred_hint()
+            return
+
+        row = U.wframe(holder, "card")
+        row.pack(fill="x")
+        if proto == "telnet":
+            title, pw_label = "进入 enable 特权模式", "enable 密码"
+            hint = ("交换机 / 路由器没有 sudo。勾选后用 enable 密码进特权模式；"
+                    "不勾选也能看，写操作时才会问你要密码。")
+        else:
+            title, pw_label = "使用 sudo 提权（登录后自动 sudo -i）", "sudo 密码"
+            hint = ("勾选后在连接时自动执行 sudo -i，之后所有命令都带 root；"
+                    "不勾选也能用，需要提权时会弹窗问你要密码 —— "
+                    "也可以到「终端」里自己敲。")
+        U.Check(row, title, self.v_elevate,
+                command=self._elev_toggled).pack(side="left")
+        U.wlabel(row, pw_label, "card", U.FONT_S).pack(side="left", padx=(14, 8))
+        self.e_sudopw = ttk.Entry(row, textvariable=self.v_sudopw, show="*",
+                                  width=18)
+        self.e_sudopw.pack(side="left")
+        U.RoundButton(row, "👁", lambda: self._toggle_eye(self.e_sudopw),
+                      variant="ghost", font=U.FONT_S, height=24,
+                      padx=7).pack(side="left", padx=(2, 0))
+        U.wlabel(holder, hint, "dim", U.FONT_XS, justify="left").pack(
+            anchor="w", pady=(6, 0))
+        self._elev_toggled()
+
+    def _elev_toggled(self) -> None:
+        on = bool(self.v_elevate.get())
+        if self.e_sudopw is not None:
+            try:
+                self.e_sudopw.configure(state="normal" if on else "disabled")
+            except tk.TclError:
+                pass
+        self._refresh_cred_hint()
+
+    def _admin_toggled(self) -> None:
+        if not self.v_admin.get() or self._is_admin():
+            return
+        if messagebox.askyesno(
+                "需要管理员权限",
+                "当前不是管理员。要现在以管理员身份重新启动吗？\n\n"
+                "会关闭当前窗口并重开一个（已连接的会话会断开）。",
+                parent=self):
+            self._restart_as_admin()
+
+    def _restart_as_admin(self) -> bool:
+        """用 UAC 重新拉起自己。成功就关掉当前实例，避免两个窗口抢 data 目录。"""
+        try:
+            import ctypes
+            args = [a for a in sys.argv[1:]]
+            if getattr(sys, "frozen", False):
+                exe, params = sys.executable, subprocess.list2cmdline(args)
+            else:
+                exe = sys.executable
+                params = subprocess.list2cmdline([str(Path(sys.argv[0]).resolve())] + args)
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", exe, params, str(Path.cwd()), 1)
+            if rc > 32:
+                self.after(400, self.destroy)
+                return True
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("提权失败", str(e), parent=self)
+        return False
 
     def _on_keypw_changed(self, *_):
         if self._keypw_job:
@@ -893,7 +1094,8 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             if self.v_pw.get():
                 keep.append("登录密码")
             if self.v_sudopw.get():
-                keep.append("sudo 密码")
+                keep.append("enable 密码" if self.v_proto.get() == "telnet"
+                            else "sudo 密码")
             if not keep:
                 lbl.configure(text="已勾选 · 填好口令后点「保存」即落盘",
                               fg=U.T.text_dim)
@@ -1103,14 +1305,34 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self.btn_connect.set_enabled(False)
         self.status.set_state("正在连接…")
 
+        is_local = proto == "local"
+        local_win = is_local and sys.platform == "win32"
+        # 本机 Windows 走 UAC（整个进程），类 Unix 与远程走 sudo / enable
+        elevate = bool(self.v_elevate.get()) or (local_win and self.v_admin.get())
+        if local_win and self.v_admin.get() and not self._is_admin():
+            self.btn_connect.set_enabled(True)
+            if not messagebox.askyesno(
+                    "需要管理员权限",
+                    "勾了「以管理员身份运行」，但当前不是管理员。\n"
+                    "要现在以管理员身份重新启动吗？",
+                    parent=self):
+                return
+            if self._restart_as_admin():
+                return
+            self.btn_connect.set_enabled(True)
+            return
+
         spec = ConnSpec(proto=proto,
-                        host=self.v_host.get().strip(),
-                        port=int(self.v_port.get() or (23 if proto == "telnet" else 22)),
+                        host="" if is_local else self.v_host.get().strip(),
+                        port=0 if is_local else int(
+                            self.v_port.get() or (23 if proto == "telnet" else 22)),
                         user=self.v_user.get().strip(),
                         auth=self.v_mode.get(),
                         key_path=norm_path(self.v_key.get()),
                         password=self.v_pw.get(),
-                        key_passphrase=self.v_keypw.get())
+                        key_passphrase=self.v_keypw.get(),
+                        sudo_password=self.v_sudopw.get().strip() if elevate else "",
+                        elevate=elevate)
 
         if proto == "ssh":
             if spec.auth == "key":
@@ -1145,13 +1367,23 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                     pass
             s = open_session(spec)
             s.tracer = self._trace_cmd
-            if isinstance(s, SSHSession) and spec.proto == "ssh" and self.v_sudopw.get():
-                s.sudo_ok(self.v_sudopw.get())
+            # 连上之后核实一次提权是否真的成功：密码错了不能装作生效
+            elev = ""
+            if spec.elevate and spec.sudo_password:
+                okadm = False
+                try:
+                    okadm = s.can_admin()[0]
+                except Exception:  # noqa: BLE001
+                    okadm = False
+                if okadm:
+                    elev = "enable" if proto == "telnet" else "sudo -i"
+                else:
+                    elev = "failed"
             dev = detect(s)
-            return s, dev
+            return s, dev, elev
 
         def ok(res):
-            s, dev = res
+            s, dev, elev = res
             self.session = s
             self.device = dev
             self.dialect = dialect_for(dev)
@@ -1170,6 +1402,14 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             self.fw_backend = None
             self._log_raw("meta", f"[设备] {dev.os_name or dev.os_family} · "
                                   f"{dev.kernel or ''} · {dev.arch or ''}\n")
+            if dev.os_family == "network":
+                self._log_raw("meta", f"[厂商] {dev.vendor or '未知'} · "
+                                      f"{dev.device_type} · 命令按厂商 CLI 生成\n")
+            if elev == "failed":
+                self._log_raw("bad", "[提权] 密码没通过，需要时再问你要一次\n")
+                self.status.set_state("已连接（提权未生效）", "warn")
+            elif elev:
+                self._log_raw("ok", f"[提权] {elev} 已生效，之后的命令都带 root 权限\n")
             # 勾了「记住凭据」就顺手把档案落盘 —— 口令要真的进文件，
             # 不能指望用户连通之后还想起来点一次「保存」。
             if self.v_remember.get() and self.v_prof.get().strip():
@@ -2074,7 +2314,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 证书控制台已经内嵌在「VPN 证书」页里，不再有 --vpncert 子进程形态。
+    # 证书控制台已经内嵌在「隧道客户端证书管理」页里，不再有 --vpncert 子进程形态。
     # 想单独调它可以直接 `python vpncert_gui.py`（它自己能独立跑）。
 
     if "--dark" in sys.argv:

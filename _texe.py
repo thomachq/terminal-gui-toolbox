@@ -170,8 +170,8 @@ def main():
                 img2.save(OUT / "exe_vpn.png")
                 chk(len(img2.getcolors(maxcolors=1 << 22) or []) > 50,
                     "VPN 页不是空白")
-            # 内嵌 = 只有一个顶层窗口，没有第二条 VPN Cert Console
-            extra = [h for h in find_titled("VPN Cert Console")]
+            # 内嵌 = 只有一个顶层窗口，没有第二条 Client Cert Console
+            extra = [h for h in find_titled("Client Cert Console")]
             chk(not extra, "没有多余的证书控制台窗口", f"{len(extra)} 个")
     finally:
         p2.terminate()

@@ -24,6 +24,7 @@ class Sample:
     uptime: float = 0.0            # 秒
     ncpu: int = 1
     error: str = ""
+    unsupported: bool = False      # 这台设备天生采不到（交换机 / 路由器）
     at: float = field(default_factory=time.time)
 
     @property
@@ -54,6 +55,11 @@ class Sampler:
 
     def sample(self, timeout: int = 12) -> Sample:
         cmd = self.dialect.metrics_cmd()
+        if not cmd:
+            # 网络设备（交换机 / 路由器）根本没有 /proc 这类计数器。
+            # 返回「不支持」而不是「失败」，状态栏才会是 — 而不是一片红字。
+            self.last = Sample(ok=False, error="", unsupported=True)
+            return self.last
         try:
             # 不走 run_traced：性能采样每几秒一次，刷满日志没有意义
             rc, out, err = self.session.run(cmd, timeout=timeout)

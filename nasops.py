@@ -19,7 +19,7 @@ KEYS_DIR = "/var/packages/VPNCenter/target/etc/openvpn/keys"
 REAPPLY = "/usr/local/bin/vpncert-reapply.sh"
 
 REAPPLY_SH = """#!/bin/sh
-# 由 VPN Cert Console 生成：DSM 重新生成 openvpn.conf 后，把客户端证书校验与 CRL 补回去。
+# 由 Client Cert Console 生成：DSM 重新生成 openvpn.conf 后，把客户端证书校验与 CRL 补回去。
 CONF=/var/packages/VPNCenter/etc/openvpn/openvpn.conf
 KEYS=/var/packages/VPNCenter/target/etc/openvpn/keys
 [ -f "$CONF" ] || exit 0

@@ -7,7 +7,7 @@
   * init_ca        建私有 CA
   * issue          签发服务端 / 设备证书
   * revoke         吊销 + 重建 CRL
-  * build_ovpn     把 ca / cert / key / tls-auth 内嵌进单文件 .ovpn
+  * build_ovpn     把 ca / cert / key / tls-auth 内嵌进单文件配置
 """
 from __future__ import annotations
 
@@ -118,7 +118,7 @@ class PKI:
         subject = x509.Name(
             [
                 x509.NameAttribute(NameOID.COMMON_NAME, cn),
-                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "VPN Cert Console"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Client Cert Console"),
             ]
         )
         now = _now()
@@ -335,7 +335,7 @@ class PKI:
         p = self.ca_dir / "crl.pem"
         return p.read_text(encoding="ascii") if p.exists() else ""
 
-    # ---------- .ovpn 打包 ----------
+    # ---------- 单文件配置打包 ----------
     def ovpn_text(
         self,
         name: str,
@@ -404,7 +404,7 @@ class PKI:
         return out
 
     def export_bundle(self, name: str, platforms: list[str], **kw) -> dict:
-        """一个 zip 打包：crt + key + 多平台 .ovpn + README。"""
+        """一个 zip 打包：crt + key + 各平台配置文件 + README。"""
         import zipfile
 
         platforms = [p for p in platforms if p in PLATFORMS] or list(PLATFORM_ORDER)
@@ -423,7 +423,7 @@ class PKI:
             readme.append(f"  {name}-{p}.ovpn    {PLATFORMS[p]['label']}")
         readme += [
             "",
-            "所有 .ovpn 都是「单文件内嵌」格式：ca / cert / key / tls-auth 全部写在",
+            "所有配置文件都是「单文件内嵌」格式：ca / cert / key / tls-auth 全部写在",
             "文件内部，不依赖任何外部文件，可以直接导入手机或桌面客户端。",
             "",
         ]
@@ -448,12 +448,12 @@ class PKI:
         return {"file": zpath.name, "bytes": zpath.stat().st_size, "platforms": platforms}
 
 
-# ---------------- 各平台说明（写进 .ovpn 注释） ----------------
+# ---------------- 各平台说明（写进配置文件注释） ----------------
 PLATFORM_ORDER = ["windows", "android", "ios", "harmony", "linux", "macos"]
 
 PLATFORMS: dict[str, dict] = {
     "windows": {
-        "label": "Windows（OpenVPN GUI / OpenVPN Connect）",
+        "label": "Windows · OpenVPN GUI / OpenVPN Connect",
         "notes": [
             "# ===== Windows 端 =====",
             "# 推荐客户端：OpenVPN GUI 或 OpenVPN Connect（openvpn.net 下载）",
@@ -473,7 +473,7 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "android": {
-        "label": "Android（OpenVPN Connect / OpenVPN for Android）",
+        "label": "Android · OpenVPN Connect / OpenVPN for Android",
         "notes": [
             "# ===== Android 端 =====",
             "# 推荐客户端：OpenVPN Connect（应用商店搜索）",
@@ -487,7 +487,7 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "ios": {
-        "label": "iOS / iPadOS（OpenVPN Connect）",
+        "label": "iOS / iPadOS · OpenVPN Connect",
         "notes": [
             "# ===== iOS / iPadOS 端 =====",
             "# 推荐客户端：OpenVPN Connect（App Store）",
@@ -502,7 +502,7 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "harmony": {
-        "label": "鸿蒙 / 卓易通（通过安卓兼容层）",
+        "label": "鸿蒙 / 卓易通 · 安卓兼容层",
         "notes": [
             "# ===== 鸿蒙 / 卓易通 =====",
             "# 鸿蒙 NEXT 通过「卓易通」运行安卓应用，因此使用安卓版客户端：OpenVPN Connect",
@@ -513,15 +513,15 @@ PLATFORMS: dict[str, dict] = {
             "#",
             "# 常见问题：",
             "#   - 卓易通沙盒看不到某些目录 → 优先放 Download",
-            "#   - 卓易通内找不到文件 → 先用「文件管理」把 .ovpn 分享/复制到 Download 再试",
+            "#   - 卓易通内找不到文件 → 先用「文件管理」把配置文件分享/复制到 Download 再试",
             "#   - 鸿蒙原生 OpenVPN 客户端尚不成熟，不建议使用",
         ],
     },
     "linux": {
-        "label": "Linux（openvpn CLI / NetworkManager）",
+        "label": "Linux · openvpn CLI / NetworkManager",
         "notes": [
             "# ===== Linux 端 =====",
-            "# 客户端：命令行 openvpn，或桌面 NetworkManager（导入 .ovpn 即可）",
+            "# 客户端：命令行 openvpn，或桌面 NetworkManager（导入配置文件即可）",
             "#",
             "# 放置位置：",
             "#   用户级： ~/.config/openvpn/<文件名>.ovpn",
@@ -540,13 +540,13 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "macos": {
-        "label": "macOS（Tunnelblick / OpenVPN Connect）",
+        "label": "macOS · Tunnelblick / OpenVPN Connect",
         "notes": [
             "# ===== macOS 端 =====",
             "# 推荐客户端：Tunnelblick（免费开源）或 OpenVPN Connect",
             "#",
             "# 放置位置：",
-            "#   Tunnelblick：直接双击本 .ovpn 即可导入，程序自己管理存放位置",
+            "#   Tunnelblick：直接双击本配置文件即可导入，程序自己管理存放位置",
             "#   手工放置目录：",
             "#     ~/Library/Application Support/Tunnelblick/Configurations/<名字>.tblk/Contents/Resources/",
             "#   OpenVPN Connect：Import → File → 选择本文件",

@@ -3,10 +3,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg)](requirements.txt)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](#安装与启动)
-[![Tests](https://img.shields.io/badge/self--tests-474%20checks-brightgreen.svg)](#离线自测)
+[![Tests](https://img.shields.io/badge/self--tests-633%20checks-brightgreen.svg)](#离线自测)
 
 **多协议终端工具箱**：SSH / Telnet / 本机会话统一入口，实时性能状态栏、SFTP 双栏文件管理、
-路由与端口规则、容器管理、证书控制台与本地 API。纯 tkinter 实现，单文件 exe，MIT 许可。
+路由与端口规则、容器管理、隧道客户端证书管理与本地 API。纯 tkinter 实现，单文件 exe，MIT 许可。
 
 **把「连着几台机器反复敲同样几条命令」这件事做成窗口。**
 
@@ -27,7 +27,7 @@ MobaXterm 好用但只有 Windows 且不开源；剩下的要么只管 SSH，要
 
 这个项目把三件事拧在一起：**会话统一**（本机 / SSH / Telnet 走同一套接口）、
 **命令方言**（同一个意图按系统生成正确的命令）、**结果结构化**（能把 `ip route` 解析成表格去改）。
-VPN 证书控制台只是其中一个页面，不是全部——它最初是本项目的前身。
+隧道客户端证书管理只是其中一个页面，不是全部——它最初是本项目的前身。
 
 ## 功能一览
 
@@ -40,7 +40,7 @@ VPN 证书控制台只是其中一个页面，不是全部——它最初是本�
 | **路由表** | 读路由、加/删路由 | `ip route` / `route` / `netstat -rn` 输出统一成表格 |
 | **防火墙** | 读规则、开/关端口 | 覆盖 nft、iptables、netsh advfirewall、pf、ipfw；3178 条规则也带横向滚动 |
 | **Docker** | 容器/镜像列表、启停、日志 | 区分「未安装 / 守护进程没起 / 无权限 / 正常」四种状态，不把报错刷满日志 |
-| **VPN 证书** | 自建 CA、签服务端与设备证书、打包 `.ovpn`、部署到 NAS | 内嵌页面，不是外挂程序；部署前自动备份，命令全可回溯 |
+| **隧道客户端证书管理** | 自建 CA（Client Cert CA）、签服务端与设备证书、每个平台一份配置文件、部署到 NAS | 内嵌页面，不是外挂程序；部署前自动备份，命令全可回溯 |
 | **智能体接入** | 本地 HTTP API + 会话池 | 连一次反复下命令，服务端每 25 秒 SSH keepalive，掉线自动重连 |
 
 另外三块不属于任何单页，但天天在用：
@@ -58,7 +58,7 @@ VPN 证书控制台只是其中一个页面，不是全部——它最初是本�
 |---|---|
 | ![](screenshots/conn.png) | ![](screenshots/files_both.png) |
 
-| 终端（行内模式） | VPN 证书控制台（内嵌） |
+| 终端（行内模式） | 隧道客户端证书管理（内嵌） |
 |---|---|
 | ![](screenshots/terminal_inline.png) | ![](screenshots/vpn_cons.png) |
 
@@ -169,7 +169,42 @@ PyInstaller 的 GPL 带有 bootloader 例外，打包产物不受传染。
 
 ### 1 · 连接与设备
 
-**协议**：SSH / Telnet / 本机。选「本机」时地址与认证区自动收起，工具直接跑在本机。
+**协议**：SSH / Telnet / 本机。
+
+**选「本机」时，界面直接瘦下来**：档案、地址、端口、用户、私钥 / 密码全部收起 ——
+本机没有「连到哪台设备」这件事，留着那些框只会让人以为漏填了。
+只留一项提权设置，而且按系统分开：
+
+| 本机系统 | 提权方式 |
+|---|---|
+| Windows | 「以管理员身份运行（UAC）」勾选。本机没有 sudo，勾了就用 `ShellExecuteW("runas")` 把整个程序重启到管理员，并显示当前是不是管理员 |
+| Linux / macOS | 「使用 sudo 提权」勾选 + sudo 密码。勾了之后连接时自动执行 `sudo -i`，之后所有命令都带 root |
+
+**远程连接（SSH / Telnet）的提权**同一行搞定：
+
+- 勾选 + 填密码：连上后立刻 `sudo -i`（Telnet 目标是网络设备时则是 `enable` 进特权模式）
+- **不勾选也行**：需要 root 的操作第一次被调用时，程序会弹窗要密码，
+  密码只在内存里留到本次会话结束；也可以到「终端」里自己敲
+- 密码错了不会假装成功：日志里会写 `[提权] 密码没通过`
+
+**网络设备按厂商说话。** 交换机 / 路由器没有 `uname`、没有 `/proc`，命令体系也和 Linux 无关。
+探测时会试 `display version`（H3C / 华为 / 锐捷）与 `show version`（Cisco），
+认出来之后所有页面的命令都按厂商生成：
+
+| 意图 | Cisco IOS | H3C / 华为 |
+|---|---|---|
+| 看版本 | `show version` | `display version` |
+| 接口 | `show ip interface brief` | `display ip interface brief` |
+| 路由表 | `show ip route` | `display ip routing-table` |
+| 加静态路由 | `ip route …` | `ip route-static …` |
+| 删静态路由 | `no ip route …` | `undo ip route-static …` |
+| 看配置 | `show running-config` | `display current-configuration` |
+| 关分页 | `terminal length 0` | `screen-length disable` |
+
+分页是自动处理的：碰到 `--More--` / `<--- More --->` 会自己发空格翻页，
+不需要人守在屏幕前敲空格。改路由要进配置视图（`configure terminal` / `system-view`），
+所以**只有 Telnet 连接能写**——SSH 到 IOS 每条命令一个新通道，配置模式不保留，
+这一条会如实写在页面提示里，而不是让你点下去失败。
 
 **连接档案**——参考 OpenSSH 客户端的做法：
 
@@ -194,8 +229,9 @@ PyInstaller 的 GPL 带有 bootloader 例外，打包产物不受传染。
 | 操作系统 | DSM 读 `/etc/VERSION`；OpenWrt 读 `/etc/openwrt_release`；Linux 读 `/etc/os-release`；Windows 读 CIM `Win32_OperatingSystem` |
 | 内核 / 架构 | `uname -s` `-r` `-m`；Windows 用 `OSArchitecture` 并归一到 `x64` / `x86` / `ARM64` |
 | 主机名 | `uname -n` / `CSName` |
-| 设备类型 | nas / router / switch / container / workstation / server |
-| Shell | `$SHELL` 或 powershell / cmd |
+| 设备类型 | nas / router / switch / container / workstation / server；交换机与路由器按型号判断（`C2960…`、`S5130…`、`AR2220…`），不只看有没有 "switch" 这个词 |
+| 厂商 | Cisco / H3C / 华为 / 锐捷 / Juniper，来自 `show version` / `display version` 的回显 |
+| Shell | `$SHELL` 或 powershell / cmd / cli |
 | 当前用户 | 含是否 root |
 
 探测结果决定后面所有命令的**方言**（见「命令方言」）。
@@ -290,14 +326,15 @@ Windows 的磁盘不再用 `wmic`（Win11 24H2 起默认不装），改 `Get-Cim
 探测走 `run()` 而不是 `run_traced()`，所以「未安装」这种**正常状态**不会在命令日志里
 留下一坨 PowerShell 红字；结论改成日志里的一行 `[Docker] Windows（本机）· 未安装`。
 
-### 8 · VPN 证书
+### 8 · 隧道客户端证书管理
 
-群晖 NAS 上 OpenVPN 的客户端证书管理控制台，**内嵌在这一页里**（页内 Frame），
+群晖 NAS 上隧道服务的客户端证书管理控制台，**内嵌在这一页里**（页内 Frame），
 不再另起进程或独立窗口。五个子页（连接 / 证书 / 打包 / 部署 / 日志）在页顶横排切换，
 和主程序共享同一份 `data` 目录，所以档案、加密密钥、CA 都是同一套。
 
-功能与原来的 VPN Cert Console 完全一致，详见 `vpncert_gui.py` 头部注释：
-建 CA → 签服务端证书 → 签设备证书 → 打包六平台 `.ovpn` / zip → 部署到 NAS → 吊销与 CRL。
+功能与原来的 Client Cert Console 完全一致，详见 `vpncert_gui.py` 头部注释：
+建 CA（默认名 `Client Cert CA`）→ 签服务端证书 → 签设备证书 → 每个平台一份配置文件（zip 打包）
+→ 部署到 NAS → 吊销与 CRL。
 
 `vpncert_gui.py` 的 `App` 是 `tk.Frame` 而不是 `tk.Tk`，`embedded=True` 时
 省掉标题行、把竖导航换成横向分段条、按 3:2 比例分栏；单独运行时仍可作为独立窗口启动。
@@ -433,10 +470,11 @@ terminal-gui-toolbox/
 ├─ app.py               主程序：九页导航 + 状态栏 + 日志侧边栏 + 应用锁 + 托盘
 ├─ core/
 │  ├─ detect.py         设备/系统探测 + 命令方言
-│  ├─ session.py        会话抽象（本机 / SSH / Telnet）+ 编码解码 + 提权
+│  ├─ session.py        会话抽象（本机 / SSH / Telnet）+ 编码解码 + 提权与 NeedElevation
+│  ├─ telnet_session.py Telnet 协议层（IAC 协商 / 安静判定 / 分页自动翻 / enable）
 │  ├─ metrics.py        CPU / 内存 / 网络 / 时长采样 + 人话格式化
-│  ├─ parsers.py        命令输出 → 结构化行（认不出就返回空，绝不抛）
-│  ├─ routes.py         路由表读写（ip route / route / netstat -rn）
+│  ├─ parsers.py        命令输出 → 结构化行（含 Cisco / H3C 路由表）
+│  ├─ routes.py         路由表读写（ip route / route / netstat -rn / 厂商 CLI）
 │  ├─ firewall.py       防火墙读写（nft / iptables / netsh / pf / ipfw）
 │  ├─ docker.py         Docker 探测与操作（四态区分）
 │  ├─ files.py          文件系统抽象（LocalFS / SFTPFS）+ 传输 + WinSCP
@@ -459,7 +497,7 @@ terminal-gui-toolbox/
 │  ├─ tray.py           纯 ctypes 托盘（不引 pystray）
 │  └─ icon.py           窗口图标 + AppUserModelID
 ├─ wbtui.py             WorkBuddy 风格控件库（配色 / 圆角按钮 / 卡片 / 导航 / 勾选框）
-├─ vpncert_gui.py       VPN 证书控制台（可独立窗口，也可内嵌成页内 Frame）
+├─ vpncert_gui.py       隧道客户端证书管理控制台（可独立窗口，也可内嵌成页内 Frame）
 ├─ pkilib.py            CA / 证书 / CRL / ovpn 打包
 ├─ nasops.py            SSH/SFTP + sudo 提权 + 配置改写
 ├─ crypto_store.py      机密存储：AES-256-GCM（便携密钥）/ DPAPI
@@ -474,6 +512,8 @@ terminal-gui-toolbox/
 ├─ _inlinetest.py       终端两种输入形态：输入框 / 行内 + 切换搬运（40 项）
 ├─ _vpnsmoke.py         证书控制台内嵌：五个子页 / 状态转发 / boot 幂等（27 项）
 ├─ _uismoke.py          证书控制台界面与档案层（101 项）
+├─ _selftest.py         PKI：建 CA / 签证书 / CRL / 多平台打包（58 项）
+├─ _conntest.py         连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（92 项）
 ├─ _shots.py            批量截图（九页 + 锁屏）
 ├─ _shot2.py            截图工具（置前 + PrintWindow）
 ├─ _texe.py             打包后 exe 验收
@@ -552,8 +592,10 @@ python _sectest.py    # 加密 / 锁 / 私钥打码（52 项）
 python _redacttest.py # 私钥脱敏：五个出口逐个验证 + ppk/ta.key + 幂等（30 项）
 python _termsmoke.py  # 终端：回显 / 历史 / 取消 / 不重复回显（32 项）
 python _inlinetest.py # 终端两种输入形态：输入框 / 行内 + 切换搬运（40 项）
-python _vpnsmoke.py   # VPN 控制台内嵌：五个子页 / 状态转发 / boot 幂等（27 项）
+python _vpnsmoke.py   # 证书控制台内嵌：五个子页 / 状态转发 / boot 幂等（27 项）
 python _uismoke.py    # 证书控制台界面与档案层（101 项）
+python _selftest.py   # 建 CA / 签证书 / CRL / 多平台打包（58 项）
+python _conntest.py   # 连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（92 项）
 python _texe.py       # 打包后的 exe 验收（起窗 / 截图 / 数据落点 / 子进程）
 ```
 
@@ -561,10 +603,10 @@ python _texe.py       # 打包后的 exe 验收（起窗 / 截图 / 数据落点
 `_tsmoke.py` / `_tsmoke2.py` 会真的连一次本机并跑真实命令，所以需要能跑 PowerShell；
 `_fsmoke.py` 用两端的本地目录冒充 SFTP，走的是和生产一样的传输代码路径。
 
-## 上线顺序（VPN 证书部分，重要）
+## 上线顺序（证书部分，重要）
 
 1. 先建 CA、签服务端证书、签各设备证书
-2. 打包并分发新 `.ovpn`（此时**先别部署**，旧配置还能用）
+2. 打包并分发新配置文件（此时**先别部署**，旧配置还能用）
 3. 部署（替换 CA + 服务端证书 + 打开证书校验）
 4. 客户端用新配置连接，逐个验证
 5. 确认无误后再清理旧配置
@@ -579,7 +621,9 @@ python _texe.py       # 打包后的 exe 验收（起窗 / 截图 / 数据落点
 | 二 | 界面表格化（DSM 风格）+ 路由表读写 + 防火墙读写 + Docker 管理 | 完成 |
 | 三 | 本地 HTTP API（连接池保活）+ 应用锁改密码验旧密码 + 托盘 + 图标 | 完成 |
 | 四 | 文件管理（SFTP 双栏 / 上传下载 / WinSCP 集成） | 完成 |
-| 五 | 完整交互式 Telnet（IAC 协商 / 回显 / 窗口尺寸）+ 交互式 SSH shell | 待做 |
+| 五 | Telnet 协议层（IAC 协商 / 分页自动翻 / enable 提权）+ 厂商 CLI（Cisco / H3C / 华为） | 完成 |
+| 六 | 交互式 SSH shell（跟终端窗口打通，走 `invoke_shell` 而不是逐条 exec） | 待做 |
 
-Python 3.13 起标准库移除了 `telnetlib`，所以 Telnet 协议层要自己写，
-不能再 `import telnetlib`。
+Python 3.13 起标准库移除了 `telnetlib`，所以 Telnet 协议层是 `core/telnet_session.py`
+自己写的：socket + IAC 剔除 + 「安静判定」收包 + `--More--` 自动翻页。
+真正的完整终端仿真（窗口尺寸协商、光标定位、全屏程序）仍然要靠交互式 shell，见第六批。

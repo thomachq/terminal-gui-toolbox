@@ -32,3 +32,6 @@ err.txt
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ── 自测产生的 PKI 样本（里面有 CA 私钥，绝不入库）──
+_test_data/

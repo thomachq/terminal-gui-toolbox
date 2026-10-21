@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-VPN Cert Console —— 原生 Windows 窗口程序（tkinter）
+Client Cert Console —— 原生 Windows 窗口程序（tkinter）
 
-给群晖 NAS 的 OpenVPN 补上客户端证书管理：
-  建私有 CA、签设备证书、多平台打包 .ovpn、吊销 + CRL、部署到 NAS。
+隧道客户端证书管理：给 NAS 上的隧道服务补上客户端证书。
+  建私有 CA、签设备证书、多平台打包配置文件、吊销 + CRL、部署到 NAS。
   SSH 侧用开源库 paramiko，执行的每条命令与原始输出都进「命令日志」页。
 
 界面风格参考 WorkBuddy（浅色蓝调），功能为独立实现。
@@ -59,7 +59,7 @@ def wrap_to(holder, *labels, pad: int = 14, floor: int = 280) -> None:
 
 
 class App(tk.Frame):
-    """VPN 证书控制台主体。
+    """隧道客户端证书管理控制台主体。
 
     两种用法：
 
@@ -127,7 +127,7 @@ class App(tk.Frame):
         self.btn_lock = None
         self.btn_theme = None
 
-        # 内嵌时「VPN 证书」这个标题主程序导航已经写了，
+        # 内嵌时「隧道客户端证书管理」这个标题主程序导航已经写了，
         # 再顶一行大字只会白吃 60px 高度；状态胶囊挪到分段条那一行去。
         if self.embedded:
             return
@@ -136,8 +136,8 @@ class App(tk.Frame):
 
         left = U.wframe(bar, "page")
         left.pack(side="left")
-        U.wlabel(left, "VPN Cert Console", "page", U.FONT_H).pack(anchor="w")
-        U.wlabel(left, "群晖 OpenVPN 客户端证书管理 · 建 CA / 签证书 / 多平台打包 / 吊销",
+        U.wlabel(left, "Client Cert Console", "page", U.FONT_H).pack(anchor="w")
+        U.wlabel(left, "隧道客户端证书管理 · 建 CA / 签证书 / 多平台打包 / 吊销",
                  "pagedim", U.FONT_S).pack(anchor="w", pady=(2, 0))
 
         right = U.wframe(bar, "page")
@@ -976,7 +976,7 @@ class App(tk.Frame):
         ca.grid(row=0, column=0, sticky="we")
         b = ca.body
         b.columnconfigure(1, weight=1)
-        self.v_cacn = tk.StringVar(value="VPN Cert CA")
+        self.v_cacn = tk.StringVar(value="Client Cert CA")
         self.v_cadays = tk.StringVar(value="3650")
         self.v_cabits = tk.StringVar(value="3072")
         self.v_capw = tk.StringVar()
@@ -1089,7 +1089,7 @@ class App(tk.Frame):
         self.status.set("正在生成 CA（3072 位约需数秒）…")
 
         def work():
-            return self.pki.init_ca(self.v_cacn.get().strip() or "VPN Cert CA",
+            return self.pki.init_ca(self.v_cacn.get().strip() or "Client Cert CA",
                                     int(self.v_cadays.get() or 3650),
                                     int(self.v_cabits.get() or 3072),
                                     self.v_capw.get() or None,
@@ -1120,7 +1120,7 @@ class App(tk.Frame):
         name = self.tree.item(sel[0], "values")[0]
         if not messagebox.askyesno(
                 "确认吊销",
-                f"确定吊销 {name}？\n该设备的 .ovpn 将立刻无法连接（需重新部署 crl.pem）。",
+                f"确定吊销 {name}？\n该设备的配置文件将立刻无法连接（需重新部署 crl.pem）。",
                 parent=self):
             return
         self.bg(lambda: self.pki.revoke(name, ca_passphrase=self.v_capw.get() or None),
@@ -1192,15 +1192,17 @@ class App(tk.Frame):
         U.Check(b, "启用 comp-lzo", self.v_plzo).grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        pl = U.Card(pg, title="导出平台", hint="每个平台一份 .ovpn，注释写明该平台放置路径")
+        pl = U.Card(pg, title="导出平台", hint="每个平台一份配置文件，注释写明该平台放置路径")
         pl.grid(row=1, column=0, sticky="we", pady=(10, 0))
         b = pl.body
         self.plat_vars: dict[str, tk.BooleanVar] = {}
+        # 平台名后面跟了客户端建议（用「·」分隔，不加括号），单条最长 40 多字符，
+        # 三列放不下会把 iOS / macOS 顶出可视区域，所以按两列排。
         for i, key in enumerate(PLATFORM_ORDER):
             v = tk.BooleanVar(value=True)
             self.plat_vars[key] = v
             U.Check(b, PLATFORMS[key]["label"], v).grid(
-                row=i // 3, column=i % 3, sticky="w", padx=(0, 30), pady=2)
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 30), pady=2)
 
         mid = U.wframe(pg, "page")
         mid.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
@@ -1271,7 +1273,7 @@ class App(tk.Frame):
         if not ta:
             self.box_pack.txt.insert("end", "⚠ 未包含 tls-auth（ta.key 为空）\n")
         self.box_pack.txt.insert("end", f"\n输出目录：{self.pki.out_dir}\n")
-        self.status.set(f"已生成 {len(made)} 个 .ovpn")
+        self.status.set(f"已生成 {len(made)} 份配置文件")
 
     def do_bundle(self):
         name = self.v_bundle.get()
@@ -1282,7 +1284,7 @@ class App(tk.Frame):
         self.box_pack.clear()
         self.box_pack.txt.insert(
             "end", f"✓ {res['file']}   ({res['bytes']} 字节, {len(res['platforms'])} 个平台)\n"
-                   f"含：{name}.crt / {name}.key / 各平台 .ovpn / README.txt\n\n"
+                   f"含：{name}.crt / {name}.key / 各平台配置文件 / README.txt\n\n"
                    f"目录：{self.pki.out_dir}\n")
         self.status.set("已导出设备包")
 
@@ -1322,7 +1324,7 @@ class App(tk.Frame):
         warn.grid(row=1, column=0, sticky="we", pady=(10, 0))
         w1 = U.wlabel(warn.body,
                       "⚠ 替换服务端证书后，所有旧客户端配置会立即失效。"
-                      "请先签好证书、分发新 .ovpn，最后才部署。",
+                      "请先签好证书、分发新配置文件，最后才部署。",
                       "err", U.FONT_S, justify="left")
         w1.pack(anchor="w", fill="x")
         w2 = U.wlabel(warn.body,
@@ -1359,7 +1361,7 @@ class App(tk.Frame):
             return messagebox.showwarning("未选择", "请选择服务端证书", parent=self)
         if not messagebox.askyesno(
                 "确认部署",
-                "将替换 NAS 上的 CA / 服务端证书并重启 VPN 服务。\n"
+                "将替换 NAS 上的 CA / 服务端证书并重启隧道服务。\n"
                 "所有旧客户端配置会立即失效。确定继续？", parent=self):
             return
         self.box_deploy.clear()
@@ -1561,7 +1563,7 @@ def main():
         U.T = U.DARK
 
     root = tk.Tk()
-    root.title("VPN Cert Console")
+    root.title("Client Cert Console")
     root.geometry(f"{U.px(1220)}x{U.px(830)}")
     root.minsize(U.px(1080), U.px(700))
     root.configure(bg=U.T.page)
