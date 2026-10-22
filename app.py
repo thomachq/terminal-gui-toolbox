@@ -162,6 +162,9 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self._keypw_job = None
         self._lock_overlay = None
         self._last_active = time.time()
+        self._lock_after = None
+        self._sample_after = None
+        self._drain_after = None
         self._sampling = False
         self._local_dev: DeviceInfo | None = None
         self._toast_job = None
@@ -475,7 +478,25 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             return
         self._quit_app()
 
+    def _cancel_timers(self) -> None:
+        """撤掉所有自我续期的定时器，否则窗口销毁后 Tcl 会反复报
+        invalid command name ..._tick / ...tick。"""
+        for name in ("_lock_after", "_sample_after", "_drain_after"):
+            tid = getattr(self, name, None)
+            if tid is None:
+                continue
+            try:
+                self.after_cancel(tid)
+            except Exception:  # noqa: BLE001
+                pass
+            setattr(self, name, None)
+
+    def destroy(self) -> None:
+        self._cancel_timers()
+        super().destroy()
+
     def _quit_app(self) -> None:
+        self._cancel_timers()
         try:
             if self._tray:
                 self._tray.stop()
@@ -666,7 +687,10 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                     traceback.print_exc()
         except queue.Empty:
             pass
-        self.after(80, self._drain)
+        try:
+            self._drain_after = self.after(80, self._drain)
+        except tk.TclError:
+            self._drain_after = None
 
     # ============================================================ 日志
     # 脱敏规则统一放在 core/redact.py：日志、工具输出、系统信息、终端、
@@ -699,8 +723,15 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
     # ============================================================ 采样
     def _start_sampler(self):
         def tick():
-            if (not self._sampling and self.session is not None
-                    and self.session.alive and self.sampler is not None):
+            # 会话可能是半拆状态（关闭中 / 传输层已断），这里探活失败不该让
+            # 状态栏定时器每秒抛一次异常刷屏。
+            try:
+                need = (not self._sampling and self.session is not None
+                        and bool(getattr(self.session, "alive", False))
+                        and self.sampler is not None)
+            except Exception:  # noqa: BLE001
+                need = False
+            if need:
                 self._sampling = True
 
                 def work():
@@ -711,8 +742,11 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                         s = Sample(ok=False, error=str(e))
                     self.post(self._on_sample, s)
                 threading.Thread(target=work, daemon=True).start()
-            self.after(SAMPLE_MS, tick)
-        self.after(600, tick)
+            try:
+                self._sample_after = self.after(SAMPLE_MS, tick)
+            except tk.TclError:
+                self._sample_after = None
+        self._sample_after = self.after(600, tick)
 
     def _on_sample(self, s):
         self._sampling = False
@@ -2074,7 +2108,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         try:
             self.vpn_console.boot()
         except Exception as e:  # noqa: BLE001
-            self.status.set_state(f"证书控制台初始化失败：{e}", "err")
+            self.status.set_state(f"隧道客户端证书管理初始化失败：{e}", "err")
 
     # ============================================================ 防火墙模块
     # ============================================================ 应用锁
@@ -2098,9 +2132,9 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         except Exception:  # noqa: BLE001
             pass
         try:
-            self.after(5000, self._lock_tick)
+            self._lock_after = self.after(5000, self._lock_tick)
         except tk.TclError:
-            pass
+            self._lock_after = None
 
     def _maybe_lock_on_start(self):
         if not self.lock.enabled():

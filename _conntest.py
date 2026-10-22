@@ -534,6 +534,15 @@ def test_elevation_dialog() -> None:
 
     calls = {"ask": 0, "form": 0}
     orig_ask, orig_open = APP.messagebox.askyesno, UI_FORMS.FormDialog.open
+    # 提权失败会弹 showwarning，真弹窗没人点就永远卡住，必须一起屏蔽
+    orig_warn, orig_err = APP.messagebox.showwarning, APP.messagebox.showerror
+    warnings = []
+
+    def _fake_warn(*args, **kw):
+        warnings.append(args)
+
+    APP.messagebox.showwarning = _fake_warn
+    APP.messagebox.showerror = _fake_warn
 
     class _Sess:
         kind = "ssh"
@@ -541,6 +550,7 @@ def test_elevation_dialog() -> None:
         user = "thomas"
         is_root = False
         sudo_pw = None
+        alive = False
 
         def sudo_ok(self, pw):
             self.sudo_pw = pw
@@ -592,8 +602,11 @@ def test_elevation_dialog() -> None:
                          lambda: ran2.append(1), None, None)
         pump(1.2)
         check("密码错时不重跑原操作", not ran2, ran2)
+        check("密码错时给出了提示", len(warnings) >= 1, warnings)
     finally:
         APP.messagebox.askyesno = orig_ask
+        APP.messagebox.showwarning = orig_warn
+        APP.messagebox.showerror = orig_err
         UI_FORMS.FormDialog.open = orig_open
         a.destroy()
 

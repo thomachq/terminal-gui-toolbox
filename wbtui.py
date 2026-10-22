@@ -644,11 +644,23 @@ class Check(tk.Frame):
             w.bind("<Enter>", self._enter)
             w.bind("<Leave>", self._leave)
         try:
-            self.var.trace_add("write", lambda *a: self._draw())
+            self._vtrace = self.var.trace_add("write", lambda *a: self._draw())
         except tk.TclError:
-            pass
+            self._vtrace = None
         register(self, self._paint)
         self._draw()
+
+    def destroy(self) -> None:
+        # StringVar 归调用方持有，比这个控件活得久。trace 不摘掉，
+        # 控件销毁后动一下变量就会抛 invalid command name。
+        tid = getattr(self, "_vtrace", None)
+        if tid:
+            try:
+                self.var.trace_remove("write", tid)
+            except (tk.TclError, AttributeError):
+                pass
+            self._vtrace = None
+        super().destroy()
 
     def _toggle(self, _=None):
         try:
@@ -680,7 +692,10 @@ class Check(tk.Frame):
 
     def _draw(self) -> None:
         c = self.box
-        c.delete("all")
+        try:
+            c.delete("all")
+        except tk.TclError:
+            return
         s = self._size
         on = self.get()
         if on:

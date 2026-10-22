@@ -510,8 +510,8 @@ terminal-gui-toolbox/
 ├─ _redacttest.py       脱敏：五个出口逐个验证 + ppk / ta.key + 幂等（30 项）
 ├─ _termsmoke.py        终端：回显 / 历史 / 取消 / 不重复回显（32 项）
 ├─ _inlinetest.py       终端两种输入形态：输入框 / 行内 + 切换搬运（40 项）
-├─ _vpnsmoke.py         证书控制台内嵌：五个子页 / 状态转发 / boot 幂等（27 项）
-├─ _uismoke.py          证书控制台界面与档案层（101 项）
+├─ _vpnsmoke.py         隧道客户端证书管理内嵌：五个子页 / 状态转发 / boot 幂等（27 项）
+├─ _uismoke.py          隧道客户端证书管理界面与档案层（101 项）
 ├─ _selftest.py         PKI：建 CA / 签证书 / CRL / 多平台打包（58 项）
 ├─ _conntest.py         连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（92 项）
 ├─ _shots.py            批量截图（九页 + 锁屏）
@@ -592,8 +592,8 @@ python _sectest.py    # 加密 / 锁 / 私钥打码（52 项）
 python _redacttest.py # 私钥脱敏：五个出口逐个验证 + ppk/ta.key + 幂等（30 项）
 python _termsmoke.py  # 终端：回显 / 历史 / 取消 / 不重复回显（32 项）
 python _inlinetest.py # 终端两种输入形态：输入框 / 行内 + 切换搬运（40 项）
-python _vpnsmoke.py   # 证书控制台内嵌：五个子页 / 状态转发 / boot 幂等（27 项）
-python _uismoke.py    # 证书控制台界面与档案层（101 项）
+python _vpnsmoke.py   # 隧道客户端证书管理内嵌：五个子页 / 状态转发 / boot 幂等（27 项）
+python _uismoke.py    # 隧道客户端证书管理界面与档案层（101 项）
 python _selftest.py   # 建 CA / 签证书 / CRL / 多平台打包（58 项）
 python _conntest.py   # 连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（92 项）
 python _texe.py       # 打包后的 exe 验收（起窗 / 截图 / 数据落点 / 子进程）
