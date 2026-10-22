@@ -342,12 +342,60 @@ def test_click_once() -> None:
         root.destroy()
 
 
+def test_brief_dialog() -> None:
+    print("\n[5] 「给智能体的说明」必须看得见")
+    import tkinter as tk
+
+    import app as APP
+
+    a = APP.ToolboxApp()
+    try:
+        a.nav.select("api")
+        for _ in range(30):
+            a.update()
+            a.after(15)
+            a.update_idletasks()
+        a.clipboard_clear()
+        a.clipboard_append("SENTINEL")
+        a.update()
+
+        a.api_copy_brief()
+        for _ in range(20):
+            a.update()
+            a.after(12)
+        tops = [w for w in a.winfo_children() if isinstance(w, tk.Toplevel)]
+        # 原来只往剪贴板塞、状态栏闪一行字，用户点了看不到东西 —— 必须弹窗。
+        check("点击后弹出说明窗", len(tops) == 1, f"{len(tops)} 个 Toplevel")
+        if tops:
+            t = tops[0]
+            check("窗口标题正确", t.title() == "给智能体的说明", t.title())
+            body = t.txt.get("1.0", "end-1c") if hasattr(t, "txt") else ""
+            check("窗内文本非空", len(body) > 300, f"{len(body)} 字")
+            check("窗里有复制全文按钮", hasattr(t, "btn_copy"))
+            a.clipboard_clear()
+            a.clipboard_append("X")
+            a.update()
+            t._do_copy()
+            a.update()
+            check("复制全文写进剪贴板", len(a.clipboard_get()) == len(body),
+                  f"{len(a.clipboard_get())} vs {len(body)}")
+            check("按钮文字变「已复制」", "已复制" in str(t.btn_copy.text),
+                  str(t.btn_copy.text))
+            t.destroy()
+        check("剪贴板已是说明全文",
+              not a.clipboard_get().startswith("SENTINEL"),
+              a.clipboard_get()[:20])
+    finally:
+        a.destroy()
+
+
 def main() -> int:
     try:
         test_profiles()
         test_widgets()
         test_app()
         test_click_once()
+        test_brief_dialog()
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         return 2

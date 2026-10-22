@@ -181,7 +181,7 @@ import app as A
 
 a = A.ToolboxApp()
 pump(a, 0.6)
-chk(len(a._pages) == 10, "十个页面都已构建", f"{list(a._pages)}")
+chk(len(a._pages) == 11, "十一个页面都已构建", f"{list(a._pages)}")
 a.nav.select("files")
 pump(a, 0.4)
 chk(a.nav.current == "files", "导航能切到文件管理")

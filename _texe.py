@@ -180,6 +180,51 @@ def main():
         except Exception:  # noqa: BLE001
             p2.kill()
 
+    # ---- 5. --page web：新加的 Web 服务页（core.webstack / pages.web_page 有没有打进去）
+    before3 = set(find_titled("Terminal GUI Toolbox"))
+    p3 = subprocess.Popen([str(EXE), "--page", "web"], cwd=str(HERE))
+    try:
+        hwnd3 = wait_window("Terminal GUI Toolbox", before3)
+        chk(hwnd3 is not None, "--page web 起出主窗口")
+        if hwnd3:
+            time.sleep(4.0)
+            img3 = capture(hwnd3)
+            chk(img3 is not None, "Web 服务页可截图")
+            if img3:
+                OUT.mkdir(exist_ok=True)
+                img3.save(OUT / "exe_web.png")
+                chk(len(img3.getcolors(maxcolors=1 << 22) or []) > 50,
+                    "Web 服务页不是空白")
+    finally:
+        p3.terminate()
+        try:
+            p3.wait(timeout=8)
+        except Exception:  # noqa: BLE001
+            p3.kill()
+
+    # ---- 6. --page ai：AI 运维页（core.aiops / ai_skills / ai_skills_builtin 有没有打进去）
+    # 技能正文是打进 exe 的常量，这一页能起来且不空白，说明那 8 份 SKILL.md 也在包里。
+    before4 = set(find_titled("Terminal GUI Toolbox"))
+    p4 = subprocess.Popen([str(EXE), "--page", "ai"], cwd=str(HERE))
+    try:
+        hwnd4 = wait_window("Terminal GUI Toolbox", before4)
+        chk(hwnd4 is not None, "--page ai 起出主窗口")
+        if hwnd4:
+            time.sleep(4.0)
+            img4 = capture(hwnd4)
+            chk(img4 is not None, "AI 运维页可截图")
+            if img4:
+                OUT.mkdir(exist_ok=True)
+                img4.save(OUT / "exe_ai.png")
+                chk(len(img4.getcolors(maxcolors=1 << 22) or []) > 50,
+                    "AI 运维页不是空白")
+    finally:
+        p4.terminate()
+        try:
+            p4.wait(timeout=8)
+        except Exception:  # noqa: BLE001
+            p4.kill()
+
     npass = sum(1 for ok, _, _ in RESULTS if ok)
     nfail = len(RESULTS) - npass
     print("\n===== %d 项，通过 %d，失败 %d =====" % (len(RESULTS), npass, nfail))

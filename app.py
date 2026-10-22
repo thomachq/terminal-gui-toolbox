@@ -35,13 +35,16 @@ import crypto_store
 import lockmgr
 import wbtui as U
 from api.server import make_default as make_api
-from core import parsers, routes
+from core import ai_skills
+from core import aiops, parsers, routes
 from core import redact
 from core.detect import DeviceInfo, capabilities, detect, dialect_for
 from core.metrics import (Sampler, human_bytes, human_gb, human_rate,
                           human_uptime)
+from core.sessionmgr import SessionManager
 from core.session import (ConnSpec, LocalSession, NeedElevation, SSHSession,
                           SessionError, open_session)
+from pages.ai_page import AiPage
 from pages.api_page import ApiPage
 from pages.docker_page import DockerPage
 from pages.files_page import FilesPage
@@ -141,7 +144,7 @@ TOOL_COLS = {
 }
 
 
-class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
+class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPage,
                  WebPage, tk.Tk):
     def __init__(self):
         super().__init__()
@@ -151,10 +154,10 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
         self.configure(bg=U.T.page)
 
         # ---- 状态
-        self.session = None
-        self.device = DeviceInfo()
-        self.dialect = None
-        self.sampler: Sampler | None = None
+        # 多设备：一次能连好几台，session / device / dialect / sampler
+        # 都是「当前那台」的视图（见类里的四个 property）。
+        self.sessions = SessionManager()
+        self._local_device = DeviceInfo()
         self.log_model = LogModel()
         self.q: queue.Queue = queue.Queue()
         self._pages: dict[str, tk.Frame] = {}
@@ -196,12 +199,20 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
         self.api_cfg, self.api_pool, self.api_server = make_api(
             DATA_DIR, on_log=self._api_event)
 
+        # ---- 自己的 AI（AI 运维页）：与「给别的智能体用的 API」是两件事
+        self.ai_cfg = aiops.AIConfig(DATA_DIR / "ai.json")
+        self.ai_assistant = aiops.Assistant(self.ai_cfg)
+        self.ai_skill_store = ai_skills.make_store(DATA_DIR)
+        self.ai_busy = False
+        self._ai_stop = threading.Event()
+
         # ---- 图标 / 任务栏身份
         set_app_id("TerminalToolbox.App.1")
         apply_icon(self, ICON_ICO)
 
         U.configure_ttk(self)
         self._header()
+        self._devtabs()
         self._body()
         self._statusbar()
         self._drain_after = self.after(80, self._drain)
@@ -217,6 +228,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
     def _header(self):
         bar = U.wframe(self, "page")
         bar.pack(fill="x", padx=U.px(18), pady=(U.px(14), U.px(8)))
+        self.header_bar = bar
 
         left = U.wframe(bar, "page")
         left.pack(side="left")
@@ -241,6 +253,128 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
         self.pill_proto = U.Pill(right, "—", "mute")
         self.pill_proto.pack(side="right", padx=U.px(5))
 
+    # ============================================================ 多设备标签
+    def _devtabs(self):
+        """顶部设备标签：本机 + 每个已连接设备，点一下切到那台。
+
+        页面本身不知道有多台设备 —— 它们读的永远是「当前活动的那台」，
+        切换的实质是改 sessions.active_id 再把当前页按新设备重取一遍。
+        """
+        self.host_tabs = U.wframe(self, "page")
+        self._tabs_shown = False
+        self._rebuild_devtabs()
+
+    def _rebuild_devtabs(self):
+        bar = getattr(self, "host_tabs", None)
+        if bar is None:
+            return
+        for w in bar.winfo_children():
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        active = self.sessions.active_id
+        U.wlabel(bar, "设备", "pagedim", U.FONT_XS).pack(
+            side="left", padx=(0, U.px(6)))
+        U.RoundButton(bar, "本机", lambda: self._switch_device(""),
+                      variant=("ghost" if active else "primary"),
+                      font=U.FONT_S, height=26, padx=12).pack(side="left")
+        for slot in self.sessions:
+            box = U.wframe(bar, "page")
+            box.pack(side="left", padx=(U.px(6), 0))
+            tail = "" if slot.alive() else " · 离线"
+            U.RoundButton(box, f"{slot.label}{tail}",
+                          lambda sid=slot.sid: self._switch_device(sid),
+                          variant=("primary" if slot.sid == active else "secondary"),
+                          font=U.FONT_S, height=26, padx=12).pack(side="left")
+            U.RoundButton(box, "×",
+                          lambda sid=slot.sid: self._close_device(sid),
+                          variant="ghost", font=U.FONT_S, height=26,
+                          padx=8).pack(side="left")
+        n = len(self.sessions)
+        if n:
+            U.wlabel(bar, f"{n} 台已连接", "pagedim", U.FONT_XS).pack(side="right")
+        # 一台都没连的时候把整行收起来 —— 不能让切换器白占一行高度，
+        # 小屏（任务栏还挡掉一截）连接页会被挤到看不全。
+        if n and not self._tabs_shown:
+            bar.pack(fill="x", padx=U.px(18), pady=(0, U.px(2)),
+                     after=getattr(self, "header_bar", None))
+            self._tabs_shown = True
+        elif not n and self._tabs_shown:
+            bar.pack_forget()
+            self._tabs_shown = False
+
+    def _switch_device(self, sid: str):
+        if sid and self.sessions.set_active(sid) is None:
+            return
+        if not sid:
+            self.sessions.active_id = ""
+        self._after_switch()
+
+    def _close_device(self, sid: str):
+        slot = self.sessions.get(sid)
+        if slot is None:
+            return
+        if slot.alive():
+            ok = messagebox.askokcancel(
+                "断开这台设备",
+                f"断开「{slot.label}」？\n该设备上正在跑的命令会中断，"
+                f"其它设备不受影响。", parent=self)
+            if not ok:
+                return
+        self.sessions.close(sid)
+        self._after_switch()
+
+    def _after_switch(self):
+        """切换/关闭设备后的统一收尾：重画标签、作废页面缓存、按新设备重取。"""
+        self._rebuild_devtabs()
+        self._local_dev = None
+        self._routes_loaded = False
+        self._fw_probed = False
+        self._dk_probed = False
+        self._web_probed = False
+        self.fw_backend = None
+        self._term_cwd_val = ""
+        s = self.session
+        dev = self.device
+        if s is None:
+            # 没有任何会话了 → 回到「本机」，把界面复位成未连接的样子
+            self._local_device = DeviceInfo()
+            self.status.clear()
+            self.pill_dev.set("未连接", "mute")
+            self.pill_proto.set("—", "mute")
+            self._kv_empty()
+            try:
+                self.lbl_tool_os.configure(text="未连接 · 将使用本机命令")
+                self.lbl_route.configure(text="点「刷新」读取设备当前路由表。")
+                self.lbl_fw.configure(text="点「探测后端」判断设备用哪套防火墙。")
+            except (AttributeError, tk.TclError):
+                pass
+            try:
+                self._term_refresh_head()
+            except (AttributeError, tk.TclError):
+                pass
+            self._refresh_current_page()
+            return
+        alive = True
+        try:
+            alive = bool(s.alive)
+        except Exception:  # noqa: BLE001
+            alive = False
+        self._render_device(dev, s)
+        self.status.set_device(dev.hostname or dev.os_name or s.label,
+                               dev.os_family)
+        self.status.set_state("已连接" if alive else "连接已断开",
+                              "ok" if alive else "err")
+        self.pill_dev.set(dev.os_name or "已连接", "ok" if alive else "err")
+        self.pill_proto.set(s.kind.upper(), "ok" if alive else "err")
+        self._log_raw("meta", f"[切换] 当前设备 → {dev.hostname or dev.os_name}\n")
+        try:
+            self._term_refresh_head()
+        except (AttributeError, tk.TclError):
+            pass
+        self._refresh_current_page()
+
     def _body(self):
         body = U.wframe(self, "page")
         body.pack(fill="both", expand=True, padx=U.px(10))
@@ -255,6 +389,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
             ("fw", "防火墙"),
             ("docker", "Docker"),
             ("web", "Web 服务"),
+            ("ai", "AI 运维"),
             ("vpn", "隧道客户端证书管理"),
             ("api", "智能体接入"),
         ], on_change=self._show, width=176)
@@ -281,6 +416,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
                              ("fw", self.build_fw),
                              ("docker", self.build_docker),
                              ("web", self.build_web),
+                             ("ai", self.build_ai),
                              ("vpn", self._build_vpn),
                              ("api", self.build_api)):
             page = U.wframe(self.stack, "page")
@@ -399,6 +535,8 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
             self.after(200, self.docker_probe)
         elif key == "api":
             self.after(80, self.api_refresh)
+        elif key == "ai":
+            self.after(80, self._ai_ready)
         elif key == "web" and not self._web_probed:
             self._web_probed = True
             self.after(200, self.web_probe)
@@ -597,6 +735,26 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
             return bool(ctypes.windll.shell32.IsUserAnAdmin())
         except Exception:  # noqa: BLE001
             return False
+
+    def copy_text(self, text: str, label: str = "") -> bool:
+        """统一写剪贴板：写完立刻 update_idletasks，别等事件循环空闲。
+
+        Tk 的剪贴板由本进程持有，所以内容只在程序活着的时候有效 —— 复制后
+        该弹窗的还是要弹窗，别指望用户「复制了但看不见」。
+        """
+        if not text:
+            self.toast("没有可复制的内容", "warn")
+            return False
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+        except tk.TclError as e:
+            self.toast(f"复制失败：{e}", "err")
+            return False
+        self.toast(f"{label}已复制到剪贴板 · {len(text)} 字" if label
+                   else f"已复制到剪贴板 · {len(text)} 字", "ok")
+        return True
 
     def toast(self, text: str, tone: str = "ok", ms: int = 3200) -> None:
         """状态栏上的临时提示（比 messagebox 轻，不打断操作）。"""
@@ -1491,10 +1649,10 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
 
         def ok(res):
             s, dev, elev = res
-            self.session = s
-            self.device = dev
-            self.dialect = dialect_for(dev)
-            self.sampler = Sampler(s, self.dialect)
+            # 多设备：连上就加一个槽位，顶部标签栏多一个；同一台重连则替换
+            slot = self.sessions.add(s, dev)
+            slot.elev = elev
+            self._rebuild_devtabs()
             self.btn_connect.set_enabled(True)
             self._render_device(dev, s)
             self.status.set_device(dev.hostname or dev.os_name or s.label, dev.os_family)
@@ -1532,35 +1690,19 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
         self.bg(work, ok=ok, err=err)
 
     def _disconnect(self):
-        if self.session:
-            try:
-                self.session.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self.session = None
-        self.sampler = None
-        self.device = DeviceInfo()
-        self.dialect = None
-        self._local_dev = None
-        self._routes_loaded = False
-        self._fw_probed = False
-        self._dk_probed = False
-        self._web_probed = False
-        self.fw_backend = None
-        self.status.clear()
-        self.pill_dev.set("未连接", "mute")
-        self.pill_proto.set("—", "mute")
-        self._kv_empty()
-        # 工具页的目标与提示也要跟着复位，否则还挂着上一台设备的值
-        try:
-            self.lbl_tool_os.configure(text="未连接 · 将使用本机命令")
-            self.lbl_route.configure(text="点「刷新」读取设备当前路由表。")
-            self.lbl_fw.configure(text="点「探测后端」判断设备用哪套防火墙。")
-        except (AttributeError, tk.TclError):
-            pass
-        # 终端跟着断：目录缓存作废，标题栏回到「未连接」
-        self._term_cwd_val = ""
-        self._term_refresh_head()
+        """只断当前这一台；关掉后自动切到剩下的上一台（没有就回本机）。"""
+        sid = self.sessions.active_id
+        if sid:
+            self.sessions.close(sid)
+        else:
+            s = self.sessions.session
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._local_device = DeviceInfo()
+        self._after_switch()
 
     # ============================================================ 终端（默认不打开）
     def open_terminal(self):
@@ -1782,6 +1924,39 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
             self.tbl_tool.grid()
             self.raw_tool.grid_remove()
             self.tbl_tool.tkraise()
+
+    # ============================================================ 当前设备视图
+    # 这四个属性都不存状态，一律指向「当前活动的那台」。多设备切换靠改
+    # SessionManager.active_id，页面里读的还是这同一套名字，改动面最小。
+    @property
+    def session(self):
+        return self.sessions.session
+
+    @session.setter
+    def session(self, s):
+        # 兼容直接赋值的旧写法（外部脚本/自测会这么干）：塞给「当前这台」，
+        # 没有当前台就新建一个槽位。正常连接流程走 sessions.add()。
+        if s is None:
+            self.sessions.active_id = ""
+            return
+        slot = self.sessions.active
+        if slot is None:
+            self.sessions.add(s, self._local_device)
+        else:
+            slot.session = s
+            slot.reset_sampler()
+
+    @property
+    def device(self) -> DeviceInfo:
+        return self.sessions.device or self._local_device
+
+    @property
+    def dialect(self):
+        return self.sessions.dialect
+
+    @property
+    def sampler(self):
+        return self.sessions.sampler
 
     def _active_session(self):
         """工具默认跑在当前会话上；没连接就跑本机。"""
@@ -2140,11 +2315,14 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
             return detect(s)
 
         def ok(dev):
-            self.device = dev
-            self.dialect = dialect_for(dev)
-            if self.session:
-                self.sampler = Sampler(self.session, self.dialect)
-                self._render_device(dev, self.session)
+            slot = self.sessions.active
+            if slot is not None:
+                slot.device = dev
+                slot.dialect = dialect_for(dev)
+                slot.reset_sampler()
+                self._render_device(dev, slot.session)
+            else:
+                self._local_device = dev
             self.status.set_device(dev.hostname or dev.os_name, dev.os_family)
             self.pill_dev.set(dev.os_name or "已连接", "ok")
             messagebox.showinfo("探测完成",

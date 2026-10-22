@@ -66,7 +66,7 @@ chk(_lm.LockManager(_lm.Settings(A.DATA_DIR / "settings.json")).enabled() is Fal
 print("== 1. 构建与主题 ==")
 a = A.ToolboxApp()
 pump(a, 0.5)
-chk(len(a._pages) == 10, "十个页面都已构建", f"{list(a._pages)}")
+chk(len(a._pages) == 11, "十一个页面都已构建", f"{list(a._pages)}")
 for key in ("conn", "tools", "sys", "files", "routes", "fw", "docker",
             "vpn", "api"):
     a.nav.select(key)

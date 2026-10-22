@@ -32,14 +32,15 @@ hidden = [
     # 本工具箱自身的分层（页面是 Mixin，靠多继承拼进 ToolboxApp，
     # 静态分析有时扫不到，全部显式列出）
     'core.detect', 'core.session', 'core.telnet_session', 'core.metrics',
-    'core.cli_channel', 'core.ssh_shell',
+    'core.cli_channel', 'core.ssh_shell', 'core.sessionmgr',
     'core.parsers', 'core.routes', 'core.firewall', 'core.docker',
-    'core.files', 'core.redact', 'core.webstack',
+    'core.files', 'core.redact', 'core.webstack', 'core.aiops',
+    'core.ai_skills', 'core.ai_skills_builtin',
     'ui.statusbar', 'ui.logpanel', 'ui.table', 'ui.forms',
     'ui.icon', 'ui.tray', 'ui.terminal',
     'pages.routes_page', 'pages.firewall_page',
     'pages.docker_page', 'pages.files_page', 'pages.api_page',
-    'pages.web_page',
+    'pages.web_page', 'pages.ai_page',
     # 给 AI 智能体的本地 HTTP API
     'api.pool', 'api.server',
     'wbtui',

@@ -180,12 +180,9 @@ class ApiPage:
         if srv is None:
             return
         tok = srv.config.token()
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(tok)
-            self.toast("令牌已复制到剪贴板", "ok")
-        except tk.TclError:
-            forms.InfoDialog.show(self, "令牌", tok, width=560, height=200)
+        if not self.copy_text(tok, "令牌"):
+            forms.InfoDialog.show(self, "令牌", tok, width=560, height=200,
+                                  copyable=True)
 
     def api_rotate_token(self):
         srv = getattr(self, "api_server", None)
@@ -201,12 +198,25 @@ class ApiPage:
         self.toast("令牌已重置", "ok")
 
     def api_copy_brief(self):
+        brief = self._brief_text()
+        if not brief:
+            return
+        # 这个按钮叫「说明」，那就要让人看见说明。
+        # 之前只往剪贴板里塞、状态栏闪一行字，看上去像没反应；现在先弹窗，
+        # 全文同时进剪贴板，「复制全文」也留在窗里，两条路都给。
+        forms.InfoDialog.show(self, "给智能体的说明", brief,
+                              subtitle="全文已同时放入剪贴板",
+                              width=880, height=640)
+        self.copy_text(brief, "说明")
+
+    def _brief_text(self) -> str:
         srv = getattr(self, "api_server", None)
         if srv is None:
-            return
+            self.toast("API 还没初始化，稍后再试", "warn")
+            return ""
         tok = srv.config.token()
         url = srv.url()
-        brief = f"""# Terminal GUI Toolbox · SSH 连接 API
+        return f"""# Terminal GUI Toolbox · SSH 连接 API
 
 基础地址：{url}
 鉴权头：Authorization: Bearer {tok}
@@ -246,13 +256,6 @@ sid = requests.post(f"{{S}}/v1/sessions", headers=H, json={{"host":"192.168.3.12
 r = requests.post(f"{{S}}/v1/sessions/{{sid}}/exec", headers=H, json={{"cmd":"uptime"}}).json()
 print(r["out"])
 """
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(brief)
-            self.toast("说明已复制，可直接给智能体", "ok")
-        except tk.TclError:
-            forms.InfoDialog.show(self, "给智能体的说明", brief,
-                                  width=860, height=620)
 
     def api_settings(self):
         srv = getattr(self, "api_server", None)
@@ -343,12 +346,7 @@ print(r["out"])
     def api_copy_sid(self, row):
         if not row:
             return
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(str(row.get("id", "")))
-            self.toast("连接 ID 已复制", "ok")
-        except tk.TclError:
-            pass
+        self.copy_text(str(row.get("id", "")), "连接 ID")
 
     def api_session_detail(self, row):
         if not row:

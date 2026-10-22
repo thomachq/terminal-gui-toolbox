@@ -3,16 +3,21 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg)](requirements.txt)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](#安装与启动)
-[![Tests](https://img.shields.io/badge/self--tests-633%20checks-brightgreen.svg)](#离线自测)
+[![Tests](https://img.shields.io/badge/self--tests-885%20checks-brightgreen.svg)](#离线自测)
 
-**多协议终端工具箱**：SSH / Telnet / 本机会话统一入口，实时性能状态栏、SFTP 双栏文件管理、
-路由与端口规则、容器管理、隧道客户端证书管理与本地 API。纯 tkinter 实现，单文件 exe，MIT 许可。
+**多协议终端工具箱**：SSH / Telnet / **多台设备同时连着**、实时性能状态栏、SFTP 双栏文件管理、
+路由与端口规则、容器管理、Web 服务与站点、隧道客户端证书、**AI 运维**与本地 API。
+纯 tkinter 实现，单文件 exe，MIT 许可。
 
 **把「连着几台机器反复敲同样几条命令」这件事做成窗口。**
 
 连上自动识别对方的操作系统与设备类型，命令按系统自动换写法；底部是 MobaXterm 式的实时状态条
 （CPU / 内存 / 网络 / 运行时长），右侧是可分离的命令日志，另有一个默认关着、需要时才点开的终端。
-十个页面覆盖连接、网络诊断、文件传输、路由、端口规则、容器管理、Web 服务与服务器证书、隧道客户端证书签发和给智能体用的本地 API。
+十一个页面覆盖连接、网络诊断、文件传输、路由、端口规则、容器管理、Web 服务与服务器证书、
+AI 运维、隧道客户端证书签发和给智能体用的本地 API。
+
+**多设备**：顶部一排标签，连几台就有几个；点一下切过去，路由、防火墙、Docker、Web 服务这些页
+立刻改看那台。断开只断当前这台，其余不受影响。
 
 单文件 exe，绿色免安装：不装 Python、不写注册表、不占端口、不起后台服务。
 运行时只依赖两个库（paramiko、cryptography），界面全部用 tkinter 手写，不引第三方 UI 框架。
@@ -41,6 +46,7 @@ MobaXterm 好用但只有 Windows 且不开源；剩下的要么只管 SSH，要
 | **防火墙** | 读规则、开/关端口 | 覆盖 nft、iptables、netsh advfirewall、pf、ipfw；3178 条规则也带横向滚动 |
 | **Docker** | 容器/镜像列表、启停、日志 | 区分「未安装 / 守护进程没起 / 无权限 / 正常」四种状态，不把报错刷满日志 |
 | **Web 服务** | 探测设备上所有 Web 服务（Nginx / Apache / Tomcat / Caddy / Lighttpd / IIS），下拉切换逐个管理，服务器 TLS 证书读取、校验与部署 | 进程、监听端口、配置文件三方对照着认，不靠「猜端口」；部署证书前自动备份，配置检查或重载失败就还原 |
+| **AI 运维** | 说一句话，AI 逐条生成命令、在远端执行、读回输出再决定下一步；可套 8 份内置排查剧本（磁盘/安全/服务/网络/网站 SSL/数据库/日志/文件 FTP） | 命令卡片标风险（只读/会改动/高风险）；三档模式，高风险永远必问；技能只是文本，能自动挑也能自装，脚本永不执行 |
 | **隧道客户端证书管理** | 自建 CA（Client Cert CA）、签服务端与设备证书、每个平台一份配置文件、部署到 NAS | 内嵌页面，不是外挂程序；部署前自动备份，命令全可回溯 |
 | **智能体接入** | 本地 HTTP API + 会话池 | 连一次反复下命令，服务端每 25 秒 SSH keepalive，掉线自动重连 |
 
@@ -163,7 +169,7 @@ PyInstaller 的 GPL 带有 bootloader 例外，打包产物不受传染。
 
 下面是逐页、逐模块的实现说明。想直接用的人看到这里就够了，想改代码的往下看。
 
-## 十个页面
+## 十一个页面
 
 左侧导航切换，不换窗口。列表类页面统一是 DSM 那套观感：工具条（搜索在左、动作在右）
 + 斑马纹表格 + 空态（图标 + 一句「还没有…」+ 一句「怎么办」）+ 右键菜单。
@@ -345,7 +351,31 @@ NAS 上还可能有内置的 Web Station），所以这一页的第一件事是*
 IIS 的证书不是配置文件里的路径，而是 http.sys 的端口绑定（`netsh http show sslcert`），
 所以对 IIS 只做「看」：列出 https 绑定用到的证书主题与到期时间，换证书请走 IIS 管理器或
 `netsh http update sslcert` —— 界面上会直接把这句话说出来，而不是留一个点了没反应的按钮。
-### 9 · 隧道客户端证书管理
+
+### 9 · AI 运维
+
+说一句话，AI 逐条给命令，程序在**当前这台设备**上执行，把真实输出喂回去，它再决定下一步，
+最多来回几轮（默认 8 步）。要点三条：
+
+- **命令一定看得见**：每条命令按风险着色（只读 / 会改动 / 高风险）、附上「为什么」，
+  执行输出同时进右侧命令日志，不做后台静默执行。
+- **三档模式**：自动执行（只读与一般改动直接跑）/ 每步确认（有改动就问）/ 只读（改东西一律跳过并记账）。
+  **高风险（删除、清空、重启设备）在任何档位都要问**，也没有「本次不再问」这种开关。
+- **技能 = 排查剧本**：内置 8 份（服务器资源与性能检查 / 安全诊断与加固 / 服务与计划任务诊断 /
+  网络与防火墙诊断 / 网站与 SSL 诊断 / 数据库诊断 / 日志分析 / 文件与 FTP 诊断），
+  正文是「探测 → 检查 → 诊断 → 修复 → 注意事项」。选「自动判断」就按你说的话打分挑一份，
+  对话区会写出命中了什么（`· 技能：数据库诊断（命中 慢查询、连接数）`）。
+  「技能库」窗口能看正文、导入 `.md` / `.zip`（入口文件 `SKILL.md`）、打开 `data/skills/`。
+
+技能的边界写死在这里，别改：**技能只是文本**，目录里的脚本一律不执行；命令必须由模型按 SOP
+生成、再经会话通道在目标机上跑。删掉某个内置技能后不会被自动装回来（`.seeded` 标记控制）。
+frontmatter 只认宝塔那个子集（`key: value`、`description: >`、`tags: [a, b]`、缩进 `- a`），
+嵌套映射与多文档一律判坏跳过，坏文件不拖垮其余技能。
+
+模型可以用自家 Key（DeepSeek / 通义 / Kimi / 智谱 / 任何 OpenAI 兼容网关），也能选本机
+DeepSeek Harness（`dsh --profile headless`）。Key 加密存在 `data/ai.json`，界面上不回显。
+
+### 10 · 隧道客户端证书管理
 
 群晖 NAS 上隧道服务的客户端证书管理控制台，**内嵌在这一页里**（页内 Frame），
 不再另起进程或独立窗口。五个子页（连接 / 证书 / 打包 / 部署 / 日志）在页顶横排切换，
@@ -358,7 +388,7 @@ IIS 的证书不是配置文件里的路径，而是 http.sys 的端口绑定（
 `vpncert_gui.py` 的 `App` 是 `tk.Frame` 而不是 `tk.Tk`，`embedded=True` 时
 省掉标题行、把竖导航换成横向分段条、按 3:2 比例分栏；单独运行时仍可作为独立窗口启动。
 
-### 10 · 智能体接入
+### 11 · 智能体接入
 
 本地 HTTP API，给 AI 智能体的 SSH 连接技能用：**连一次、之后反复下命令**，
 服务端每 25 秒发一次 SSH keepalive，掉线自动重连 —— 智能体不必自己管连接。
@@ -486,7 +516,7 @@ terminal-gui-toolbox/
 ├─ THIRD-PARTY-NOTICES.md  第三方组件归属与许可证
 ├─ .gitignore           排除 data/、*.exe、build/ 等
 ├─ assets/app.ico       应用图标（_mkicon.py 生成）
-├─ app.py               主程序：十页导航 + 状态栏 + 日志侧边栏 + 应用锁 + 托盘
+├─ app.py               主程序：十一页导航 + 状态栏 + 日志侧边栏 + 应用锁 + 托盘
 ├─ core/
 │  ├─ detect.py         设备/系统探测 + 命令方言
 │  ├─ session.py        会话抽象（本机 / SSH / Telnet）+ 编码解码 + 提权与 NeedElevation
@@ -497,6 +527,10 @@ terminal-gui-toolbox/
 │  ├─ firewall.py       防火墙读写（nft / iptables / netsh / pf / ipfw）
 │  ├─ docker.py         Docker 探测与操作（四态区分）
 │  ├─ webstack.py       Web 服务探测（进程/端口/配置三方对照）+ 证书解析与部署回滚
+│  ├─ aiops.py          AI 引擎（OpenAI 兼容 / 本机 dsh）+ 风险分级 + 自驱执行循环
+│  ├─ ai_skills.py      技能库：SKILL.md 解析、自动挑选、第三方技能安装
+│  ├─ ai_skills_builtin.py  8 份内置技能原文（宝塔终端那 8 个，逐字还原）
+│  └─ sessionmgr.py     多设备会话槽位（顶部标签切换）
 │  ├─ files.py          文件系统抽象（LocalFS / SFTPFS）+ 传输 + WinSCP
 │  └─ redact.py         私钥 / 口令脱敏（五个出口共用的唯一规则源）
 ├─ pages/               各页面的 Mixin（被 ToolboxApp 多继承拼起来）
@@ -505,6 +539,7 @@ terminal-gui-toolbox/
 │  ├─ docker_page.py    Docker 页
 │  ├─ web_page.py       Web 服务页（下拉切换 + TLS 证书管理）
 │  ├─ files_page.py     文件管理页（SFTP 双栏 / 上传下载 / 队列 / 进度）
+│  ├─ ai_page.py        AI 运维页（对话 / 技能下拉 / 三档模式 / 技能库窗口）
 │  └─ api_page.py       智能体接入页
 ├─ api/
 │  ├─ pool.py           会话池：keepalive、掉线重连、exec 上限
@@ -524,7 +559,7 @@ terminal-gui-toolbox/
 ├─ crypto_store.py      机密存储：AES-256-GCM（便携密钥）/ DPAPI
 ├─ lockmgr.py           应用锁：PBKDF2 校验 / 闲置超时 / 记住密码
 ├─ profiles.py          连接档案（密文）+ ~/.ssh 密钥发现 + ssh config 解析
-├─ _tsmoke.py           界面冒烟：十页几何 / 日志分离 / 真实连接采样（71 项）
+├─ _tsmoke.py           界面冒烟：十一页几何 / 日志分离 / 真实连接采样（71 项）
 ├─ _tsmoke2.py          第二批界面自测：表格 / 路由 / 防火墙 / Docker / API / 锁屏（65 项）
 ├─ _websmoke.py         Web 服务自测：探测解析 / 证书报表 / 部署回滚 / 页面切换（98 项）
 ├─ _fsmoke.py           文件管理自测：路径 / 传输字节校验 / 取消 / 界面真实上传（49 项）
@@ -533,10 +568,13 @@ terminal-gui-toolbox/
 ├─ _termsmoke.py        终端：回显 / 历史 / 取消 / 不重复回显（32 项）
 ├─ _inlinetest.py       终端两种输入形态：输入框 / 行内 + 切换搬运（40 项）
 ├─ _vpnsmoke.py         隧道客户端证书管理内嵌：五个子页 / 状态转发 / boot 幂等（27 项）
-├─ _uismoke.py          隧道客户端证书管理界面与档案层（101 项）
+├─ _uismoke.py          隧道客户端证书管理界面与档案层（110 项）
 ├─ _selftest.py         PKI：建 CA / 签证书 / CRL / 多平台打包（58 项）
-├─ _conntest.py         连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（92 项）
-├─ _shots.py            批量截图（十页 + 锁屏）
+├─ _conntest.py         连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（106 项）
+├─ _aismoke.py          AI 运维：方案解析 / 自驱循环 / 三档模式 / 技能（59 项）
+├─ _aiskilltest.py      技能库：8 份内置 / frontmatter / 自动挑选 / 安装 / 注入（54 项）
+├─ _mdevsmoke.py        多设备标签：加入 / 切换 / 关闭 / 回退（34 项）
+├─ _shots.py            批量截图（十一页 + 锁屏）
 ├─ _shot2.py            截图工具（置前 + PrintWindow）
 ├─ _texe.py             打包后 exe 验收
 ├─ _mkicon.py           生成图标
@@ -619,6 +657,9 @@ python _uismoke.py    # 隧道客户端证书管理界面与档案层（103 项�
 python _selftest.py   # 建 CA / 签证书 / CRL / 多平台打包（58 项）
 python _conntest.py   # 连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（106 项）
 python _websmoke.py   # Web 服务：探测解析 / 证书报表 / 部署与回滚 / 页面切换（98 项）
+python _aismoke.py    # AI 运维：JSON 解析 / 自驱循环 / 三档模式 / 技能注入（59 项）
+python _aiskilltest.py # 技能库：内置 8 份 / frontmatter 子集 / 自动挑选 / 安装（54 项）
+python _mdevsmoke.py  # 多设备标签：加入 / 切换 / 关闭最后一条要回退（34 项）
 python _texe.py       # 打包后的 exe 验收（起窗 / 截图 / 数据落点 / 子进程）
 ```
 

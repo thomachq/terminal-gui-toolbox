@@ -273,11 +273,12 @@ class InfoDialog(tk.Toplevel):
     """只读信息窗：原始输出、容器日志这类长文本。"""
 
     def __init__(self, parent, title: str, body: str, subtitle: str = "",
-                 width: int = 860, height: int = 560):
+                 width: int = 860, height: int = 560, copyable: bool = True):
         super().__init__(parent)
         self.title(title)
         self.configure(bg=U.T.page)
         self.transient(parent)
+        self._copy_src = body or ""
         wrap = U.wframe(self, "page")
         wrap.pack(fill="both", expand=True, padx=U.px(18), pady=U.px(16))
         head = U.wframe(wrap, "page")
@@ -288,6 +289,12 @@ class InfoDialog(tk.Toplevel):
                 side="left", padx=(U.px(10), 0))
         U.RoundButton(head, "关闭", self.destroy, variant="secondary",
                       height=30, padx=16).pack(side="right")
+        # 只读窗口里的文本能选中，但很多人直接找按钮 —— 给一个明确的复制入口，
+        # 也顺手解决「点了没反应」：按钮文字会当场变成「已复制」。
+        if copyable:
+            self.btn_copy = U.RoundButton(head, "复制全文", self._do_copy,
+                                          variant="ghost", height=30, padx=14)
+            self.btn_copy.pack(side="right", padx=(0, U.px(6)))
 
         card = U.Card(wrap)
         card.pack(fill="both", expand=True, pady=(U.px(12), 0))
@@ -318,6 +325,27 @@ class InfoDialog(tk.Toplevel):
     @classmethod
     def show(cls, parent, title: str, body: str, **kw) -> None:
         cls(parent, title, body, **kw)
+
+    def _do_copy(self):
+        """复制全文，并在按钮上留一个看得见的结果。"""
+        text = self._copy_src
+        if not text:
+            self.btn_copy.set_text("没有内容")
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+        except tk.TclError:
+            self.btn_copy.set_text("复制失败")
+            return
+        self.btn_copy.set_text(f"已复制 {len(text)} 字")
+        try:
+            self.after(1800, lambda: (
+                self.btn_copy.set_text("复制全文")
+                if self.btn_copy.winfo_exists() else None))
+        except tk.TclError:
+            pass
 
 
 def confirm(parent, title: str, message: str, danger: bool = False,

@@ -159,7 +159,9 @@ def main() -> int:
     chk(app._log_win is not None and app._log_win.winfo_exists(), "日志分离成窗口")
     chk(not app._docked(), "分离后从分隔器移除",
         f"panes={len(app.paned.panes())}")
-    chk(len(app.log_model.lines) == before, "分离不丢日志",
+    # 断的是「行数只增不减」而不是「完全相等」：状态栏采样器与连接日志会继续写，
+    # 早先写成 == 会偶发失败（22 vs 17），那是采样器在跑，不是日志丢了。
+    chk(len(app.log_model.lines) >= before, "分离不丢日志",
         f"{len(app.log_model.lines)} vs {before}")
     if app._log_panel is not None:
         txt = app._log_panel.txt
@@ -172,7 +174,7 @@ def main() -> int:
     pump(app, 0.6)
     chk(app._log_win is None, "日志归位后窗口销毁")
     chk(app._docked(), "归位后回到分隔器")
-    chk(len(app.log_model.lines) == before, "归位不丢日志",
+    chk(len(app.log_model.lines) >= before, "归位不丢日志",
         f"{len(app.log_model.lines)} vs {before}")
 
     app._toggle_log(False)
