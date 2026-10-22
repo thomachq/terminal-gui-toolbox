@@ -314,11 +314,40 @@ def test_app() -> None:
     print("  [INFO] 主窗口构建、切换、销毁均无异常")
 
 
+def test_click_once() -> None:
+    print("\n[4] 按钮点击只触发一次")
+    import tkinter as tk
+
+    import wbtui as U
+
+    root = tk.Tk()
+    try:
+        calls = []
+        btn = U.RoundButton(root, "试一下", lambda: calls.append(1),
+                            variant="primary", height=32, padx=18)
+        btn.pack(pady=20)
+        root.update()
+        btn.event_generate("<Button-1>", x=20, y=16)
+        btn.event_generate("<ButtonRelease-1>", x=20, y=16)
+        root.update()
+        # canvas 的 item 绑定和 widget 绑定会各跑一遍；两套都绑就会点一次跑两次，
+        # 「启动服务」起来马上停就是这么来的。
+        check("点一次只触发一次 command", len(calls) == 1, f"{len(calls)} 次")
+
+        calls.clear()
+        btn.event_generate("<ButtonRelease-1>", x=20, y=16)
+        root.update()
+        check("没按下去就松手不触发", not calls, f"{len(calls)} 次")
+    finally:
+        root.destroy()
+
+
 def main() -> int:
     try:
         test_profiles()
         test_widgets()
         test_app()
+        test_click_once()
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         return 2

@@ -165,6 +165,10 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self._lock_after = None
         self._sample_after = None
         self._drain_after = None
+        # 定时器是否还有必要续期。Tk 的 after 挂在解释器上而不是控件上，
+        # 窗口销毁后再排一次不会当场报错，等它真触发时命令已经被删，
+        # 才会冒出 invalid command name ..._drain。
+        self._alive = True
         self._sampling = False
         self._local_dev: DeviceInfo | None = None
         self._toast_job = None
@@ -197,7 +201,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self._header()
         self._body()
         self._statusbar()
-        self.after(80, self._drain)
+        self._drain_after = self.after(80, self._drain)
         self._load_last_profile()
         self._watch_activity()
         self._start_sampler()
@@ -481,6 +485,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
     def _cancel_timers(self) -> None:
         """撤掉所有自我续期的定时器，否则窗口销毁后 Tcl 会反复报
         invalid command name ..._tick / ...tick。"""
+        self._alive = False
         for name in ("_lock_after", "_sample_after", "_drain_after"):
             tid = getattr(self, name, None)
             if tid is None:
@@ -490,6 +495,21 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             except Exception:  # noqa: BLE001
                 pass
             setattr(self, name, None)
+        # 还有一批一次性 after（toast 复位、密钥信息刷新、锁屏抖动动画…）
+        # 各自挂着 python 回调，窗口没了就不该再跑。Tcl 的 after 队列挂在
+        # 解释器上而不是控件上，漏掉一个，下个实例泵事件时就会冒
+        # invalid command name。这里一并撤干净。
+        try:
+            rest = self.tk.call("after", "info")
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(rest, str):
+            rest = (rest,) if rest else ()
+        for tid in rest:
+            try:
+                self.tk.call("after", "cancel", tid)
+            except Exception:  # noqa: BLE001
+                pass
 
     def destroy(self) -> None:
         self._cancel_timers()
@@ -678,6 +698,8 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                 allow_elev=False)
 
     def _drain(self):
+        if not self._alive:
+            return
         try:
             while True:
                 fn, a = self.q.get_nowait()
@@ -687,6 +709,8 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                     traceback.print_exc()
         except queue.Empty:
             pass
+        if not self._alive:
+            return
         try:
             self._drain_after = self.after(80, self._drain)
         except tk.TclError:
@@ -742,6 +766,8 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                         s = Sample(ok=False, error=str(e))
                     self.post(self._on_sample, s)
                 threading.Thread(target=work, daemon=True).start()
+            if not self._alive:
+                return
             try:
                 self._sample_after = self.after(SAMPLE_MS, tick)
             except tk.TclError:
@@ -774,7 +800,12 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                             command=self._proto_changed).pack(side="left", padx=(0, 20))
 
         self.v_prof = tk.StringVar()
-        self.v_remember = tk.BooleanVar(value=False)
+        # 每个口令各自一个「保存」开关：只勾私钥口令就只存私钥口令，
+        # 不再用一个总开关去猜要存哪几项。
+        self.v_save_keypw = tk.BooleanVar(value=False)
+        self.v_save_pw = tk.BooleanVar(value=False)
+        self.v_save_sudo = tk.BooleanVar(value=False)
+        self.v_remember = tk.BooleanVar(value=False)   # 上面三项的汇总，只读
         self.v_host = tk.StringVar(value="192.168.3.12")
         self.v_port = tk.StringVar(value="22")
         self.v_user = tk.StringVar(value="")
@@ -849,10 +880,9 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self.e_keypw = ttk.Entry(rk, textvariable=self.v_keypw, show="*", width=18)
         self.e_keypw.pack(side="left", padx=(8, 0))
         self.v_keypw.trace_add("write", self._on_keypw_changed)
-        # 口令框旁边就地给一个「保存」勾选：它和下面的总开关是同一个变量，
-        # 所以只要用户在这里勾上，档案里就会留下口令 —— 不必先滚下去找开关。
-        U.Check(rk, "保存口令", self.v_remember,
-                command=self._remember_changed).pack(side="left", padx=(8, 0))
+        # 「保存口令」就地放在这个框后面：勾了才在档案里留下口令，
+        # 每项自己管自己，不需要滚到下面再找一个总开关。
+        U.Check(rk, "保存口令", self.v_save_keypw).pack(side="left", padx=(8, 0))
         self.btn_eye = U.RoundButton(rk, "👁", self._toggle_keypw_eye,
                                      variant="ghost", font=U.FONT_S,
                                      height=24, padx=7)
@@ -866,6 +896,8 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         U.RoundButton(self.row_pw, "👁", lambda: self._toggle_eye(self.e_pw),
                       variant="ghost", font=U.FONT_S, height=24,
                       padx=7).pack(side="left", padx=(2, 0))
+        U.Check(self.row_pw, "保存口令", self.v_save_pw).pack(side="left",
+                                                             padx=(8, 0))
 
         # 提权：内容随「协议 + 本机系统」变，见 _rebuild_elevation()
         self.v_elevate = tk.BooleanVar(value=False)
@@ -874,16 +906,12 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self.row_elev.pack(fill="x", pady=(9, 0))
         self.elev_holder = self.row_elev
 
-        # 凭据保存：一个总开关 + 一行实时说明「现在到底存了什么」
+        # 凭据保存不再有总开关：每个口令框后面各有一个「保存口令」。
+        # 这里只留一行说明，告诉用户勾与不勾分别会落在哪里。
         self.row_cred = U.wframe(b, "card")
-        rc = self.row_cred
-        rc.pack(fill="x", pady=(9, 0))
-        self.chk_remember = U.Check(rc, "记住凭据（私钥口令 · 登录密码 · sudo 密码，"
-                                        "本机加密保存）",
-                                    self.v_remember, command=self._remember_changed)
-        self.chk_remember.pack(side="left")
-        self.lbl_cred = U.wlabel(rc, "", "dim", U.FONT_XS, anchor="e")
-        self.lbl_cred.pack(side="right")
+        self.row_cred.pack(fill="x", pady=(9, 0))
+        self.lbl_cred = U.wlabel(self.row_cred, "", "dim", U.FONT_XS, anchor="w")
+        self.lbl_cred.pack(side="left")
 
         act = U.wframe(b, "card")
         act.pack(fill="x", pady=(11, 0))
@@ -893,9 +921,10 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         U.RoundButton(act, "断开", self._disconnect, variant="ghost",
                       height=34, padx=14).pack(side="left", padx=(8, 0))
 
-        # 任何一项凭据变化都重算一次「将加密保存：…」，用户不用猜勾选框管谁
-        for var in (self.v_remember, self.v_keypw, self.v_pw, self.v_sudopw):
-            var.trace_add("write", lambda *_: self._refresh_cred_hint())
+        # 任何一项口令开关变化都重算一次提示，用户不用猜勾选框管谁
+        for var in (self.v_save_keypw, self.v_save_pw, self.v_save_sudo,
+                    self.v_keypw, self.v_pw, self.v_sudopw):
+            var.trace_add("write", lambda *_: self._remember_synced())
         self._refresh_cred_hint()
 
         # ---- 设备概览
@@ -959,28 +988,29 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                     self.row_auth.pack(fill="x", pady=(9, 0),
                                        before=self.row_elev)
                 self._mode_changed()
-        # 本机 Windows 没有要输的口令，这行留着只会让人以为还有东西没填
+        # 本机 Windows 没有要输的口令，这行提示留着只会让人以为还有东西没填
         local_win = proto == "local" and sys.platform == "win32"
         if local_win:
             self.row_cred.pack_forget()
-        else:
-            if not self.row_cred.winfo_manager():
-                self.row_cred.pack(fill="x", pady=(9, 0))
-            self.chk_remember.set_text({
-                "telnet": "记住凭据（enable 密码，本机加密保存）",
-                "local": "记住凭据（sudo 密码，本机加密保存）",
-            }.get(proto, "记住凭据（私钥口令 · 登录密码 · sudo 密码，本机加密保存）"))
+        elif not self.row_cred.winfo_manager():
+            self.row_cred.pack(fill="x", pady=(9, 0))
         self._rebuild_elevation()
 
     def _mode_changed(self):
-        if self.v_mode.get() == "key":
-            self.row_pw.pack_forget()
-            if not self.row_key.winfo_ismapped():
-                self.row_key.pack(fill="x", pady=(7, 0), before=self.row_keypw)
+        """选私钥就只露私钥相关两行，选登录密码就只露密码一行。
+
+        以前两行一直摆着，私钥口令框空着也显示，看着像「还有东西没填」。
+        """
+        use_key = self.v_mode.get() == "key"
+        # 先全部收起再按当前选择依次排，顺序不会错，也不用去猜 before/after
+        for w in (self.row_key, self.row_keypw, self.row_pw):
+            w.pack_forget()
+        if use_key:
+            self.row_key.pack(fill="x", pady=(7, 0))
+            self.row_keypw.pack(fill="x", pady=(6, 0))
         else:
-            self.row_key.pack_forget()
-            if not self.row_pw.winfo_ismapped():
-                self.row_pw.pack(fill="x", pady=(6, 0))
+            self.row_pw.pack(fill="x", pady=(6, 0))
+        self._refresh_cred_hint()
 
     # ---------------- 提权区（随平台与协议变形）
     def _is_admin(self) -> bool:
@@ -1030,15 +1060,24 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
 
         row = U.wframe(holder, "card")
         row.pack(fill="x")
-        if proto == "telnet":
-            title, pw_label = "进入 enable 特权模式", "enable 密码"
-            hint = ("交换机 / 路由器没有 sudo。勾选后用 enable 密码进特权模式；"
+        if proto == "local":
+            title = "使用 sudo 提权（进入后自动 sudo -i）"
+            pw_label = "sudo 密码"
+            hint = ("本机的提权就是 sudo：勾选后所有命令都走 sudo -i；"
+                    "不勾选也能用，需要 root 时会弹窗问你要密码 —— "
+                    "也可以到「终端」里自己敲。")
+        elif proto == "telnet":
+            title = "连接后自动进特权模式"
+            pw_label = "提权密码"
+            hint = ("交换机 / 路由器填 enable 密码；对端其实是 Linux / Unix 的话"
+                    "这里就是 sudo 密码 —— 连上探测完系统再决定敲哪条命令。"
                     "不勾选也能看，写操作时才会问你要密码。")
         else:
-            title, pw_label = "使用 sudo 提权（登录后自动 sudo -i）", "sudo 密码"
-            hint = ("勾选后在连接时自动执行 sudo -i，之后所有命令都带 root；"
-                    "不勾选也能用，需要提权时会弹窗问你要密码 —— "
-                    "也可以到「终端」里自己敲。")
+            title = "使用提权（登录后自动 sudo -i / enable）"
+            pw_label = "提权密码"
+            hint = ("勾选后在连接时自动提权：服务器上执行 sudo -i，交换机 / 路由器"
+                    "上进 enable 特权模式（SSH 也支持）。不勾选也能用，"
+                    "需要提权时会弹窗问你要密码 —— 也可以到「终端」里自己敲。")
         U.Check(row, title, self.v_elevate,
                 command=self._elev_toggled).pack(side="left")
         U.wlabel(row, pw_label, "card", U.FONT_S).pack(side="left", padx=(14, 8))
@@ -1048,6 +1087,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         U.RoundButton(row, "👁", lambda: self._toggle_eye(self.e_sudopw),
                       variant="ghost", font=U.FONT_S, height=24,
                       padx=7).pack(side="left", padx=(2, 0))
+        U.Check(row, "保存口令", self.v_save_sudo).pack(side="left", padx=(8, 0))
         U.wlabel(holder, hint, "dim", U.FONT_XS, justify="left").pack(
             anchor="w", pady=(6, 0))
         self._elev_toggled()
@@ -1112,27 +1152,34 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
     def _remember_changed(self, *_):
         self._refresh_cred_hint()
 
+    def _remember_synced(self, *_):
+        """三个分项开关汇总成 v_remember（老代码与档案格式还在用它）。"""
+        try:
+            any_save = bool(self.v_save_keypw.get() or self.v_save_pw.get()
+                            or self.v_save_sudo.get())
+            if bool(self.v_remember.get()) != any_save:
+                self.v_remember.set(any_save)
+        except tk.TclError:
+            pass
+        self._refresh_cred_hint()
+
     def _refresh_cred_hint(self) -> None:
-        """把「现在到底会存什么」直接写出来，不用用户猜勾选框管哪些字段。"""
+        """只说清「勾了的项会在点保存时落盘」，不再代替用户做决定。"""
         lbl = getattr(self, "lbl_cred", None)
         if lbl is None:
             return
         try:
-            if not self.v_remember.get():
-                lbl.configure(text="未勾选 · 口令只留在本次运行的内存里",
-                              fg=U.T.text_mute)
-                return
             keep = []
-            if self.v_keypw.get():
+            proto = self.v_proto.get()
+            if self.v_save_keypw.get() and self.v_mode.get() == "key":
                 keep.append("私钥口令")
-            if self.v_pw.get():
+            if self.v_save_pw.get() and self.v_mode.get() == "password":
                 keep.append("登录密码")
-            if self.v_sudopw.get():
-                keep.append("enable 密码" if self.v_proto.get() == "telnet"
-                            else "sudo 密码")
+            if self.v_save_sudo.get():
+                keep.append("enable 密码" if proto == "telnet" else "sudo 密码")
             if not keep:
-                lbl.configure(text="已勾选 · 填好口令后点「保存」即落盘",
-                              fg=U.T.text_dim)
+                lbl.configure(text="未勾选「保存口令」· 口令只留在本次运行的内存里",
+                              fg=U.T.text_mute)
                 return
             lbl.configure(text="将加密保存：" + "、".join(keep), fg=U.T.ok)
         except tk.TclError:
@@ -1203,9 +1250,13 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             "key_path": norm_path(self.v_key.get()),
             "remember": bool(self.v_remember.get()),
         }
-        if p["remember"]:
+        # 每一项单独决定存不存：勾了私钥口令就只存私钥口令，
+        # 别把一个没勾的口令也顺手写进文件。
+        if self.v_save_pw.get():
             p["password"] = self.v_pw.get()
+        if self.v_save_keypw.get():
             p["key_passphrase"] = self.v_keypw.get()
+        if self.v_save_sudo.get():
             p["sudo_password"] = self.v_sudopw.get()
         return p
 
@@ -1227,7 +1278,12 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self.v_keypw.set(p.get("key_passphrase", "") or "")
         self.v_pw.set(p.get("password", "") or "")
         self.v_sudopw.set(p.get("sudo_password", "") or "")
-        self.v_remember.set(bool(p.get("remember")))
+        # 档案里真存了哪几项，就把对应开关打开，界面上如实反映
+        self.v_save_keypw.set(bool(p.get("key_passphrase")))
+        self.v_save_pw.set(bool(p.get("password")))
+        self.v_save_sudo.set(bool(p.get("sudo_password")))
+        self._remember_synced()
+        self._mode_changed()
         if self.v_key.get():
             self._refresh_key_info()
         else:
@@ -1401,19 +1457,25 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                     pass
             s = open_session(spec)
             s.tracer = self._trace_cmd
-            # 连上之后核实一次提权是否真的成功：密码错了不能装作生效
+            # 先探测出「对方到底是什么」，再决定提权怎么提：
+            # 交换机 / 路由器是 enable，Linux / Unix 是 sudo —— 同一个密码框。
+            dev = detect(s)
+            try:
+                s.bind_device(dev)
+            except Exception:  # noqa: BLE001
+                pass
             elev = ""
             if spec.elevate and spec.sudo_password:
                 okadm = False
                 try:
-                    okadm = s.can_admin()[0]
+                    okadm = bool(s.sudo_ok(spec.sudo_password))
                 except Exception:  # noqa: BLE001
                     okadm = False
+                # 连上之后核实一次：密码错了不能装作生效
                 if okadm:
-                    elev = "enable" if proto == "telnet" else "sudo -i"
+                    elev = "enable" if s.admin_kind == "enable" else "sudo -i"
                 else:
                     elev = "failed"
-            dev = detect(s)
             return s, dev, elev
 
         def ok(res):
@@ -2131,6 +2193,8 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                     self._show_lock("闲置超时，已自动锁定")
         except Exception:  # noqa: BLE001
             pass
+        if not self._alive:
+            return
         try:
             self._lock_after = self.after(5000, self._lock_tick)
         except tk.TclError:

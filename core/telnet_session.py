@@ -25,35 +25,32 @@ import re
 import socket
 import time
 
+from core.cli_channel import (CLIClient, CLIError, DEFAULT_ENCODINGS,
+                              _MORE, _PASSWORD, _PROMPT_TAIL)
+
 IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
 
-# 分页提示：Cisco "<--- More --->"，H3C/华为 "--More--"，部分老设备 "---- More ----"
-_MORE = re.compile(r"(?:<---\s*More\s*--->|--\s*More\s*--|----\s*More\s*----"
-                   r"|--More--|more\s*--\s*|\(q\)uit)", re.I)
-
-# 登录提示
+# 登录提示（Telnet 才会一上来就问账号）
 _LOGIN = re.compile(r"(?:login:|login as:|username:|user\s*name:)", re.I)
-_PASSWORD = re.compile(r"(?:password:|passwd:)", re.I)
-_PROMPT_TAIL = re.compile(r"[#>\]$]\s*$")
-
-DEFAULT_ENCODINGS = ("utf-8", "gbk", "latin-1")
 
 
-class TelnetError(Exception):
+class TelnetError(CLIError):
     pass
 
 
-class TelnetClient:
-    """一条 Telnet 连接。command() 是串行的：同一时刻只跑一条命令。"""
+class TelnetClient(CLIClient):
+    """一条 Telnet 连接。command() 是串行的：同一时刻只跑一条命令。
+
+    收包、翻页、提示符、enable 这些行为都在 CLIClient 里，和 SSH 通道共用；
+    这里只负责 Telnet 特有的部分：socket 收发、IAC 协商、登录提示。
+    """
 
     def __init__(self, host: str, port: int = 23, timeout: int = 15) -> None:
+        super().__init__()
         self.host = host
         self.port = int(port or 23)
         self.timeout = timeout
         self.sock: socket.socket | None = None
-        self.buf = ""
-        self.encoding = "utf-8"
-        self.last_prompt = ""
         self._closed = False
 
     # ------------------------------------------------------------ 连接
@@ -170,94 +167,3 @@ class TelnetClient:
             except OSError:
                 pass
         return bytes(out)
-
-    def _decode(self, raw: bytes) -> str:
-        """先按当前编码解，出现替换字符就换一种试（设备常见 UTF-8 / GBK 混用）。"""
-        for enc in (self.encoding,) + DEFAULT_ENCODINGS:
-            try:
-                text = raw.decode(enc)
-            except UnicodeDecodeError:
-                continue
-            if "\ufffd" not in text:
-                self.encoding = enc
-                return text
-        return raw.decode(self.encoding, "replace")
-
-    def _drain(self, deadline: float, quiet: float = 0.6) -> str:
-        """收到「安静一段时间」为止，同时自动翻过所有分页提示。"""
-        parts: list[str] = []
-        last = time.time()
-        while time.time() < deadline:
-            chunk = self._recv_once(0.35)
-            if chunk:
-                parts.append(chunk)
-                last = time.time()
-                if _MORE.search(chunk):
-                    self._send(" ")          # 翻页
-                    continue
-            elif parts and time.time() - last >= quiet:
-                break
-            elif not parts and time.time() - last >= max(quiet, 2.0):
-                break
-        return "".join(parts)
-
-    def _remember_prompt(self, text: str) -> None:
-        """把最后一行的提示符记下来（"SW1#"、"R1>" 这种）。"""
-        for line in reversed((text or "").splitlines()):
-            s = line.strip()
-            if s and len(s) <= 96 and _PROMPT_TAIL.search(s):
-                self.last_prompt = s
-                return
-
-    # ------------------------------------------------------------ 命令
-    def command(self, cmd: str, timeout: int = 30, quiet: float = 0.6) -> str:
-        """发一条命令并收回输出。
-
-        用「安静判定」而不是硬等提示符：网络设备的提示符五花八门
-        （带主机名、带模块号、带 `(config)`），靠正则匹配一定会漏。
-        安静 0.6 秒且已有内容，就认为这条命令跑完了。
-        """
-        if not self.alive():
-            raise TelnetError("尚未连接")
-        self._send(cmd + "\r\n")
-        text = self._drain(time.time() + max(timeout, 3), quiet=quiet)
-        self._remember_prompt(text)
-        return text
-
-    def send_line(self, text: str) -> None:
-        """只发不收 —— 给交互式终端用（比如 conf t 之后一条条敲）。"""
-        self._send(text + "\r\n")
-
-    # ------------------------------------------------------------ 特权模式
-    def enable(self, password: str = "", timeout: int = 15) -> bool:
-        """进 enable 模式（Cisco `enable`，H3C/华为 `super`、`system-view` 另说）。
-
-        判定标准是最后的提示符里出现 `#` —— Cisco / H3C / 华为的特权模式
-        全都是 `#`，用户模式是 `>`。这比解析回显文字可靠。
-        """
-        if not self.alive():
-            return False
-        self._send("enable\r\n")
-        out = self._drain(time.time() + 6, quiet=0.5)
-        if _PASSWORD.search(out) and password:
-            self._send(password + "\r\n")
-            out += self._drain(time.time() + 8, quiet=0.6)
-        elif password and re.search(r"^\s*password\s*:?\s*$", out, re.I | re.M):
-            self._send(password + "\r\n")
-            out += self._drain(time.time() + 8, quiet=0.6)
-        self._remember_prompt(out)
-        return "#" in (self.last_prompt or "")
-
-    def disable_paging(self, vendor: str = "") -> None:
-        """关掉分页。不关的话 `display current-configuration` 会一直翻页。"""
-        cmds = {
-            "cisco": ["terminal length 0"],
-            "h3c": ["screen-length disable"],
-            "huawei": ["screen-length 0 temporary"],
-        }.get(vendor, ["terminal length 0", "screen-length disable",
-                       "screen-length 0 temporary"])
-        for c in cmds:
-            try:
-                self.command(c, timeout=8)
-            except TelnetError:
-                return

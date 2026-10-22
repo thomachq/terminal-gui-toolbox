@@ -163,9 +163,45 @@ def test_conn_page() -> None:
     a._proto_changed()
     pump()
     check("Telnet：私钥/密码行隐藏", not shown(a.row_auth))
-    check("Telnet：提示的是 enable 密码",
-          "enable" in str(a.chk_remember.lbl.cget("text")).lower()
-          or a.e_sudopw is not None)
+    check("Telnet：提权密码框在", a.e_sudopw is not None)
+    check("Telnet：三处口令各有自己的保存开关",
+          all(hasattr(a, n) for n in ("v_save_keypw", "v_save_pw", "v_save_sudo")))
+
+    # 认证方式切换：选私钥不该露登录密码，选登录密码不该露私钥口令
+    a.v_proto.set("ssh")
+    a._proto_changed()
+    a.v_mode.set("key")
+    a._mode_changed()
+    pump(0.1)
+    check("选私钥：露私钥口令框", shown(a.row_keypw))
+    check("选私钥：不露登录密码框", not shown(a.row_pw))
+    a.v_mode.set("password")
+    a._mode_changed()
+    pump(0.1)
+    check("选登录密码：露密码框", shown(a.row_pw))
+    check("选登录密码：不露私钥口令框", not shown(a.row_keypw))
+    check("选登录密码：不露私钥文件框", not shown(a.row_key))
+
+    # 每个口令各存各的：只勾私钥口令，档案里就只能有私钥口令
+    for v in (a.v_save_keypw, a.v_save_pw, a.v_save_sudo):
+        v.set(False)
+    a.v_save_keypw.set(True)
+    a.v_keypw.set("kp")
+    a.v_pw.set("lp")
+    a.v_sudopw.set("sp")
+    prof = a._collect_profile()
+    check("只勾私钥口令：只存私钥口令",
+          "key_passphrase" in prof and "password" not in prof
+          and "sudo_password" not in prof,
+          sorted(k for k in prof if "pass" in k))
+    a.v_save_keypw.set(False)
+    a.v_save_sudo.set(True)
+    prof = a._collect_profile()
+    check("只勾提权密码：只存提权密码",
+          "sudo_password" in prof and "key_passphrase" not in prof
+          and "password" not in prof,
+          sorted(k for k in prof if "pass" in k))
+    check("底部不再有「记住凭据」总开关", not hasattr(a, "chk_remember"))
 
     a.v_proto.set("local")
     a._proto_changed()
@@ -350,13 +386,49 @@ O E2  172.16.0.0/16 [110/20] via 10.1.1.2, 00:10:00, GigabitEthernet0/1
           be.del_cmds({"dst": "10.0.0.0/8", "gateway": "1.1.1.1"})[0]
           .startswith("undo ip route-static"))
 
-    # SSH 到网络设备写不了配置（每条命令一个新通道，进不了 config 模式）
-    be_ssh = routes.backend_of(DeviceInfo(os_family="network", vendor="cisco"),
-                               FakeSSHSession())
-    check("SSH 到交换机：只读", be_ssh.can_write is False)
-    be_tel = routes.backend_of(DeviceInfo(os_family="network", vendor="cisco"),
-                               FakeTelnetSession())
-    check("Telnet 到交换机：可写", be_tel.can_write is True)
+    # 能不能写配置看「对端是不是网络设备 + 有没有持久 CLI」，不看协议。
+    # SSH 走 invoke_shell 一样能进 config 模式；Telnet 连 Linux 也不会
+    # 被当成交换机（它会由 detect 判成 unix，压根不走网络设备后端）。
+    class _SSHNet(FakeSSHSession):
+        @property
+        def alive(self):
+            return True
+
+        def cli(self):
+            return object()          # 假装开出了持久 shell
+
+    dev_net = DeviceInfo(os_family="network", vendor="cisco")
+    ssh_net = _SSHNet()
+    ssh_net.bind_device(dev_net)
+    be_ssh = routes.backend_of(dev_net, ssh_net)
+    check("SSH 到交换机：有持久 shell 就能写", be_ssh.can_write is True)
+
+    ssh_no_cli = FakeSSHSession()          # 没连上的会话没有 CLI
+    ssh_no_cli.bind_device(dev_net)
+    check("SSH 没连上：不可写",
+          routes.backend_of(dev_net, ssh_no_cli).can_write is False)
+
+    dev_tel = DeviceInfo(os_family="network", vendor="cisco")
+    tn = FakeTelnetSession()
+    tn.bind_device(dev_tel)
+    tn._impl = object()                    # 假装已经连上（can_cli 只要求有通道）
+    check("Telnet 到交换机：可写",
+          routes.backend_of(dev_tel, tn).can_write is True)
+
+    # 同一套协议连 Linux：不该被当成网络设备
+    dev_lnx = DeviceInfo(os_family="linux")
+    tn2 = FakeTelnetSession()
+    tn2.bind_device(dev_lnx)
+    tn2._impl = object()
+    check("Telnet 到 Linux：后端是 LinuxRoute",
+          type(routes.backend_of(dev_lnx, tn2)).__name__ == "LinuxRoute")
+    check("Telnet 到 Linux：提权方式是 sudo",
+          tn2.admin_kind == "sudo", tn2.admin_kind)
+    try:
+        tn2.run_admin("ip route add 10.0.0.0/8 via 1.1.1.1")
+        check("Telnet 到 Linux 无密码：抛 sudo 提权", False)
+    except NeedElevation as e:
+        check("Telnet 到 Linux 无密码：抛 sudo 提权", e.kind == "sudo", e.kind)
 
 
 # ------------------------------------------------------------------ 5. 采样

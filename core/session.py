@@ -172,6 +172,34 @@ class BaseSession:
         """(能不能提权, 不能的话给用户看的一句话)"""
         return True, ""
 
+    # ---------------- 对端到底是什么
+    # 协议和它是「什么设备」是两件事：交换机 / 路由器既可能只开 Telnet，
+    # 也可能只开 SSH；Linux 服务器同理（老设备只留 telnet 的也不少）。
+    # 所以提权方式、能不能改配置，一律看这里的 host_kind，不看 proto。
+    host_kind = ""              # unix / network / windows，detect 之后由 bind_device 填
+
+    def bind_device(self, info) -> None:
+        fam = (getattr(info, "os_family", "") or "").lower()
+        if fam == "network":
+            self.host_kind = "network"
+        elif fam == "windows":
+            self.host_kind = "windows"
+        elif fam:
+            self.host_kind = "unix"
+
+    @property
+    def is_network_host(self) -> bool:
+        return self.host_kind == "network"
+
+    @property
+    def can_cli(self) -> bool:
+        """能不能开一条「模式能保持」的持久 CLI（改配置必须靠它）。"""
+        return False
+
+    def cli(self):
+        """持久 CLI 通道，没有就返回 None。"""
+        return None
+
 
 # ------------------------------------------------------------------ 本机
 class LocalSession(BaseSession):
@@ -185,6 +213,7 @@ class LocalSession(BaseSession):
         self.user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
         self.label = "本机"
         self.is_windows = sys.platform == "win32"
+        self.host_kind = "windows" if self.is_windows else "unix"
         self.ps_native = self.is_windows
         self.platform_hint = {"win32": "windows", "darwin": "darwin"}.get(
             sys.platform, "linux")
@@ -296,6 +325,9 @@ class SSHSession(BaseSession):
         self.client = None
         self.sudo_pw: str | None = None
         self._sftp = None
+        self._cli = None            # 交换机 / 路由器用的持久 shell
+        self.enabled = False        # 网络设备是否已进 enable
+        self.vendor = ""            # detect 之后由 bind_device 补上，关分页要用
 
     # ---------------- 连接
     def connect(self, host: str, port: int = 22, user: str = "",
@@ -337,6 +369,13 @@ class SSHSession(BaseSession):
 
     def close(self) -> None:
         try:
+            if self._cli:
+                self._cli.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._cli = None
+        self.enabled = False
+        try:
             if self._sftp:
                 self._sftp.close()
         except Exception:  # noqa: BLE001
@@ -354,6 +393,15 @@ class SSHSession(BaseSession):
             ) -> tuple[int, str, str]:
         if not self.alive:
             raise SessionError("尚未连接")
+        if not sudo and self.host_kind == "network":
+            # 交换机 / 路由器上 exec 通道每次都是新会话：分页关不掉，
+            # 长一点的 show 会卡在 --More--。统一走持久 shell。
+            try:
+                cli = self.cli()
+            except Exception as e:  # noqa: BLE001
+                raise SessionError(f"开不了设备 CLI：{e}") from e
+            if cli is not None:
+                return 0, cli.command(cmd, timeout=timeout), ""
         if sudo:
             if not self.sudo_pw:
                 raise SessionError("该操作需要 sudo 密码")
@@ -381,12 +429,42 @@ class SSHSession(BaseSession):
         except Exception:  # noqa: BLE001
             return False
 
-    # ---------------- 提权
+    # ---------------- 提权（看设备类型，不看协议）
+    # SSH 连服务器是 sudo；SSH 连交换机 / 路由器就是 enable + 配置视图。
+    # 后者不能走 exec 通道（每条命令一个新通道，模式带不过去），
+    # 所以这里按需开一条 invoke_shell 的持久会话，见 cli()。
+    @property
+    def can_cli(self) -> bool:
+        return self.host_kind == "network" and self.alive
+
+    def cli(self):
+        """交换机 / 路由器的持久 CLI；服务器返回 None（用 exec 就够）。"""
+        if self.host_kind != "network" or not self.alive:
+            return None
+        if self._cli is None:
+            from core.ssh_shell import SSHShellClient
+            self._cli = SSHShellClient(self.client)
+            vendor = (self.vendor or "").lower()
+            try:
+                self._cli.disable_paging(vendor)
+            except Exception:  # noqa: BLE001
+                pass
+        return self._cli
+
     @property
     def admin_kind(self) -> str:
-        return "sudo"
+        return "enable" if self.host_kind == "network" else "sudo"
 
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
+        if self.host_kind == "network":
+            if not self.enabled:
+                raise NeedElevation(
+                    "这一步要进入特权模式：请提供 enable 密码。",
+                    kind="enable", target=f"{self.user}@{self.host}")
+            t0 = time.time()
+            out = self.cli().command(cmd, timeout=timeout)
+            self._trace(cmd, 0, out, "", int((time.time() - t0) * 1000))
+            return 0, out, ""
         if self.is_root or self.user == "root":
             return self.run_traced(cmd, timeout)
         if not self.sudo_pw:
@@ -404,12 +482,37 @@ class SSHSession(BaseSession):
         self._trace("sudo " + cmd, rc, out, err, int((time.time() - t0) * 1000))
         return rc, out, err
 
+    def sudo_ok(self, pw: str) -> bool:
+        """一个密码框，两种含义：交换机是 enable，服务器是 sudo。"""
+        if self.host_kind == "network":
+            cli = self.cli()
+            if cli is None:
+                return False
+            ok = bool(cli.enable(pw))
+            self.enabled = ok
+            if ok:
+                self.sudo_pw = pw
+                self.is_root = True
+            return ok
+        self.sudo_pw = pw
+        try:
+            rc, _, _ = self.run("id -u", sudo=True, timeout=20)
+            return rc == 0
+        except Exception:  # noqa: BLE001
+            return False
+
     def can_admin(self) -> tuple[bool, str]:
+        if self.host_kind == "network":
+            return (True, "") if self.enabled else (False, "需要 enable 密码")
         if self.is_root or self.user == "root":
             return True, ""
         if self.sudo_pw:
             return True, ""
         return False, "需要 sudo 密码或 root 登录"
+
+    def bind_device(self, info) -> None:
+        super().bind_device(info)
+        self.vendor = (getattr(info, "vendor", "") or "").lower()
 
     # ---------------- SFTP
     def sftp(self):
@@ -459,20 +562,40 @@ class TelnetSession(BaseSession):
         out = self._impl.command(cmd, timeout=timeout)
         return 0, out, ""
 
-    # ---------------- 提权：网络设备没有 sudo，只有 enable 特权模式
+    # ---------------- 提权（看设备类型，不看协议）
+    # Telnet 连交换机是 enable，Telnet 连 Linux 就是 sudo —— 判断依据是
+    # 探测出来的 host_kind。没探测到（空）时按网络设备处理：Telnet 的
+    # 典型场景就是老交换机，真连到 Linux 的话 detect 会给它改回来。
+    @property
+    def can_cli(self) -> bool:
+        return self._impl is not None
+
+    def cli(self):
+        return self._impl
+
     @property
     def admin_kind(self) -> str:
-        return "enable"
+        return "sudo" if self.host_kind == "unix" else "enable"
 
     def can_admin(self) -> tuple[bool, str]:
+        if self.host_kind == "unix":
+            if self.is_root or self.sudo_pw:
+                return True, ""
+            return False, "需要 sudo 密码"
         if self.enabled or self.is_root:
             return True, ""
         return False, "需要 enable 密码"
 
     def sudo_ok(self, pw: str) -> bool:
-        """网络设备上「提权」= 进 enable 模式，密码就是 enable 密码。"""
+        """一个密码框，两种含义：网络设备是 enable，Linux 是 sudo。"""
         if not self._impl:
             return False
+        if self.host_kind == "unix":
+            ok = bool(self._impl.sudo_check(pw))
+            if ok:
+                self.sudo_pw = pw
+                self.is_root = True
+            return ok
         ok = self._impl.enable(pw)
         self.enabled = bool(ok)
         if ok:
@@ -483,6 +606,16 @@ class TelnetSession(BaseSession):
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
         if not self._impl:
             raise SessionError("尚未连接")
+        if self.host_kind == "unix":
+            # Linux over telnet：和 SSH 那条路一样走 sudo -S
+            if self.is_root:
+                return self.run_traced(cmd, timeout)
+            if not self.sudo_pw:
+                raise NeedElevation("这一步要 root 权限：请提供 sudo 密码。",
+                                    kind="sudo", target=self.host)
+            ok, out = self._impl.run_sudo(cmd, self.sudo_pw, timeout=timeout)
+            self._trace(cmd, 0 if ok else 1, out, "", 0)
+            return (0 if ok else 1), out, ""
         if not self.enabled:
             raise NeedElevation(
                 "这一步要进入特权模式：请提供 enable 密码。",
@@ -507,6 +640,14 @@ class ConnSpec:
 
 
 def open_session(spec: ConnSpec) -> BaseSession:
+    """连上就好，**不提权**。
+
+    远端提权必须等探测完再决定：同一个密码框，交换机上是 enable、
+    服务器上是 sudo。以前在 connect 之后立刻提权，等于先假定对方是
+    Linux —— 连交换机时那次 sudo 必然失败，还会把协议当成设备类型。
+    调用方拿到会话后：detect() → bind_device() → 需要的话再 sudo_ok()。
+    本机没有这个歧义（平台已知），所以照旧就地做完。
+    """
     if spec.proto == "local":
         s = LocalSession()
         if spec.elevate and not s.is_windows and spec.sudo_password:
@@ -516,14 +657,10 @@ def open_session(spec: ConnSpec) -> BaseSession:
         s = TelnetSession()
         s.connect(spec.host, spec.port or 23,
                   user=spec.user, password=spec.password)
-        if spec.elevate and spec.sudo_password:
-            s.sudo_ok(spec.sudo_password)
         return s
     s = SSHSession()
     s.connect(spec.host, spec.port or 22, spec.user,
               password=spec.password if spec.auth == "password" else None,
               key_path=spec.key_path if spec.auth == "key" else None,
               key_passphrase=spec.key_passphrase or None)
-    if spec.elevate and spec.sudo_password:
-        s.sudo_ok(spec.sudo_password)
     return s

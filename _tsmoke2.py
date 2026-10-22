@@ -85,8 +85,10 @@ chk(len(a.tbl_ep.all_rows()) >= 8, "接口速查有内容",
 a.tbl_route.set_columns(A.TOOL_COLS["ports"])
 a.tbl_route.set_rows([{"proto": "tcp", "addr": "0.0.0.0", "port": "22",
                        "proc": "sshd/1", "state": "LISTEN", "_tone": "warn"}])
+# 渲染是同步的，立刻取行数；先 pump 再取会被其它队列里的刷新覆盖，偶发失败
+_n_route = len(a.tbl_route.tree.get_children())
 pump(a, 0.2)
-chk(len(a.tbl_route.tree.get_children()) == 1, "换列 + 填行正常")
+chk(_n_route == 1, "换列 + 填行正常", f"{_n_route} 行")
 
 print("== 3. 本机工具（真实命令） ==")
 a.nav.select("tools")

@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""持久 CLI 通道的公共行为：发一条命令、把输出收回来、翻过分页、进特权。
+
+为什么单独抽出来：设备认的是**设备类型**，不是**协议**。
+交换机 / 路由器既可能挂 Telnet 也可能开 SSH，Linux 服务器同样
+（有些老设备只留 telnet，有些交换机只开了 SSH）。所以「进配置视图」
+这套逻辑必须与传输层解耦，否则就会出现「SSH 连交换机只能只读」
+这种把协议当设备类型用的错误结论。
+
+子类只管搬运字节：
+  · _send(text)      发一段文本
+  · _recv_once(wait) 收一包，没数据返回 ""
+  · alive()          连接是否还活着
+  · close()
+本类负责「安静判定 / 自动翻页 / 记忆提示符 / enable / sudo」。
+"""
+from __future__ import annotations
+
+import re
+import shlex
+import time
+
+# 分页提示：Cisco "<--- More --->"，H3C/华为 "--More--"，部分老设备 "---- More ----"
+_MORE = re.compile(r"(?:<---\s*More\s*--->|--\s*More\s*--|----\s*More\s*----"
+                   r"|--More--|more\s*--\s*|\(q\)uit)", re.I)
+
+_PASSWORD = re.compile(r"(?:password|passwd|密码)\s*[:：]", re.I)
+_PROMPT_TAIL = re.compile(r"[#>\]$]\s*$")
+
+# sudo 拒绝的几种回显：密码错、不在 sudoers、需要终端
+_SUDO_BAD = re.compile(
+    r"(sorry,\s*(try again|a password is required)|incorrect password|"
+    r"not in the sudoers|is not allowed to run sudo|no password was provided|"
+    r"a terminal is required)", re.I)
+
+DEFAULT_ENCODINGS = ("utf-8", "gbk", "latin-1")
+
+
+class CLIError(Exception):
+    pass
+
+
+class CLIClient:
+    """一条持久 CLI。command() 是串行的：同一时刻只跑一条命令。"""
+
+    quiet_default = 0.6
+
+    def __init__(self) -> None:
+        self.encoding = "utf-8"
+        self.buf = ""
+        self.last_prompt = ""
+
+    # ------------------------------------------------------------ 子类实现
+    def _send(self, text: str) -> None:
+        raise NotImplementedError
+
+    def _recv_once(self, wait: float = 0.35) -> str:
+        raise NotImplementedError
+
+    def alive(self) -> bool:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------ 解码
+    def _decode(self, raw: bytes) -> str:
+        """先按当前编码解，出现替换字符就换一种试（设备常见 UTF-8 / GBK 混用）。"""
+        for enc in (self.encoding,) + DEFAULT_ENCODINGS:
+            try:
+                text = raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+            if "\ufffd" not in text:
+                self.encoding = enc
+                return text
+        return raw.decode(self.encoding, "replace")
+
+    # ------------------------------------------------------------ 收包
+    def _drain(self, deadline: float, quiet: float = 0.6) -> str:
+        """收到「安静一段时间」为止，同时自动翻过所有分页提示。"""
+        parts: list[str] = []
+        last = time.time()
+        while time.time() < deadline:
+            chunk = self._recv_once(0.35)
+            if chunk:
+                parts.append(chunk)
+                last = time.time()
+                if _MORE.search(chunk):
+                    self._send(" ")          # 翻页
+                    continue
+            elif parts and time.time() - last >= quiet:
+                break
+            elif not parts and time.time() - last >= max(quiet, 2.0):
+                break
+        return "".join(parts)
+
+    def _remember_prompt(self, text: str) -> None:
+        """把最后一行的提示符记下来（"SW1#"、"R1>" 这种）。"""
+        for line in reversed((text or "").splitlines()):
+            s = line.strip()
+            if s and len(s) <= 96 and _PROMPT_TAIL.search(s):
+                self.last_prompt = s
+                return
+
+    # ------------------------------------------------------------ 命令
+    def command(self, cmd: str, timeout: int = 30, quiet: float = 0.6) -> str:
+        """发一条命令并收回输出。
+
+        用「安静判定」而不是硬等提示符：网络设备的提示符五花八门
+        （带主机名、带模块号、带 `(config)`），靠正则匹配一定会漏。
+        安静 0.6 秒且已有内容，就认为这条命令跑完了。
+        """
+        if not self.alive():
+            raise CLIError("尚未连接")
+        self._send(cmd + "\r\n")
+        text = self._drain(time.time() + max(timeout, 3), quiet=quiet)
+        self._remember_prompt(text)
+        return text
+
+    def send_line(self, text: str) -> None:
+        """只发不收 —— 给交互式终端用（比如 conf t 之后一条条敲）。"""
+        self._send(text + "\r\n")
+
+    def interactive(self, cmd: str, answers: list[str], timeout: int = 60) -> str:
+        """按提示依次回答。给那些会连问几遍的交互命令用
+        （`passwd`、`copy running-config startup-config` 之类）。"""
+        out = self.command(cmd, timeout=max(8, min(timeout, 20)))
+        for ans in answers:
+            if not _PASSWORD.search(out) and "?" not in out:
+                break
+            self._send(ans + "\r\n")
+            out += self._drain(time.time() + 12, quiet=0.6)
+        self._remember_prompt(out)
+        return out
+
+    # ------------------------------------------------------------ 特权模式
+    def enable(self, password: str = "", timeout: int = 15) -> bool:
+        """进 enable 模式（Cisco `enable`，H3C/华为 `super`、`system-view` 另说）。
+
+        判定标准是最后的提示符里出现 `#` —— Cisco / H3C / 华为的特权模式
+        全都是 `#`，用户模式是 `>`。这比解析回显文字可靠。
+        """
+        if not self.alive():
+            return False
+        self._send("enable\r\n")
+        out = self._drain(time.time() + 6, quiet=0.5)
+        if _PASSWORD.search(out) and password:
+            self._send(password + "\r\n")
+            out += self._drain(time.time() + 8, quiet=0.6)
+        self._remember_prompt(out)
+        return "#" in (self.last_prompt or "")
+
+    def disable_paging(self, vendor: str = "") -> None:
+        """关掉分页。不关的话 `display current-configuration` 会一直翻页。"""
+        cmds = {
+            "cisco": ["terminal length 0"],
+            "h3c": ["screen-length disable"],
+            "huawei": ["screen-length 0 temporary"],
+        }.get(vendor, ["terminal length 0", "screen-length disable",
+                       "screen-length 0 temporary"])
+        for c in cmds:
+            try:
+                out = self.command(c, timeout=8)
+            except CLIError:
+                return
+            # 认不出的命令不用再试剩下的，避免日志里一串报错
+            if re.search(r"(%\s*invalid|unrecognized|unavailable|too many)",
+                         out or "", re.I):
+                return
+
+    # ------------------------------------------------------------ sudo
+    def run_sudo(self, cmd: str, password: str,
+                 timeout: int = 60) -> tuple[bool, str]:
+        """在有 sudo 的机器上跑一条需要 root 的命令。
+
+        密码走标准输入（`sudo -S`），不进命令行、不进进程列表。提示语是
+        我们自己指定的 `Password:`，这样既能判断「要不要给密码」，
+        又不会因为没配 NOPASSWD 而把密码当命令敲进 shell。
+        """
+        if not password:
+            raise CLIError("需要 sudo 密码")
+        full = (f"sudo -S -p 'Password: ' sh -c {shlex.quote(cmd)}")
+        self._send(full + "\r\n")
+        head = self._drain(time.time() + 3.5, quiet=0.35)
+        if _PASSWORD.search(head):
+            self._send(password + "\r\n")
+        out = head + self._drain(time.time() + max(timeout, 5),
+                                 quiet=self.quiet_default)
+        self._remember_prompt(out)
+        return (not _SUDO_BAD.search(out)), out
+
+    def sudo_check(self, password: str) -> bool:
+        """验密码 + 顺手刷新 sudo 票据（默认 15 分钟）。"""
+        ok, _ = self.run_sudo("true", password, timeout=20)
+        return ok

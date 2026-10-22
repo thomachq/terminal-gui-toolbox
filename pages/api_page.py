@@ -7,6 +7,7 @@ import json
 import tkinter as tk
 
 import wbtui as U
+from api.server import PORT_RANGE, port_busy
 from ui import forms
 from ui.table import Column, DataTable, KVGrid
 
@@ -85,7 +86,8 @@ class ApiPage:
                       height=32, padx=14).pack(side="left", padx=(U.px(6), 0))
         U.RoundButton(row, "给智能体的说明", self.api_copy_brief, variant="secondary",
                       height=32, padx=14).pack(side="left", padx=(U.px(6), 0))
-        U.RoundButton(row, "端口设置", self.api_settings, variant="ghost",
+        # 端口和监听地址、保活一起在「API 设置」里改，不再单开一个「换端口」按钮
+        U.RoundButton(row, "API 设置", self.api_settings, variant="ghost",
                       height=32, padx=14).pack(side="left", padx=(U.px(6), 0))
 
         # 连接池
@@ -156,13 +158,22 @@ class ApiPage:
         if srv.running:
             srv.stop()
             self.toast("API 服务已停止", "warn")
+            self.api_log_line("api", "停止 API 服务")
         else:
+            was = srv.port
             ok, msg = srv.start()
             self.toast(msg, "ok" if ok else "err")
             if not ok:
                 forms.confirm(self, "启动失败", msg)
+                # 启动失败不写「停止」：之前这里按 running 反推，
+                # 于是启动失败也记成「停止 API 服务」，看着像莫名停了一次。
+                self.api_log_line("bad", f"启动失败：{msg}")
+            else:
+                moved = srv.port != was
+                self.api_log_line(
+                    "api", f"启动 API 服务 · 端口 {srv.port}"
+                    + (f"（原 {was} 被占用，已自动换）" if moved else ""))
         self.api_refresh()
-        self.api_log_line("api", f"{'启动' if srv.running else '停止'} API 服务")
 
     def api_copy_token(self):
         srv = getattr(self, "api_server", None)
@@ -249,8 +260,12 @@ print(r["out"])
             return
         cfg = srv.config
         fields = [
-            {"key": "port", "label": "端口", "kind": "int", "required": True,
-             "default": int(cfg.data.get("port") or 8760), "min": 1024, "max": 65535},
+            # 端口留空 = 每次启动自动挑一个空闲端口，和「换端口」是同一件事，
+            # 所以只留这一个入口，不再单摆一个按钮。
+            {"key": "port", "label": "端口", "kind": "int",
+             "default": int(cfg.data.get("port") or 0), "min": 0, "max": 65535,
+             "hint": f"留空或填 0 = 自动挑一个空闲端口；{PORT_RANGE[0]}-"
+                     f"{PORT_RANGE[1]} 这一段比较不容易撞"},
             {"key": "host", "label": "监听地址", "kind": "select",
              "options": [("127.0.0.1", "仅本机（推荐）"),
                          ("0.0.0.0", "局域网可访问（注意风险）")],
@@ -263,14 +278,22 @@ print(r["out"])
              "unit": "秒", "hint": "0 = 不回收（智能体可长期挂着）"},
         ]
         data = forms.FormDialog.open(self, "API 设置", fields,
-                                     subtitle="改端口需要重启服务")
+                                     subtitle="改端口或监听地址会重启服务")
         if not data:
             return
         was_running = srv.running
+        old_port = int(cfg.data.get("port") or 0)
+        host = str(data.get("host") or "127.0.0.1")
+        raw = str(data.get("port") or "").strip()
+        new_port = int(raw) if raw.isdigit() else 0
+        if new_port == 0:
+            new_port = pick_free_port(host)
         if was_running:
             srv.stop()
-        cfg.data["port"] = int(data["port"])
-        cfg.data["host"] = data["host"]
+        if new_port != old_port and port_busy(new_port, host):
+            self.toast(f"端口 {new_port} 现在被占用，启动时会自动换一个空闲的", "warn")
+        cfg.data["port"] = new_port
+        cfg.data["host"] = host
         cfg.data["keepalive"] = int(data["keepalive"])
         cfg.data["idle_ttl"] = int(data["idle_ttl"])
         srv.pool.keepalive_default = int(data["keepalive"])
@@ -279,6 +302,21 @@ print(r["out"])
         if was_running:
             ok, msg = srv.start()
             self.toast(msg, "ok" if ok else "err")
+            moved = srv.port != old_port
+            self.api_log_line(
+                "api" if ok else "bad",
+                (f"API 服务已重启 · 端口 {srv.port}" if ok
+                 else f"重启失败：{msg}")
+                + (f"（原 {old_port}）" if moved else ""))
+            if ok and moved:
+                # 智能体存的是完整地址，换了端口必须重新给它一份
+                forms.InfoDialog.show(
+                    self, "端口已更换",
+                    f"{old_port} → {srv.port}\n\n"
+                    f"新地址：{srv.url()}\n\n"
+                    "智能体里存的旧地址已经失效，把新地址和令牌重新给它一份"
+                    "（「给智能体的说明」里是新地址）。",
+                    width=520, height=200)
         self.api_refresh()
 
     def api_close_session(self, row):

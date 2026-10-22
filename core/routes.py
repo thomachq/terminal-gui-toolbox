@@ -231,17 +231,26 @@ class NetworkRoute(RouteBackend):
                  "huawei": "Huawei VRP", "ruijie": "锐捷 RGOS",
                  "juniper": "Juniper JunOS"}
         self.label = names.get(self.vendor, "网络设备 CLI")
-        # 配置模式要靠同一条会话保持，只有 Telnet 是持久会话；
-        # SSH 到 IOS 每条命令一个新通道，进不了 config 模式，所以只读。
         self.needs_enable = True
 
     @property
     def can_write(self) -> bool:
-        # 注意：后端在 backend_for() 里构造时 session 还是 None，
-        # 所以不能把结论写死在 __init__ 里，必须每次按当前会话判。
-        kind = getattr(self.session, "kind", "") if self.session else ""
-        return kind == "telnet" and self.vendor in (
-            "cisco", "h3c", "huawei", "ruijie")
+        """能不能改配置，取决于**对端是不是网络设备 + 有没有持久 CLI**，
+        而不是用什么协议连上去的。
+
+        以前这里写的是 `kind == "telnet"`，等于「SSH 连交换机只能只读」——
+        但 SSH 一样进得去配置视图，只要走 invoke_shell 拿一条持久会话
+        （见 core/ssh_shell.py）。反过来 Telnet 连 Linux 也不会被当成
+        可写设备，因为 host_kind 是 unix，压根不会走到这个后端。
+        后端在 backend_for() 里构造时 session 还是 None，所以必须每次按
+        当前会话判，不能写死在 __init__。
+        """
+        s = self.session
+        if s is None or getattr(s, "host_kind", "") != "network":
+            return False
+        if self.vendor not in ("cisco", "h3c", "huawei", "ruijie"):
+            return False
+        return bool(getattr(s, "can_cli", False))
 
     def read_cmd(self) -> str:
         return ("display ip routing-table" if self.display
@@ -328,8 +337,8 @@ def _apply_network(session, backend: NetworkRoute, cmds: list[str],
     """网络设备改路由：必须先进配置视图，改完再退出来。
 
     Cisco 是 `configure terminal` / `end`，H3C 与华为是 `system-view` / `return`。
-    Telnet 会话是持久的一条，所以模式能保持；SSH 那条路走不通，已在
-    NetworkRoute.can_write 里挡掉并给了说明。
+    这里要求一条**持久**会话：Telnet 本身就是，SSH 走 invoke_shell
+    （core/ssh_shell.py）也一样能保持模式。做不到就由 can_write 挡掉。
     """
     if not backend.can_write:
         raise RouteError(backend.persist_note())

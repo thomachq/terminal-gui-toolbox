@@ -27,7 +27,9 @@ import base64
 import binascii
 import hmac
 import json
+import random
 import secrets
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,7 +41,41 @@ from api.pool import PoolError, SessionPool
 
 API_VERSION = "1.0"
 DEFAULT_PORT = 8760
+# 自动挑端口用的区间：挑高位段，避开 8xxx 这种人人都爱抢的，也避开
+# Windows 的临时端口段（默认 49152-65535，会跟系统分出去的端口撞）。
+PORT_RANGE = (30000, 45000)
 MAX_BODY = 32 * 1024 * 1024          # 32MB，够传脚本和小文件
+
+
+def port_busy(port: int, host: str = "127.0.0.1") -> bool:
+    """真绑一次看能不能绑上。不收 SO_REUSEADDR：Windows 上它允许抢占
+    已被监听的端口，会把「占用中」误判成「空闲」。"""
+    if not (1024 <= int(port) <= 65535):
+        return True
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, int(port)))
+        except OSError:
+            return True
+    return False
+
+
+def pick_free_port(host: str = "127.0.0.1", lo: int = 0, hi: int = 0) -> int:
+    """在高位区间随机挑一个当前真能绑上的端口。
+
+    不用 bind(0) 让系统分配：那是临时端口，重启就换一个，智能体里存下来的
+    地址跟着失效。这里固定区间里随机试，绑得上才算数。
+    """
+    lo = int(lo or PORT_RANGE[0])
+    hi = int(hi or PORT_RANGE[1])
+    rng = random.SystemRandom()
+    for _ in range(200):
+        p = rng.randrange(lo, hi)
+        if not port_busy(p, host):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
 _UPTIME = time.time()
 
 
@@ -60,12 +96,32 @@ class ApiConfig:
         self.data: dict = {
             "enabled": False,
             "host": "127.0.0.1",
-            "port": DEFAULT_PORT,
+            "port": 0,              # 0 = 还没定，下面按空闲情况挑一个
             "token_enc": "",
             "keepalive": 25,
             "idle_ttl": 0,
         }
         self.load()
+        if self._port_needs_pick():
+            self.data["port"] = pick_free_port(
+                str(self.data.get("host") or "127.0.0.1"))
+            try:
+                self.save()
+            except OSError:
+                pass          # 写不进去也不影响本次运行
+
+    # 老版本默认值、以及人人都爱抢的端口。落在这里说明不是用户特意选的，
+    # 启动时换成一个随机空闲端口，省得每次都撞。
+    LEGACY_PORTS = (8760, 8768, 3000, 5000, 8000, 8080, 9000)
+
+    def _port_needs_pick(self) -> bool:
+        try:
+            port = int(self.data.get("port") or 0)
+        except (TypeError, ValueError):
+            return True
+        if port <= 0:                 # 全新配置：还没有端口
+            return True
+        return port in self.LEGACY_PORTS
 
     def load(self) -> None:
         try:
@@ -139,12 +195,23 @@ class ApiServer:
         if self.running:
             return True, f"已在运行：http://{self._host()}:{self.port}"
         host = self._host()
-        try:
-            httpd = ThreadingHTTPServer((host, self.port), _Handler)
-        except OSError as e:
-            self.last_error = str(e)
-            return False, (f"端口 {self.port} 起不来：{e}。"
-                           "换一个端口，或先关掉占用它的程序。")
+        want = self.port
+        httpd, err = self._bind(host, want)
+        moved = ""
+        if httpd is None:
+            # 端口被别的程序占了：直接换一个空闲的，别让人自己猜该填哪个
+            alt = pick_free_port(host)
+            httpd, err2 = self._bind(host, alt)
+            if httpd is not None:
+                moved = f"端口 {want} 被占用，已自动改用 {alt}"
+                self.config.data["port"] = alt
+            else:
+                err = err2
+        if httpd is None:
+            self.last_error = str(err)
+            return False, (f"端口 {self.port} 起不来：{err}。"
+                           "点「换端口」自动挑一个空闲端口，"
+                           "或先关掉占用它的程序。")
         httpd.daemon_threads = True
         httpd.app = self                        # 供 handler 取用
         self._httpd = httpd
@@ -157,8 +224,38 @@ class ApiServer:
                                         daemon=True, name="api-server")
         self._thread.start()
         self.pool.start()
+        if moved:
+            self._log("warn", moved)
         self._log("ok", f"API 服务已启动 {self.url()}")
-        return True, f"已启动：{self.url()}"
+        return True, (f"{moved}，已启动：{self.url()}" if moved
+                      else f"已启动：{self.url()}")
+
+    def _bind(self, host: str, port: int):
+        try:
+            return ThreadingHTTPServer((host, int(port)), _Handler), None
+        except OSError as e:  # noqa: BLE001
+            return None, e
+
+    def relocate(self) -> tuple[bool, str]:
+        """换一个新的空闲端口；服务在跑就停掉换完再起。
+
+        智能体那边存的是完整地址，换完要把新地址重新给它。
+        """
+        was = self.running
+        if was:
+            self.stop()
+        old = self.port
+        new = pick_free_port(self._host())
+        self.config.data["port"] = new
+        self.config.save()
+        base = f"端口 {old} → {new}"
+        self._log("meta", base)
+        if not was:
+            return True, f"{base}（服务未启动）"
+        ok, msg = self.start()
+        if not ok:
+            return False, f"{base}，但重启没成功：{msg}"
+        return True, f"{base}，已在新端口起来：{self.url()}"
 
     def stop(self) -> None:
         httpd = self._httpd

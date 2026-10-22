@@ -377,11 +377,14 @@ class RoundButton(tk.Canvas):
         self._tx = self.create_text(self._btnw / 2, height / 2, text=text, font=font)
         self._paint()
         self.configure(cursor="hand2")
-        for seq, fn in (("<Enter>", self._enter), ("<Leave>", self._leave),
-                        ("<Button-1>", self._click), ("<ButtonRelease-1>", self._release)):
-            self.bind(seq, fn)
-            for item in (self._bg, self._tx):
-                self.tag_bind(item, seq, fn)
+        # 只绑画布本身。canvas 的 item 绑定和 widget 绑定会各跑一遍，
+        # 两套都绑就等于一次点击触发两次 command——「启动服务」起来马上停
+        # 就是被这么点了两下（start → stop）。
+        self._pressed = False
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        self.bind("<Button-1>", self._click)
+        self.bind("<ButtonRelease-1>", self._release)
         register(self, self._paint)
 
     # -- 颜色
@@ -445,10 +448,16 @@ class RoundButton(tk.Canvas):
         self._paint()
 
     def _click(self, _=None):
-        if self._enabled:
-            self._paint()
+        if not self._enabled:
+            return
+        self._pressed = True
+        self._paint()
 
     def _release(self, _=None):
+        # 只在画布上按下去过才算一次点击，避免从外面拖进来松手也触发
+        if not getattr(self, "_pressed", False):
+            return
+        self._pressed = False
         if self._enabled and self.command:
             self._hover = True
             self._paint()
