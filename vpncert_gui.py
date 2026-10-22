@@ -1196,13 +1196,13 @@ class App(tk.Frame):
         pl.grid(row=1, column=0, sticky="we", pady=(10, 0))
         b = pl.body
         self.plat_vars: dict[str, tk.BooleanVar] = {}
-        # 平台名后面跟了客户端建议（用「·」分隔，不加括号），单条最长 40 多字符，
-        # 三列放不下会把 iOS / macOS 顶出可视区域，所以按两列排。
+        # 复选框只写平台名（各平台用哪个客户端写在该平台配置文件的注释里），
+        # 名字短了，三列两行刚好排平，不用再挤成两列。
         for i, key in enumerate(PLATFORM_ORDER):
             v = tk.BooleanVar(value=True)
             self.plat_vars[key] = v
             U.Check(b, PLATFORMS[key]["label"], v).grid(
-                row=i // 2, column=i % 2, sticky="w", padx=(0, 30), pady=2)
+                row=i // 3, column=i % 3, sticky="w", padx=(0, 40), pady=2)
 
         mid = U.wframe(pg, "page")
         mid.grid(row=2, column=0, sticky="nsew", pady=(10, 0))

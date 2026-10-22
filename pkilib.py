@@ -453,7 +453,7 @@ PLATFORM_ORDER = ["windows", "android", "ios", "harmony", "linux", "macos"]
 
 PLATFORMS: dict[str, dict] = {
     "windows": {
-        "label": "Windows · OpenVPN GUI / OpenVPN Connect",
+        "label": "Windows",
         "notes": [
             "# ===== Windows 端 =====",
             "# 推荐客户端：OpenVPN GUI 或 OpenVPN Connect（openvpn.net 下载）",
@@ -473,7 +473,7 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "android": {
-        "label": "Android · OpenVPN Connect / OpenVPN for Android",
+        "label": "Android",
         "notes": [
             "# ===== Android 端 =====",
             "# 推荐客户端：OpenVPN Connect（应用商店搜索）",
@@ -487,7 +487,7 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "ios": {
-        "label": "iOS / iPadOS · OpenVPN Connect",
+        "label": "iOS / iPadOS",
         "notes": [
             "# ===== iOS / iPadOS 端 =====",
             "# 推荐客户端：OpenVPN Connect（App Store）",
@@ -502,7 +502,7 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "harmony": {
-        "label": "鸿蒙 / 卓易通 · 安卓兼容层",
+        "label": "鸿蒙 / 卓易通",
         "notes": [
             "# ===== 鸿蒙 / 卓易通 =====",
             "# 鸿蒙 NEXT 通过「卓易通」运行安卓应用，因此使用安卓版客户端：OpenVPN Connect",
@@ -518,7 +518,7 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "linux": {
-        "label": "Linux · openvpn CLI / NetworkManager",
+        "label": "Linux",
         "notes": [
             "# ===== Linux 端 =====",
             "# 客户端：命令行 openvpn，或桌面 NetworkManager（导入配置文件即可）",
@@ -540,7 +540,7 @@ PLATFORMS: dict[str, dict] = {
         ],
     },
     "macos": {
-        "label": "macOS · Tunnelblick / OpenVPN Connect",
+        "label": "macOS",
         "notes": [
             "# ===== macOS 端 =====",
             "# 推荐客户端：Tunnelblick（免费开源）或 OpenVPN Connect",
