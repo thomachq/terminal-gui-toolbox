@@ -66,8 +66,10 @@ chk(_lm.LockManager(_lm.Settings(A.DATA_DIR / "settings.json")).enabled() is Fal
 print("== 1. 构建与主题 ==")
 a = A.ToolboxApp()
 pump(a, 0.5)
-chk(len(a._pages) == 11, "十一个页面都已构建", f"{list(a._pages)}")
-for key in ("conn", "tools", "sys", "files", "routes", "fw", "docker",
+chk(len(a._pages) == 16, "十六个页面都已构建", f"{list(a._pages)}")
+# 连接与设备已并入主机管理（旧键 conn 走别名），AI 运维改成了右侧助手
+for key in ("hosts", "proxy", "cred", "script", "log", "tools", "sys",
+            "files", "routes", "sec", "docker", "web", "db", "cron",
             "vpn", "api"):
     a.nav.select(key)
     pump(a, 0.18)

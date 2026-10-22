@@ -247,7 +247,7 @@ def test_page():
 
     a = APP.ToolboxApp()
     try:
-        chk(len(a._pages) == 11, "十一个页面都已构建", len(a._pages))
+        chk(len(a._pages) == 12, "十二个页面都已构建", len(a._pages))
         chk("ai" in a._pages, "AI 运维页已注册", list(a._pages))
         a.nav.select("ai")
         for _ in range(20):

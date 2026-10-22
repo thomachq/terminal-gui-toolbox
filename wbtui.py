@@ -733,16 +733,19 @@ class Check(tk.Frame):
 
 # ---------------------------------------------------------------- 侧边导航
 class _NavItem(tk.Frame):
-    def __init__(self, master, label: str, command):
+    def __init__(self, master, label: str, command, indent: int = 0):
         super().__init__(master, bg=T.page, bd=0, cursor="hand2")
         self.label_text = label
         self.command = command
         self.active = False
         self._hover = False
+        # 二级项往右缩一点：分组标题下的条目要能看出「它属于上面那组」
+        self._indent = int(indent)
         self.accent = tk.Frame(self, bg=T.page, width=px(3), bd=0)
         self.accent.pack(side="left", fill="y")
         self.lbl = tk.Label(self, text=label, bg=T.page, fg=T.text_dim,
-                            font=FONT, anchor="w", bd=0, padx=px(13), pady=px(9))
+                            font=FONT, anchor="w", bd=0,
+                            padx=px(13 + self._indent), pady=px(9))
         self.lbl.pack(side="left", fill="both", expand=True)
         for w in (self, self.lbl):
             w.bind("<Button-1>", self._click)
@@ -781,22 +784,58 @@ class _NavItem(tk.Frame):
 
 
 class Nav(tk.Frame):
-    def __init__(self, master, items, on_change, width: int = 170):
+    """左侧导航。
+
+    `items` 支持两种写法：
+      ("key", "标题")                          —— 一级条目
+      ("group", "分组标题", [("key", "标题")]) —— 带小标题的一组二级条目
+
+    分组不是纯装饰：资产类（主机 / 凭证 / 脚本）和操作类（防火墙 / 数据库）
+    混在一列里时，找东西全靠记顺序。分两组之后一眼能扫到。
+    """
+
+    def __init__(self, master, items, on_change, width: int = 170,
+                 alias: dict | None = None):
         super().__init__(master, bg=T.page, bd=0, width=px(width))
         self.pack_propagate(False)
         self.on_change = on_change
+        # 旧键 → 新键。--page fw / conn 这类历史参数与旧脚本都还要能用
+        self.alias = dict(alias or {})
         self.items: dict[str, _NavItem] = {}
         self.current = None
         top = tk.Frame(self, bg=T.page, bd=0, height=px(8))
         top.pack(fill="x")
-        for key, label in items:
-            it = _NavItem(self, label, lambda k=key: self.select(k))
-            it.pack(fill="x", pady=px(1), padx=(px(2), px(8)))
-            self.items[key] = it
+        for it in items:
+            if it and it[0] == "group":
+                self._add_group(it[1], it[2])
+            else:
+                self._add_item(it[0], it[1], 0)
         register(self, lambda: self.configure(bg=T.page))
 
+    def _add_group(self, title: str, subs) -> None:
+        # 标题为空表示「这组就是当前模块本身」，不画小标题 ——
+        # 顶部页签已经写着模块名，侧栏再来一行是重复噪音。
+        if title:
+            lb = tk.Label(self, text=title, bg=T.page, fg=T.text_mute,
+                          font=FONT_XS, anchor="w", bd=0, padx=px(15),
+                          pady=px(1))
+            lb.pack(fill="x", pady=(px(11), px(1)))
+            register(lb, lambda: lb.configure(bg=T.page, fg=T.text_mute))
+        else:
+            tk.Frame(self, bg=T.page, height=px(2), bd=0).pack(fill="x")
+        for key, label in subs:
+            self._add_item(key, label, 11)
+
+    def _add_item(self, key: str, label: str, indent: int) -> None:
+        it = _NavItem(self, label, lambda k=key: self.select(k), indent=indent)
+        it.pack(fill="x", pady=px(1), padx=(px(2), px(8)))
+        self.items[key] = it
+
     def select(self, key: str) -> None:
-        if key == self.current:
+        key = self.alias.get(key, key)
+        # 不存在的键静默忽略：旧脚本可能还在传已经并掉的页面名，
+        # 直接抛 KeyError 会让整个启动流程断在导航上。
+        if key not in self.items or key == self.current:
             return
         self.current = key
         for k, it in self.items.items():

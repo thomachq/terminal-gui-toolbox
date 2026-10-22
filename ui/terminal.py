@@ -49,26 +49,22 @@ BANNER = (
 )
 
 
-class TerminalWindow(tk.Toplevel):
-    """独立终端窗口。
+class _TermShell:
+    """终端的正文与交互，与「宿主容器」无关。
 
-    `ctrl` 是主程序，需要提供四个方法：
-        term_ready()           -> bool        当前是否可执行命令
-        term_prompt()          -> str         提示符（含设备名 / 目录）
-        term_describe()        -> str         窗口标题栏右侧那行字
-        term_run(cmd, done)    -> None        异步执行，done(rc, out, err, ms)
+    同一套东西要能跑在两种宿主上：
+      · `TerminalWindow` —— 独立窗口（Toplevel）
+      · `TerminalPane`   —— 嵌在主页签里（Frame）
+    抽出来的原因很实际：拉出去、收回来不该换一套实现，否则两边行为迟早不一致
+    （一边能翻历史、一边不能这种）。这里只依赖 Tk 的两个宿主都有的能力，
+    Toplevel 专有的（title / geometry / protocol）留在子类里。
     """
 
-    def __init__(self, master, ctrl, mode: str | None = None):
+    def _init_term(self, ctrl, mode: str | None) -> None:
         global _LAST_MODE
-        super().__init__(master)
         self.ctrl = ctrl
         self.mode = mode if mode in ("box", "inline") else _LAST_MODE
         _LAST_MODE = self.mode
-        self.title("终端 · Terminal")
-        self.geometry(f"{U.px(820)}x{U.px(520)}")
-        self.minsize(U.px(560), U.px(300))
-        self.configure(bg=U.T.page)
 
         self._hist: list[str] = []
         self._hist_at = 0
@@ -90,7 +86,6 @@ class TerminalWindow(tk.Toplevel):
         self._build()
         self._apply_mode(quiet=True)
         self._banner()
-        self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(30, self._drain)
         self.after(60, self._focus_input)
 
@@ -128,6 +123,13 @@ class TerminalWindow(tk.Toplevel):
 
         U.RoundButton(head, "关闭", self.close, variant="ghost",
                       font=U.FONT_S, height=26, padx=10).pack(side="right")
+        # 独立窗口才有「嵌回」—— 嵌在页签里的那份已经在家了
+        if isinstance(self, tk.Toplevel) and callable(
+                getattr(self.ctrl, "term_embed", None)):
+            U.RoundButton(head, "嵌回主界面",
+                          lambda: self.ctrl.term_embed(self),
+                          variant="ghost", font=U.FONT_S, height=26,
+                          padx=10).pack(side="right", padx=(0, U.px(6)))
         U.RoundButton(head, "清屏", self.clear, variant="ghost",
                       font=U.FONT_S, height=26, padx=10).pack(
             side="right", padx=(0, U.px(6)))
@@ -136,11 +138,15 @@ class TerminalWindow(tk.Toplevel):
         self.seg_mode = Segmented(head, MODES, command=self._set_mode)
         self.seg_mode.select(self.mode, fire=False)
         self.seg_mode.pack(side="right", padx=(0, U.px(10)))
-        tk.Label(head, text="输入方式", bg=U.T.page, fg=U.T.text_mute,
-                 font=U.FONT_XS, bd=0).pack(side="right", padx=(0, U.px(6)))
-        self.chk_sync = U.Check(head, "同步主程序命令", self._sync,
-                                font=U.FONT_XS)
-        self.chk_sync.pack(side="right", padx=(0, U.px(14)))
+        # 头部控件多，窄的时候先被挤掉的是最左边那几个 —— 所以文案都压到最短，
+        # 「输入方式」这种一看分段控件就懂的标签干脆不要。
+        self.chk_sync = U.Check(head, "同步命令", self._sync, font=U.FONT_XS)
+        self.chk_sync.pack(side="right", padx=(0, U.px(10)))
+        # AI 活动流：助手调模型、发命令都往这里写。默认开 —— 这就是
+        # 「AI 干了什么，终端里看得见」；嫌吵可以关掉，不影响命令本身。
+        self._ai_on = tk.BooleanVar(value=True)
+        self.chk_ai = U.Check(head, "AI 活动", self._ai_on, font=U.FONT_XS)
+        self.chk_ai.pack(side="right", padx=(0, U.px(10)))
 
         # 正文
         wrap = tk.Frame(self, bg=U.T.card, bd=0, highlightthickness=1,
@@ -166,6 +172,11 @@ class TerminalWindow(tk.Toplevel):
         self.text.tag_configure("prompt", foreground=U.T.ok)
         self.text.tag_configure("meta", foreground=U.T.text_mute)
         self.text.tag_configure("echo", foreground=U.T.brand)
+        # AI 活动流三档：头部（箭头那行）加重、正文摘录退后、警示用 warn
+        self.text.tag_configure("aihead", foreground=U.T.brand,
+                                font=(U.MONO[0], 10, "bold"))
+        self.text.tag_configure("aidim", foreground=U.T.text_mute)
+        self.text.tag_configure("warn", foreground=U.T.warn)
         self.text.configure(state="disabled")
 
         # 输入行
@@ -213,6 +224,10 @@ class TerminalWindow(tk.Toplevel):
             self.text.tag_configure("prompt", foreground=U.T.ok)
             self.text.tag_configure("meta", foreground=U.T.text_mute)
             self.text.tag_configure("echo", foreground=U.T.brand)
+            self.text.tag_configure("aihead", foreground=U.T.brand,
+                                    font=(U.MONO[0], 10, "bold"))
+            self.text.tag_configure("aidim", foreground=U.T.text_mute)
+            self.text.tag_configure("warn", foreground=U.T.warn)
             self.text.configure(selectbackground=U.T.brand_soft2,
                                 selectforeground=U.T.text)
             self.wrap.configure(highlightbackground=U.T.border)
@@ -439,9 +454,12 @@ class TerminalWindow(tk.Toplevel):
         if self.mode == "inline":
             self._ensure_prompt()
 
+    def _win_title(self, text: str) -> None:
+        """设置窗口标题。嵌入形态没有标题栏，默认什么都不做。"""
+
     def _refresh_head(self) -> None:
         try:
-            self.title(f"终端 · {self.ctrl.term_describe()}")
+            self._win_title(f"终端 · {self.ctrl.term_describe()}")
             self.lbl_dev.configure(text=self.ctrl.term_describe())
             if self.mode == "inline":
                 self._reset_inline_prompt()
@@ -466,6 +484,28 @@ class TerminalWindow(tk.Toplevel):
             self.write(err if err.endswith("\n") else err + "\n", "err")
         if rc != 0:
             self.write(f"[rc={rc} {ms}ms]\n", "meta")
+
+    # ------------------------------------------------------------ AI 活动流
+    def ai_feed(self, lines) -> None:
+        """把 AI 的活动逐行写进正文。
+
+        lines 是 [(文本, 标签)]，由 core.aitrace 拼好，这里只负责落字。
+        头部行前面插一个空行做分隔，否则连续两轮对话会粘成一坨分不清。
+        用户在头部取消勾选「AI 活动」就整段静默 —— 但命令本身照跑，
+        只是不回显，免得以为把 AI 关掉了。
+        """
+        if not self._ai_on.get():
+            return
+        rows = list(lines or [])
+        if not rows:
+            return
+        for i, (text, tag) in enumerate(rows):
+            if not text:
+                continue
+            self.write(text if text.endswith("\n") else text + "\n", tag)
+            if i == 0:
+                # 头部行之后再空一行，让「输入 / 输出 / 命令」三段落分明
+                self.write("\n", "meta")
 
     def _is_own(self, display: str) -> bool:
         """这条旁路是不是自己刚敲的那条（只吞一次）。"""
@@ -639,3 +679,42 @@ class TerminalWindow(tk.Toplevel):
     # 主程序可能在别的线程里想推点东西进来
     def push(self, text: str, tag: str = "out") -> None:
         self.post(lambda: self.write(text, tag))
+
+
+class TerminalWindow(_TermShell, tk.Toplevel):
+    """独立终端窗口。
+
+    `ctrl` 是主程序，需要提供四个方法：
+        term_ready()           -> bool        当前是否可执行命令
+        term_prompt()          -> str         提示符（含设备名 / 目录）
+        term_describe()        -> str         窗口标题栏右侧那行字
+        term_run(cmd, done)    -> None        异步执行，done(rc, out, err, ms)
+    """
+
+    def __init__(self, master, ctrl, mode: str | None = None,
+                 title: str = "终端 · Terminal"):
+        tk.Toplevel.__init__(self, master)
+        self.configure(bg=U.T.page)
+        self.title(title)
+        self.geometry(f"{U.px(820)}x{U.px(520)}")
+        self.minsize(U.px(560), U.px(300))
+        self._init_term(ctrl, mode)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _win_title(self, text: str) -> None:
+        try:
+            self.title(text)
+        except tk.TclError:
+            pass
+
+
+class TerminalPane(_TermShell, tk.Frame):
+    """嵌在主界面页签里的终端。除了没有窗口边框，行为与独立窗口一致。"""
+
+    def __init__(self, master, ctrl, mode: str | None = None):
+        tk.Frame.__init__(self, master, bg=U.T.page, bd=0)
+        self._init_term(ctrl, mode)
+
+    def _win_title(self, text: str) -> None:
+        # 嵌入形态的标题由页签负责，这里不抢
+        pass

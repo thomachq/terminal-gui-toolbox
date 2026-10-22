@@ -25,6 +25,11 @@ KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa", "id_dsa")
 PROFILE_FIELDS = (
     "name", "host", "port", "user", "auth", "key_path", "note",
     "remember", "password", "key_passphrase", "sudo_password",
+    # ---- 主机资源（v1.0.4 起）：分组、标签、协议、引用关系
+    # 这几个字段只描述「这台机器是什么」，不含任何凭据；
+    # cred_id / proxy_id 指向别的库，本文件里永远只有 id，没有口令。
+    "proto", "group", "tags", "cred_id", "proxy_id",
+    "created", "last_used",
 )
 
 
@@ -316,6 +321,13 @@ class ProfileStore:
         out.setdefault("name", "")
         out.setdefault("auth", "key")
         out["port"] = out.get("port") or "22"
+        # 协议留空时按 22/23 端口猜，别让老档案全变成「未标协议」
+        if not out.get("proto"):
+            out["proto"] = "telnet" if out["port"] == "23" else "ssh"
+        if not out.get("group"):
+            out["group"] = ""
+        if not out.get("tags"):
+            out["tags"] = ""
         # 旧档案里可能存着 `C:\Users\x/.ssh/id_ed25519` 这种半斜杠路径，
         # 读进来就顺手归一，免得界面上一直显示成错的。
         out["key_path"] = norm_path(out.get("key_path"))

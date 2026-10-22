@@ -79,7 +79,8 @@ def main() -> int:
         "sys": ["tbl_disk"],
         # 证书控制台已内嵌成页内 Frame（不再是子进程 iframe），量它本身
         "vpn": ["vpn_console"],
-        "fw": ["tbl_fw", "lbl_fw"],
+        # 防火墙已并进安全中心；tbl_sec 是体检结果表，两个都要能测到
+        "sec": ["tbl_fw", "lbl_fw", "tbl_sec"],
     }
     for key, attrs in expected.items():
         app.nav.select(key)
@@ -267,7 +268,7 @@ def main() -> int:
     chk(len(sysbody) > 4, "系统信息输出", f"{len(sysbody)} 字符")
 
     # ---------------- 防火墙（本机探测；第三批改成可读可写后接口名变了）
-    app.nav.select("fw")
+    app.nav.select("sec")
     pump(app, 0.2)
     app.fw_probe()
     got_fw = False

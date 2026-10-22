@@ -40,6 +40,11 @@ SETTING_KEYS = (
     "lock_timeout",     # int：闲置秒数，0 = 永不
     "lock_auto_login",  # bool
     "lock_pass_enc",    # str：记住的口令（crypto_store 密文）
+    # ---- 设置中心（外观 / 工作区）
+    "theme",            # str：light / dark / system
+    "accent",           # str：主题配色名
+    "close_to_tray",    # bool：关闭窗口时收到托盘
+    "log_open",         # bool：启动时展开日志栏
 )
 
 

@@ -7,6 +7,8 @@
 
   服务下拉   探测到的服务（类型 + 版本 + 状态），切换即换一整套详情
   服务详情   单元名 / 监听端口 / 配置文件 / 站点根 / 运行用户
+  站点清单   这个服务下挂的每个站点：域名、别名、端口、站点根、是否上 TLS
+  域名绑定   改 server_name / ServerName+ServerAlias，备份 → 写 → 配置检查 → 重载
   TLS 证书   证书文件、私钥文件、主题、颁发者、SAN、有效期、剩余天数、是否一对
   证书操作   重新读取 / 导入并部署（自动备份 + 配置检查 + 重载 + 失败回滚）/ 恢复备份
 """
@@ -19,16 +21,26 @@ from tkinter import filedialog, ttk
 import wbtui as U
 from core import webstack as ws
 from ui import forms
-from ui.table import KVGrid
+from ui.table import Column, DataTable, KVGrid
 
 STATE_TONE = {"运行中": "ok", "未运行": "mute"}
+
+SITE_COLS = [
+    Column("name", "主域名", 190, mono=True, stretch=True),
+    Column("aliases", "别名", 190, stretch=True),
+    Column("listen", "监听", 110, mono=True),
+    Column("root", "站点根", 210, mono=True, stretch=True),
+    Column("ssl", "TLS", 50),
+    Column("file", "配置文件", 210, mono=True, stretch=True),
+]
+SITE_KINDS = ("nginx", "apache", "iis")
 
 
 class WebPage:
     # ------------------------------------------------------------ 构建
     def build_web(self, pg):
         pg.columnconfigure(0, weight=1)
-        pg.rowconfigure(3, weight=1)
+        pg.rowconfigure(4, weight=1)
 
         # ---- 服务
         c = U.Card(pg, title="Web 服务", hint="探测到的每个服务单独管理，下拉切换")
@@ -75,9 +87,48 @@ class WebPage:
         self.kk_web = KVGrid(c2.body, columns=3)
         self.kk_web.pack(fill="x")
 
+        # ---- 站点与域名
+        csite = U.Card(pg, title="站点与域名",
+                       hint="这个服务下挂的每个站点 · 域名绑定带备份与回滚")
+        csite.grid(row=2, column=0, sticky="we", pady=(U.px(10), 0))
+        bs = csite.body
+        srow = U.wframe(bs, "card")
+        srow.pack(fill="x")
+        self.lbl_site = U.wlabel(srow, "切换服务后自动读取站点。", "dim", U.FONT_S)
+        self.lbl_site.pack(side="left")
+        self.badge_site = U.Pill(srow, "未读取", "mute", height=24)
+        self.badge_site.pack(side="left", padx=(U.px(10), 0))
+        self.btn_site_bind = U.RoundButton(srow, "绑定域名…", self.web_bind_domains,
+                                           variant="primary", height=30, padx=14)
+        self.btn_site_bind.pack(side="right")
+        self.btn_site_roll = U.RoundButton(srow, "还原备份", self.web_site_restore,
+                                           variant="ghost", height=30, padx=12)
+        self.btn_site_roll.pack(side="right", padx=(0, U.px(6)))
+        self.btn_site_reload = U.RoundButton(srow, "刷新站点", self.web_sites_load,
+                                             variant="secondary", height=30, padx=12)
+        self.btn_site_reload.pack(side="right", padx=(0, U.px(6)))
+
+        self.tbl_site = DataTable(
+            bs, SITE_COLS, height=6, searchable=True,
+            empty_title="这个服务没有可解析的站点",
+            empty_hint="nginx / Apache / IIS 才有站点清单；"
+                       "Tomcat 看 webapps，Caddy / Lighttpd 按配置文件管理。",
+            on_activate=self._site_detail)
+        self.tbl_site.pack(fill="both", expand=True, pady=(U.px(8), 0))
+        self.tbl_site.set_menu([
+            ("查看站点详情", self._site_detail, lambda r: bool(r)),
+            ("绑定 / 修改域名…", self.web_bind_domains, lambda r: bool(r)),
+            ("复制域名", lambda r: self.copy_text(
+                ", ".join([r.get("name", "")] + [a for a in
+                          (r.get("aliases") or "").split(", ") if a != "—"]),
+                "域名"), lambda r: bool(r)),
+            (None, None, None),
+            ("还原这个文件的备份", self.web_site_restore, lambda r: bool(r)),
+        ])
+
         # ---- TLS
         c3 = U.Card(pg, title="服务器 TLS 证书", hint="读取 → 校验 → 部署（失败自动回滚）")
-        c3.grid(row=2, column=0, sticky="we", pady=(U.px(10), 0))
+        c3.grid(row=3, column=0, sticky="we", pady=(U.px(10), 0))
         b3 = c3.body
         line = U.wframe(b3, "card")
         line.pack(fill="x")
@@ -106,7 +157,7 @@ class WebPage:
 
         # ---- 操作记录
         c4 = U.Card(pg, title="操作记录", hint="探测命令与部署步骤，逐步落在这里")
-        c4.grid(row=3, column=0, sticky="nsew", pady=(U.px(10), 0))
+        c4.grid(row=4, column=0, sticky="nsew", pady=(U.px(10), 0))
         self.box_web = U.TextBox(c4.body, role="alt", font=U.MONO_S, height=7,
                                  wrap="none")
         self.box_web.pack(fill="both", expand=True)
@@ -114,11 +165,15 @@ class WebPage:
         self.web_res: dict = {}
         self.web_cur: str = ""
         self.web_tls: dict = {}
+        self.web_sites: list = []
+        self._web_site_svc: str = ""
         self._web_set_enabled(False)
 
     # ------------------------------------------------------------ 状态
     def _web_set_enabled(self, on: bool):
         for btn in (self.btn_web_test, self.btn_web_reload, self.btn_web_conf):
+            btn.set_enabled(on)
+        for btn in (self.btn_site_reload, self.btn_site_bind, self.btn_site_roll):
             btn.set_enabled(on)
 
     def _web_log(self, text: str) -> None:
@@ -222,6 +277,8 @@ class WebPage:
         else:
             self.web_tls = {}
             self._tls_render({})
+        # 站点清单跟着服务走：换一个服务就该换一套站点
+        self.after(60, self.web_sites_load)
 
     def _web_render(self):
         svc = self._web_service()
@@ -515,9 +572,225 @@ class WebPage:
             return
         text = "\n".join(x for x in (pair.get("cert"), pair.get("key"),
                                      pair.get("chain")) if x)
-        try:
-            self.clipboard_clear()
-            self.clipboard_append(text)
-            self.toast("证书路径已复制", "ok")
-        except tk.TclError:
-            pass
+        self.copy_text(text, "证书路径")
+
+    # ------------------------------------------------------------ 站点
+    def _web_kind(self) -> str:
+        return (self._web_service() or {}).get("kind", "")
+
+    def web_sites_load(self):
+        """读站点清单。nginx 用 `nginx -T`，apache 直接 cat 站点文件。
+
+        这两条命令都把「文件名」写在输出里（`# configuration file x:`），
+        所以列出来的每一条站点都能反查到具体文件与行号 —— 改的时候才知道改哪。
+        """
+        svc = self._web_service()
+        kind = svc.get("kind", "")
+        if kind not in SITE_KINDS:
+            self.web_sites = []
+            self.tbl_site.set_rows([])
+            self.tbl_site.set_empty(
+                "这个服务没有站点清单",
+                "nginx / Apache / IIS 才有；Tomcat 的站点在 webapps 下，"
+                "Caddy / Lighttpd 直接按配置文件管。")
+            self.lbl_site.configure(
+                text=f"{svc.get('label') or kind} 不支持站点清单",
+                fg=U.T.text_dim)
+            self.badge_site.set("不适用", "mute")
+            self.btn_site_bind.set_enabled(False)
+            self.btn_site_roll.set_enabled(False)
+            return
+
+        cmd = ws.site_dump_cmd(kind)
+        s = self._active_session()
+        self.badge_site.set("读取中", "mute")
+        self.lbl_site.configure(text="正在读取站点配置…", fg=U.T.text_dim)
+        self._web_site_svc = svc.get("key", "")
+
+        def work():
+            if s is None:
+                return ""
+            runner = getattr(s, "run_traced", None) or s.run
+            try:
+                rc, out, err = runner(cmd, timeout=45)
+            except Exception:  # noqa: BLE001
+                return ""
+            return out or ""
+
+        def done(text):
+            self._web_log(f"$ {cmd}")
+            self.web_sites = ws.parse_sites(kind, text)
+            self._web_sites_render()
+
+        def fail(msg):
+            self.web_sites = []
+            self._web_sites_render()
+            self._web_log(f"[站点] {msg}")
+
+        self.bg(work, ok=done, err=fail)
+
+    def _web_sites_render(self):
+        rows = [s.as_row() for s in self.web_sites]
+        self.tbl_site.set_rows(rows)
+        kind = self._web_kind()
+        if kind == "iis":
+            self.lbl_site.configure(
+                text="IIS 站点由 http.sys 绑定管理，这里只读", fg=U.T.text_dim)
+        elif self.web_sites:
+            self.lbl_site.configure(text=ws.summarize_sites(self.web_sites),
+                                    fg=U.T.text_dim)
+        else:
+            self.lbl_site.configure(
+                text="没有解析到站点（可能没有站点文件，或需要提权读取）",
+                fg=U.T.text_dim)
+        self.badge_site.set(f"{len(rows)} 个站点" if rows else "0 个",
+                            "ok" if rows else "mute")
+        self.btn_site_bind.set_enabled(bool(rows))
+        self.btn_site_roll.set_enabled(bool(rows))
+
+    def _site_pick(self, row=None):
+        row = row or self.tbl_site.selected()
+        if not row:
+            return None
+        for s in self.web_sites:
+            if s.file == row.get("_file") and s.index == row.get("_index"):
+                return s
+        return None
+
+    def _site_detail(self, row=None):
+        site = self._site_pick(row)
+        if site is None:
+            return
+        body = [
+            f"类型：{site.kind}",
+            f"文件：{site.file or '—'}",
+            f"位置：第 {site.index + 1} 个块（第 {site.line or '?'} 行）",
+            f"域名：{' '.join(site.names) or '（未绑定）'}",
+            f"监听：{', '.join(site.listen) or '—'}",
+            f"站点根：{site.root or '—'}",
+            f"证书：{site.ssl or '—'}",
+        ]
+        if site.note:
+            body += ["", site.note]
+        forms.InfoDialog.show(self, site.primary or "站点", "\n".join(body),
+                              subtitle=site.file, width=760, height=420)
+
+    def web_bind_domains(self, row=None):
+        site = self._site_pick(row)
+        if site is None:
+            self.toast("先选一个站点", "warn")
+            return
+        if site.kind == "iis":
+            forms.confirm(
+                self, "IIS 的绑定不在这里改",
+                f"{site.primary}\n\nIIS 站点绑定由 http.sys 管理，不在配置文件里。\n\n"
+                "请在 IIS 管理器里「编辑绑定」，或用：\n"
+                "  appcmd set site /site.name:\"站点名\" /+bindings."
+                "[protocol='http',bindingInformation='*:80:域名']")
+            return
+        fields = [
+            {"key": "names", "label": "域名", "default": " ".join(site.names),
+             "width": 52, "required": True,
+             "hint": "空格分隔；第一个是主域名，其余作为别名"},
+        ]
+        data = forms.FormDialog.open(
+            self, "绑定域名", fields,
+            subtitle=f"{site.kind} · {site.file} 第 {site.index + 1} 个块")
+        if not data:
+            return
+        raw = str(data.get("names") or "")
+        for sep in (",", "，", "、", ";", "\t"):
+            raw = raw.replace(sep, " ")
+        names = [n.strip() for n in raw.split() if n.strip()]
+        if not names:
+            return self.toast("域名不能为空", "warn")
+        bad = [n for n in names if not _valid_host(n)]
+        if bad:
+            return forms.confirm(
+                self, "域名格式看着不对",
+                "这些不像域名：\n" + "、".join(bad) +
+                "\n\n通配符请写成 *.example.com；下划线在 nginx 里能过，"
+                "但证书和浏览器可能不认。")
+
+        preview = _diff_line(site, names)
+        if not forms.confirm(
+                self, "确认修改域名",
+                f"{site.file}\n\n{preview}\n\n"
+                "会先备份成 .bak-时间戳，写完做一次配置检查并重载；"
+                "检查不过就自动还原。继续？", ok_text="写入"):
+            return
+
+        binder = ws.SiteBinder(self._active_session(), site)
+        self.badge_site.set("写入中", "mute")
+        self._web_log(f"[域名] {site.primary} → {' '.join(names)}")
+
+        def work():
+            return binder.update(names)
+
+        def done(res):
+            for st in res.get("steps") or []:
+                mark = "ok " if st.get("rc") == 0 else "ERR"
+                self._web_log(f"  [{mark}] {st.get('name')}: {st.get('cmd', '')[:110]}")
+                extra = (st.get("err") or st.get("out") or "").strip()
+                if extra and st.get("rc") != 0:
+                    self._web_log(f"        {extra[:180]}")
+            if res.get("ok"):
+                self.badge_site.set("已写入", "ok")
+                self.toast("域名已更新", "ok")
+                self._log_raw("ok", f"[Web] 域名 {site.file} → {' '.join(names)}\n")
+            else:
+                self.badge_site.set("写入失败", "err")
+                self._log_raw("bad", f"[Web] 域名写入失败 · {res.get('detail', '')}\n")
+                forms.confirm(self, "没有改成", res.get("detail") or "未知原因")
+            self.after(300, self.web_sites_load)
+
+        self.bg(work, ok=done, err=lambda m: (
+            self.badge_site.set("写入失败", "err"), self._web_log(f"[域名] {m}")))
+
+    def web_site_restore(self, row=None):
+        site = self._site_pick(row)
+        if site is None:
+            return
+        if site.kind == "iis" or not site.file:
+            return self.toast("这条没有可还原的文件", "warn")
+        if not forms.confirm(
+                self, "还原配置文件",
+                f"把 {site.file} 退回到最近一次的 .bak-* 版本，并重载服务。\n"
+                "注意：这会丢弃这个文件在备份之后的**所有**改动，不只是域名。\n\n继续？",
+                danger=True, ok_text="还原"):
+            return
+        binder = ws.SiteBinder(self._active_session(), site)
+
+        def work():
+            return binder.rollback()
+
+        def done(res):
+            self._web_log(f"[站点还原] {res.get('detail', '')}")
+            self.toast(res.get("detail", ""), "ok" if res.get("ok") else "err")
+            self.after(300, self.web_sites_load)
+
+        self.bg(work, ok=done, err=lambda m: self.toast(str(m), "err"))
+
+
+def _valid_host(name: str) -> bool:
+    """域名 / 通配符 / IP / `_` 都放行；明显不是域名的拦一下。"""
+    if name in ("_", "localhost"):
+        return True
+    if name.startswith("*."):
+        name = name[2:]
+    if not name or len(name) > 253:
+        return False
+    import re
+    return bool(re.fullmatch(r"[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9])?", name)) \
+        or bool(re.fullmatch(r"[0-9a-fA-F:.]+", name))
+
+
+def _diff_line(site, names: list[str]) -> str:
+    old = " ".join(site.names) or "（未绑定）"
+    new = " ".join(names)
+    if site.kind == "apache":
+        return (f"现在：ServerName {site.names[0] if site.names else '（无）'}"
+                f"{(' / ServerAlias ' + ' '.join(site.names[1:])) if len(site.names) > 1 else ''}\n"
+                f"改成：ServerName {names[0]}"
+                f"{(' / ServerAlias ' + ' '.join(names[1:])) if len(names) > 1 else ''}")
+    return f"现在：server_name {old}\n改成：server_name {new}"

@@ -35,3 +35,8 @@ desktop.ini
 
 # ── 自测产生的 PKI 样本（里面有 CA 私钥，绝不入库）──
 _test_data/
+
+# 构建与提交用的临时文件
+build_out.log
+_commitmsg.txt
+_release/

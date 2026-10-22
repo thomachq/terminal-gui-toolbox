@@ -35,8 +35,13 @@ import crypto_store
 import lockmgr
 import wbtui as U
 from api.server import make_default as make_api
-from core import ai_skills
+from core import ai_skills, aitrace
 from core import aiops, parsers, routes
+from core import audit as audit_core
+from core import creds as creds_core
+from core import hosts as hosts_core
+from core import proxies as proxies_core
+from core import scripts as scripts_core
 from core import redact
 from core.detect import DeviceInfo, capabilities, detect, dialect_for
 from core.metrics import (Sampler, human_bytes, human_gb, human_rate,
@@ -44,12 +49,21 @@ from core.metrics import (Sampler, human_bytes, human_gb, human_rate,
 from core.sessionmgr import SessionManager
 from core.session import (ConnSpec, LocalSession, NeedElevation, SSHSession,
                           SessionError, open_session)
-from pages.ai_page import AiPage
+from pages.ai_dock import AiDockPage
+from pages.cred_page import CredPage
+from pages.hosts_page import HostsPage
+from pages.log_page import LogPage
+from pages.proxy_page import ProxyPage
+from pages.script_page import ScriptPage
+from pages.settings_center import SettingsCenter
+from core import agent as agent_core
 from pages.api_page import ApiPage
+from pages.cron_page import CronPage
+from pages.db_page import DbPage
 from pages.docker_page import DockerPage
 from pages.files_page import FilesPage
-from pages.firewall_page import FirewallPage
 from pages.routes_page import RoutesPage
+from pages.security_page import SecurityPage
 from pages.web_page import WebPage
 from profiles import ProfileStore, discover_keys, inspect_key, norm_path
 from ui import forms
@@ -57,6 +71,8 @@ from ui.icon import apply_icon, set_app_id
 from ui.logpanel import LogModel, LogPanel
 from ui.statusbar import StatusBar
 from ui.table import KVGrid, Column, DataTable, Segmented
+from ui.tabs import TabBar
+from ui.terminal import TerminalPane, TerminalWindow
 from ui.tray import Tray
 
 if getattr(sys, "frozen", False):
@@ -87,7 +103,14 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_SUB = "多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 实时性能 · 路由 / 防火墙 / Docker"
+APP_VER = "1.0.4"
+APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
+           "计划任务 / Web 服务 · AI 运维")
+
+# 旧导航键 → 新导航键。防火墙并进安全中心之后，"fw" 仍然能用（--page fw、
+# 以前的脚本、截图脚本都指着它），只是指到同一页。
+# 已合并/改名的页面：旧键继续可用，--page 与旧脚本不会突然断掉。
+NAV_ALIAS = {"fw": "sec", "conn": "hosts"}
 
 
 SYS_COLS = {
@@ -144,8 +167,10 @@ TOOL_COLS = {
 }
 
 
-class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPage,
-                 WebPage, tk.Tk):
+class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
+                 FilesPage, AiDockPage, ApiPage, WebPage, SettingsCenter,
+                 HostsPage, ProxyPage, CredPage, ScriptPage, LogPage,
+                 tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
@@ -182,11 +207,31 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self._dk_probed = False
         self._web_probed = False
         self._routes_loaded = False
-        self._fw_probed = False
+        self._sec_done = False
+        self._db_probed = False
+        self._cron_loaded = False
+        self._hosts_ready = False
+        self._proxy_ready = False
+        self._cred_ready = False
+        self._script_ready = False
+        self._audit_ready = False
+        self._host_rows_all: list = []
+        self._proxy_rows_all: list = []
+        self._cred_rows_all: list = []
+        self._script_rows_all: list = []
+        self.ai_dock = None
+        self._ai_dock_on = False
+        self._ai_pending = None
         self._api_inited = False
         self._vpn_booted = False
         self._term: tk.Toplevel | None = None
         self._term_cwd_val = ""
+        # --no-probe：只把界面画出来，不主动跑任何探测。
+        # 探测会去调系统命令（Windows 上是 reg.exe / schtasks.exe / netstat），
+        # 在受限环境或自动化脚本里容易卡住、弹 UAC 或者干脆被拦掉；
+        # 截图与打包验收只需要界面骨架，不需要真数据。
+        # 它只压掉「打开页面时自动跑一次」，用户主动点按钮时仍然照跑。
+        self._no_probe = "--no-probe" in sys.argv
 
         # ---- 机密与档案
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -194,6 +239,19 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self.settings = lockmgr.Settings(DATA_DIR / "settings.json")
         self.lock = lockmgr.LockManager(self.settings)
         self.profiles = ProfileStore(DATA_DIR / "profiles.dat")
+        # 主机资源四件套：凭证 / 代理 / 脚本各自一个库，脚本是明文
+        self.creds = creds_core.CredStore(DATA_DIR / "creds.dat")
+        self.proxies = proxies_core.ProxyStore(DATA_DIR / "proxies.dat")
+        self.scripts = scripts_core.ScriptStore(DATA_DIR / "scripts.json")
+        # 操作审计：一天一个 jsonl，追加写
+        self.audit = audit_core.AuditStore(DATA_DIR / "logs")
+
+        # ---- 外观：先按上次保存的主题与配色定下调色板，再建控件。
+        # 反过来做的话，第一帧会闪一下默认配色。
+        self.app_ver = APP_VER
+        self.app_name = APP_NAME
+        self._close_to_tray = bool(self.settings.data.get("close_to_tray", True))
+        self._apply_theme_pref()
 
         # ---- 本地 API（智能体接入）
         self.api_cfg, self.api_pool, self.api_server = make_api(
@@ -203,8 +261,16 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self.ai_cfg = aiops.AIConfig(DATA_DIR / "ai.json")
         self.ai_assistant = aiops.Assistant(self.ai_cfg)
         self.ai_skill_store = ai_skills.make_store(DATA_DIR)
+        # 智能体的「人设」与「模型」分开存：换模型不动人设，改人设不碰凭据
+        self.agent_cfg = agent_core.AgentConfig(DATA_DIR / "agent.json")
+        self.agent = agent_core.Agent(self.agent_cfg, self.ai_cfg)
         self.ai_busy = False
         self._ai_stop = threading.Event()
+        # 助手自己发出去的远端命令：终端别再喂一遍（见 _term_feed）
+        self._ai_live_cmds: dict[str, float] = {}
+        # 模型这一层的输入输出要能在终端里看见 —— 钩子挂在引擎上，
+        # 因为只有引擎手里有请求全文与响应全文
+        aiops.set_trace(self._ai_api_trace)
 
         # ---- 图标 / 任务栏身份
         set_app_id("TerminalToolbox.App.1")
@@ -221,6 +287,8 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self._start_sampler()
         self._init_tray()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.agent_cfg.data.get("dock_open"):
+            self.after(260, self.ai_dock_open)
         self._maybe_lock_on_start()
         self.after(600, self._boot_api)
 
@@ -237,13 +305,17 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
 
         right = U.wframe(bar, "page")
         right.pack(side="right")
-        self.btn_lock = U.RoundButton(right, self._lock_btn_text(), self._lock_dialog,
-                                      variant="ghost", font=U.FONT_S, height=28, padx=12)
-        self.btn_lock.pack(side="right", padx=(U.px(8), 0))
-        self.btn_theme = U.RoundButton(right, "浅色" if U.T.name == "dark" else "深色",
-                                       self._toggle_theme, variant="ghost",
-                                       font=U.FONT_S, height=28, padx=12)
-        self.btn_theme.pack(side="right", padx=(U.px(8), 0))
+        # 最右是「设置」：外观、终端、AI、安全（含应用锁）、备份、关于都收在里面。
+        # 单独的主题切换和锁按钮都撤了 —— 三个按钮抢同一个位置，不如一个入口。
+        self.btn_settings = U.RoundButton(right, "设置", self.open_settings,
+                                          variant="ghost", font=U.FONT_S,
+                                          height=28, padx=12)
+        self.btn_settings.pack(side="right", padx=(U.px(8), 0))
+        # 紧挨「终端」右边：助手是常驻的，不该占一个选项卡
+        self.btn_ai_dock = U.RoundButton(right, "智能运维助手", self.ai_dock_toggle,
+                                         variant="primary", font=U.FONT_S,
+                                         height=28, padx=12)
+        self.btn_ai_dock.pack(side="right", padx=(U.px(8), 0))
         self.btn_term = U.RoundButton(right, "终端", self.open_terminal,
                                       variant="secondary", font=U.FONT_S,
                                       height=28, padx=12)
@@ -330,7 +402,9 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self._rebuild_devtabs()
         self._local_dev = None
         self._routes_loaded = False
-        self._fw_probed = False
+        self._sec_done = False
+        self._db_probed = False
+        self._cron_loaded = False
         self._dk_probed = False
         self._web_probed = False
         self.fw_backend = None
@@ -376,47 +450,93 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self._refresh_current_page()
 
     def _body(self):
-        body = U.wframe(self, "page")
-        body.pack(fill="both", expand=True, padx=U.px(10))
-        body.pack_propagate(False)
+        # ---- 顶部页签栏：主机资源 常驻，终端按需加，可拉出成独立窗口
+        self.tabbar = TabBar(self, on_select=self._on_tab,
+                             on_new=self._tab_new)
+        self.tabbar.on_close = self._tab_close
+        self.tabbar.pack(fill="x", padx=U.px(10), pady=(U.px(8), 0))
+        self._term_panes: dict[str, object] = {}
 
-        self.nav = U.Nav(body, [
-            ("conn", "连接与设备"),
-            ("tools", "网络工具"),
-            ("sys", "系统信息"),
-            ("files", "文件管理"),
-            ("routes", "路由表"),
-            ("fw", "防火墙"),
-            ("docker", "Docker"),
-            ("web", "Web 服务"),
-            ("ai", "AI 运维"),
-            ("vpn", "隧道客户端证书管理"),
-            ("api", "智能体接入"),
-        ], on_change=self._show, width=176)
-        self.nav.pack(side="left", fill="y", padx=(U.px(6), 0), pady=(U.px(2), U.px(8)))
+        # 外壳：左侧导航 + 页签内容在左，日志 / 助手在右。
+        # 分栏容器必须挂在窗口这一层 —— 挂在「主机资源」页里面的话，终端一旦
+        # 占满整页，右侧助手就被一起盖住，看不到「左边终端在跑、右边助手在说」。
+        self.shell = U.wframe(self, "page")
+        self.shell.pack(fill="both", expand=True)
 
-        # 内容 + 日志 的分隔容器（可拖拽）
-        self.paned = tk.PanedWindow(body, orient="horizontal", bg=U.T.page,
+        self.paned = tk.PanedWindow(self.shell, orient="horizontal", bg=U.T.page,
                                     bd=0, sashwidth=U.px(6), sashrelief="flat",
                                     showhandle=False)
         self.paned.pack(side="left", fill="both", expand=True,
                         padx=(U.px(6), U.px(8)), pady=(U.px(2), U.px(8)))
 
-        self.stack = U.wframe(self.paned, "page")
+        # 左半：导航在最左，页签内容占它右边
+        self.main = U.wframe(self.paned, "page")
+        self.paned.add(self.main, stretch="always", minsize=U.px(620))
+
+        # 所有页签的内容都 grid 在同一格，切页签就是 tkraise
+        self.workspace = U.wframe(self.main, "page")
+        self.workspace.pack(side="left", fill="both", expand=True)
+        self.workspace.rowconfigure(0, weight=1)
+        self.workspace.columnconfigure(0, weight=1)
+
+        self.ws_hosts = U.wframe(self.workspace, "page")
+        self.ws_hosts.grid(row=0, column=0, sticky="nsew")
+
+        body = U.wframe(self.ws_hosts, "page")
+        body.pack(fill="both", expand=True, padx=U.px(10))
+        body.pack_propagate(False)
+
+        self.nav = U.Nav(self.main, [
+            # 上面一组是「有哪些机器、凭什么登、跑什么脚本」—— 资产。
+            # 组名留空：顶部页签已经叫「主机资源」了，这里不再重复。
+            ("group", "", [
+                ("hosts", "主机管理"),
+                ("proxy", "代理池"),
+                ("cred", "凭证管理"),
+                ("script", "脚本库"),
+                ("log", "日志管理"),
+            ]),
+            # 下面一组是「对机器做什么」—— 操作
+            ("group", "运维工具", [
+                ("tools", "网络工具"),
+                ("sys", "系统信息"),
+                ("files", "文件管理"),
+                ("routes", "路由表"),
+                ("sec", "安全中心"),
+                ("docker", "Docker"),
+                ("web", "Web 服务"),
+                ("db", "数据库"),
+                ("cron", "计划任务"),
+                ("vpn", "隧道客户端证书管理"),
+                ("api", "智能体接入"),
+            ]),
+        ], on_change=self._show, width=176, alias=NAV_ALIAS)
+        # 导航留在最左边。before=workspace 是必须的：workspace 先 pack 了，
+        # 后 pack 的 side="left" 会排到它右边去 —— 导航就跑到终端和助手中间了。
+        self.nav.pack(side="left", fill="y", padx=(U.px(6), 0),
+                      pady=(U.px(2), U.px(8)), before=self.workspace)
+
+        # 各页的内容容器（导航右侧）
+        self.stack = U.wframe(body, "page")
+        self.stack.pack(fill="both", expand=True)
         self.stack.grid_propagate(False)
         self.stack.rowconfigure(0, weight=1)
         self.stack.columnconfigure(0, weight=1)
-        self.paned.add(self.stack, stretch="always", minsize=U.px(620))
 
-        for key, builder in (("conn", self._build_conn),
+        for key, builder in (("hosts", self.build_hosts),
+                             ("proxy", self.build_proxy),
+                             ("cred", self.build_cred),
+                             ("script", self.build_script),
+                             ("log", self.build_log),
                              ("tools", self._build_tools),
                              ("sys", self._build_sys),
                              ("files", self.build_files),
                              ("routes", self.build_routes),
-                             ("fw", self.build_fw),
+                             ("sec", self.build_sec),
                              ("docker", self.build_docker),
                              ("web", self.build_web),
-                             ("ai", self.build_ai),
+                             ("db", self.build_db),
+                             ("cron", self.build_cron),
                              ("vpn", self._build_vpn),
                              ("api", self.build_api)):
             page = U.wframe(self.stack, "page")
@@ -429,13 +549,15 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self.paned.add(self.log_dock, stretch="never", minsize=U.px(320))
         self._mount_log(self.log_dock)
         self.after(180, self._init_sash)
+        self.tabbar.add("hosts", "主机资源", closable=False)
+        self.tabbar.select("hosts")
         # 所有页都 grid 在同一格，后建的在最上层 —— 必须显式选一页。
         # 但命令行 --page 已经选过的话就别覆盖（否则截图/调试永远停在第一页）。
         self.after(20, self._ensure_first_page)
 
     def _ensure_first_page(self) -> None:
         if not getattr(self.nav, "current", None):
-            self.nav.select("conn")
+            self.nav.select("hosts")
 
     def _init_sash(self) -> None:
         """给日志侧边栏一个合理的初始宽度（约 1/3），别一开窗就半屏黑。"""
@@ -526,17 +648,40 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self.status.pack(fill="x")
 
     def _show(self, key: str):
+        key = NAV_ALIAS.get(key, key)
+        # 左侧导航属于「主机资源」页签。人在终端页签时点了导航，要先把工作区切回来，
+        # 否则会变成「导航高亮了但画面还是终端」。
+        tb = getattr(self, "tabbar", None)
+        if tb is not None and tb.current not in ("hosts", ""):
+            tb.select("hosts")
         for k, page in self._pages.items():
             if k == key:
                 page.tkraise()
+        # --no-probe：只画界面、不主动跑探测。截图与打包验收用得上 ——
+        # 那几个探测会去调系统的 reg / schtasks，在某些受限环境里会卡住。
+        if self._no_probe:
+            return
         # 页面懒加载：连上设备后再探测，免得开局就对着本机乱跑
-        if key == "docker" and not self._dk_probed:
+        if key == "hosts" and not self._hosts_ready:
+            self._hosts_ready = True
+            self.after(80, self.host_refresh)
+        elif key == "proxy" and not self._proxy_ready:
+            self._proxy_ready = True
+            self.after(80, self.proxy_refresh)
+        elif key == "cred" and not self._cred_ready:
+            self._cred_ready = True
+            self.after(80, self.cred_refresh)
+        elif key == "script" and not self._script_ready:
+            self._script_ready = True
+            self.after(80, self.script_refresh)
+        elif key == "log" and not self._audit_ready:
+            self._audit_ready = True
+            self.after(80, self.audit_reload)
+        elif key == "docker" and not self._dk_probed:
             self._dk_probed = True
             self.after(200, self.docker_probe)
         elif key == "api":
             self.after(80, self.api_refresh)
-        elif key == "ai":
-            self.after(80, self._ai_ready)
         elif key == "web" and not self._web_probed:
             self._web_probed = True
             self.after(200, self.web_probe)
@@ -548,20 +693,46 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         elif key == "routes" and not self._routes_loaded:
             self._routes_loaded = True
             self.after(200, self.routes_refresh)
-        elif key == "fw" and not self._fw_probed:
-            self._fw_probed = True
-            self.after(200, self.fw_probe)
+        elif key == "sec" and not self._sec_done:
+            self._sec_done = True
+            self.after(200, self.sec_scan)
+        elif key == "db" and not self._db_probed:
+            self._db_probed = True
+            self.after(200, self.db_probe)
+        elif key == "cron" and not self._cron_loaded:
+            self._cron_loaded = True
+            self.after(200, self.cron_load)
 
     # ============================================================ 托盘
     def _refresh_current_page(self) -> None:
         """连上/断开设备后，把当前页的数据按新设备重取一遍。"""
-        key = getattr(self.nav, "current", None)
-        if key == "routes" and self.session:
+        key = NAV_ALIAS.get(getattr(self.nav, "current", None) or "", "")
+        if not key:
+            key = getattr(self.nav, "current", None) or ""
+        if self._no_probe:
+            return
+        if key == "hosts":
+            self.after(120, self.host_refresh)
+        elif key == "proxy":
+            self.after(120, self.proxy_refresh)
+        elif key == "cred":
+            self.after(120, self.cred_refresh)
+        elif key == "script":
+            self.after(120, self.script_refresh)
+        elif key == "log":
+            self.after(120, self.audit_reload)
+        elif key == "routes" and self.session:
             self._routes_loaded = True
             self.after(150, self.routes_refresh)
-        elif key == "fw" and self.session:
-            self._fw_probed = True
-            self.after(150, self.fw_probe)
+        elif key == "sec":
+            self._sec_done = True
+            self.after(150, self.sec_scan)
+        elif key == "db":
+            self._db_probed = True
+            self.after(150, self.db_probe)
+        elif key == "cron":
+            self._cron_loaded = True
+            self.after(150, self.cron_load)
         elif key == "docker":
             self._dk_probed = True
             self.after(150, self.docker_probe)
@@ -570,6 +741,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
             self.after(150, self.web_probe)
         elif key == "files":
             self.after(150, self.files_sync)
+
     def _init_tray(self) -> None:
         try:
             self._tray = Tray(self, APP_NAME, str(ICON_ICO),
@@ -756,6 +928,34 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
                    else f"已复制到剪贴板 · {len(text)} 字", "ok")
         return True
 
+    # ---------------- 操作审计
+    @property
+    def _os_family(self) -> str:
+        """当前按哪套系统方言办事（脚本库要按它挑默认脚本类型）。"""
+        try:
+            return str(self._effective_device().os_family or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _audit(self, event: str, status: str = "ok", detail: str = "",
+               device: str = "", actor: str = "用户") -> None:
+        """记一条操作审计。
+
+        写日志失败绝不能把业务动作带崩（磁盘满、权限不对都可能写不进），
+        但也不吞得无声无息 —— 状态栏提一句，用户知道「这步没留痕」。
+        """
+        try:
+            dev = device
+            if not dev:
+                sess = getattr(self, "session", None)
+                dev = str(getattr(sess, "label", "") or "")
+            self.audit.record(event, status, detail, dev, actor)
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.toast(f"操作日志没写进去：{e}", "warn")
+            except Exception:  # noqa: BLE001
+                pass
+
     def toast(self, text: str, tone: str = "ok", ms: int = 3200) -> None:
         """状态栏上的临时提示（比 messagebox 轻，不打断操作）。"""
         try:
@@ -769,10 +969,10 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
                 pass
         self._toast_job = self.after(ms, lambda: self.status.set_state("就绪"))
 
-    def _toggle_theme(self):
+    def _toggle_theme(self):  # noqa: D401  设置中心里也可以直接切
+
         U.toggle_theme()
         self.configure(bg=U.T.page)
-        self.btn_theme.set_text("深色" if U.T.name == "light" else "浅色")
         self.status.paint_all()
         if self._log_panel:
             self._log_panel.destroy()
@@ -1704,46 +1904,262 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
         self._local_device = DeviceInfo()
         self._after_switch()
 
-    # ============================================================ 终端（默认不打开）
-    def open_terminal(self):
+    # ============================================================ 终端（页签 / 独立窗口）
+    TERM_TAB = "term"
+
+    def _term_live(self):
+        """当前活着的终端：页签优先，其次是拉出去的独立窗口。
+
+        同一个会话只该有一个终端视图 —— 两处同时显示会让「命令打到哪」变糊。
+        """
+        pane = self._term_panes.get(self.TERM_TAB)
+        if pane is not None:
+            try:
+                if pane.winfo_exists():
+                    return pane
+            except tk.TclError:
+                pass
+            self._term_panes.pop(self.TERM_TAB, None)
         w = self._term
         if w is not None:
             try:
                 if w.winfo_exists():
-                    w.deiconify()
-                    w.lift()
-                    w.focus_force()
-                    return
+                    return w
             except tk.TclError:
-                pass
-        from ui.terminal import TerminalWindow
-        self._term = TerminalWindow(self, self)
+                self._term = None
+        return None
+
+    def _term_label(self) -> str:
+        try:
+            d = self.term_describe()
+        except Exception:  # noqa: BLE001
+            d = ""
+        return f"终端 · {d}" if d else "终端"
+
+    def _term_add_tab(self):
+        """在工作区里新建一个终端页签，返回它的 TerminalPane。"""
+        holder = U.wframe(self.workspace, "page")
+        holder.grid(row=0, column=0, sticky="nsew")
+        pane = TerminalPane(holder, self)
+        pane.pack(fill="both", expand=True)
+        self._term_panes[self.TERM_TAB] = pane
+        self.tabbar.add(self.TERM_TAB, self._term_label(), closable=True,
+                        on_popout=self.term_popout)
+        self.tabbar.select(self.TERM_TAB)
+        return pane
+
+    def open_terminal(self):
+        """打开终端。默认嵌成页签 —— 需要双屏时点页签上的 ⧉ 拉出去。"""
+        if self._term_live() is not None:
+            if self.TERM_TAB in self._term_panes:
+                self.tabbar.select(self.TERM_TAB)
+            else:
+                self.term_embed(self._term)      # 独立窗口 → 收回页签
+            self.status.set_state("终端已打开 · 命令跑在当前会话上", "ok")
+            return
+        self._term_add_tab()
         self.status.set_state("终端已打开 · 命令跑在当前会话上", "ok")
 
+    def term_popout(self) -> None:
+        """页签 → 独立窗口。正文与命令历史一起搬过去，不丢上下文。"""
+        pane = self._term_panes.pop(self.TERM_TAB, None)
+        text, hist = "", []
+        if pane is not None:
+            try:
+                text = pane.text.get("1.0", "end-1c")
+                hist = list(pane._hist)
+            except (tk.TclError, AttributeError):
+                pass
+            holder = pane.master
+            try:
+                pane.destroy()
+                holder.destroy()
+            except tk.TclError:
+                pass
+        self.tabbar.remove(self.TERM_TAB)
+        w = TerminalWindow(self, self, title=f"终端 · {self.term_describe()}")
+        self._term = w
+        if text.strip():
+            w.write(text.rstrip("\n") + "\n", "out")
+        if hist:
+            w._hist = hist
+            w._hist_at = len(hist)
+        w.lift()
+        w.focus_force()
+        self.status.set_state("终端已拉出为独立窗口 · 想收回点窗口里的「嵌回」", "ok")
+
+    def term_embed(self, w=None) -> None:
+        """独立窗口 → 页签。"""
+        w = w or self._term
+        text, hist = "", []
+        if w is not None:
+            try:
+                text = w.text.get("1.0", "end-1c")
+                hist = list(w._hist)
+            except (tk.TclError, AttributeError):
+                pass
+        self._term = None
+        if w is not None:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        if self.TERM_TAB in self.tabbar.tabs:
+            self.tabbar.remove(self.TERM_TAB)
+        pane = self._term_add_tab()
+        if text.strip():
+            pane.write(text.rstrip("\n") + "\n", "out")
+        if hist:
+            pane._hist = hist
+            pane._hist_at = len(hist)
+        self.status.set_state("终端已嵌回主界面", "ok")
+
     def term_closed(self, w) -> None:
+        """独立窗口被关掉（点 × 或调 close）。"""
         if self._term is w:
             self._term = None
 
     def _term_refresh_head(self) -> None:
-        w = self._term
-        if w is None:
+        t = self._term_live()
+        if t is None:
             return
         try:
-            if w.winfo_exists():
-                w._refresh_head()
+            t._refresh_head()
         except (tk.TclError, AttributeError):
             pass
+        if self.TERM_TAB in self.tabbar.tabs:
+            self.tabbar.set_label(self.TERM_TAB, self._term_label())
 
     def _term_feed(self, display, rc, out, err, ms) -> None:
-        """tracer 的旁路：终端开着就把同一条命令推过去。"""
-        w = self._term
-        if w is None:
+        """tracer 的旁路：终端开着就把同一条命令推过去。
+
+        助手执行的命令不走这条路 —— 它自己会写一份更完整的（带主机名、
+        执行前就写、输出与 rc 分明），再喂一遍就成了双份。
+        """
+        if self._ai_owns_cmd(display):
+            return
+        t = self._term_live()
+        if t is None:
             return
         try:
-            if w.winfo_exists():
-                w.feed(display, rc, out, err, ms)
+            t.feed(display, rc, out, err, ms)
         except tk.TclError:
             pass
+
+    # ------------------------------------------------------------ AI 活动流
+    # 用户的要求：AI 执行的命令要实时出现在终端里，连调模型的输入输出也要看得见。
+    # 所以这里给助手开了一条专用通道，写进去的行比「主程序命令」更详细：
+    #   AI ⇢ 请求 ／ AI ⇠ 响应 ／ AI ▶ 命令 ／ 输出 ／ AI ■ rc
+    def _ai_owns_cmd(self, display: str) -> bool:
+        """这条命令是不是助手刚发出去的（助手自己已经写过，别重复）。"""
+        key = (display or "").strip()
+        if not key:
+            return False
+        at = self._ai_live_cmds.get(key)
+        if at is None:
+            return False
+        # 同一秒里清理一次，避免这张表越攒越大
+        now = time.monotonic()
+        for k, v in list(self._ai_live_cmds.items()):
+            if now - v > 120:
+                self._ai_live_cmds.pop(k, None)
+        return key in self._ai_live_cmds
+
+    def _ai_mark_cmd(self, cmd: str) -> None:
+        key = (cmd or "").strip()
+        if key:
+            self._ai_live_cmds[key] = time.monotonic()
+
+    def _ai_open_term(self) -> None:
+        """助手要用终端时把它叫出来，并切到那个页签。
+
+        不这么做的话，AI 在后台跑完一串命令，终端里什么都不留 ——
+        用户的原话就是「AI 执行的命令会实时显示在终端」。只在还没终端时
+        才自动开，用户自己关掉的不会被反复弹出（那是下一次点了才开）。
+        """
+        if self._term_live() is None:
+            try:
+                self.open_terminal()
+            except Exception:  # noqa: BLE001
+                return
+        try:
+            if self.TERM_TAB in self._term_panes:
+                self.tabbar.select(self.TERM_TAB)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def ai_trace(self, lines, ensure: bool = False) -> None:
+        """把核心层拼好的 (文本, 标签) 行写进终端。线程安全。
+
+        ensure=True 表示这行很重要（比如 AI 要开始执行命令了），
+        终端没开就先开一个 —— 其余装饰性日志不主动弹窗。
+        """
+        rows = list(lines or [])
+        if not rows:
+            return
+
+        def go():
+            try:
+                if ensure:
+                    self._ai_open_term()
+                t = self._term_live()
+                if t is None:
+                    return
+                t.ai_feed(rows)
+            except tk.TclError:
+                pass
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                go()
+            else:
+                self.post(go)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ai_api_trace(self, kind: str, info: dict) -> None:
+        """core.aiops 的引擎回调：模型请求 / 响应各写一段。"""
+        try:
+            if kind == "req":
+                self.ai_trace(aitrace.api_request(
+                    base=info.get("base", ""), model=info.get("model", ""),
+                    messages=info.get("messages"), provider=info.get("provider", "")))
+            elif kind == "resp":
+                self.ai_trace(aitrace.api_response(
+                    ok=bool(info.get("ok")), ms=info.get("ms"),
+                    code=info.get("code", ""), tokens=info.get("tokens"),
+                    text=info.get("text", ""), err=info.get("err", "")))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------ 页签
+    def _on_tab(self, key: str) -> None:
+        if key == "hosts":
+            self.ws_hosts.tkraise()
+            return
+        pane = self._term_panes.get(key)
+        if pane is not None:
+            try:
+                pane.master.tkraise()
+            except tk.TclError:
+                pass
+
+    def _tab_new(self) -> None:
+        """页签栏的「+」：开一个终端。"""
+        self.open_terminal()
+
+    def _tab_close(self, key: str) -> None:
+        """页签关闭回调。返回 False 表示拒绝关闭。"""
+        if key == self.TERM_TAB:
+            pane = self._term_panes.pop(key, None)
+            if pane is not None:
+                holder = pane.master
+                try:
+                    pane.destroy()
+                    holder.destroy()
+                except tk.TclError:
+                    pass
+        return None
 
     # ---- 终端要的四个接口
     def term_ready(self) -> bool:
@@ -2565,7 +2981,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
                 ok, text = self.lock.clear_password(old_password=old)
                 if not ok:
                     return msg.configure(text=text)
-                self.btn_lock.set_text(self._lock_btn_text())
+                self._settings_sync()
                 self.toast(text, "ok")
                 dlg.destroy()
                 return
@@ -2574,7 +2990,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, AiPage, ApiPag
                 remember=v_rem.get(), old_password=old)
             if not ok:
                 return msg.configure(text=text)
-            self.btn_lock.set_text(self._lock_btn_text())
+            self._settings_sync()
             self.toast(text, "ok")
             dlg.destroy()
 
@@ -2611,8 +3027,14 @@ def main():
     app = ToolboxApp()
     if "--page" in sys.argv:
         i = sys.argv.index("--page")
-        if i + 1 < len(sys.argv) and sys.argv[i + 1] in app._pages:
-            app.nav.select(sys.argv[i + 1])
+        if i + 1 < len(sys.argv):
+            want = NAV_ALIAS.get(sys.argv[i + 1], sys.argv[i + 1])
+            if want == "ai":
+                # 助手已经不占选项卡了，但 --page ai 还得能用
+                app.after(200, app.ai_dock_open)
+                want = "conn"
+            if want in app._pages:
+                app.nav.select(want)
     if "--smoke" in sys.argv:
         app.after(1500, app.destroy)
     app.mainloop()

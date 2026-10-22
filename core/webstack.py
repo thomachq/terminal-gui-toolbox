@@ -986,3 +986,434 @@ def expiring(certs: list[dict], days: int = 30) -> list[dict]:
     """从 cert_report 的结果里挑出快到期的。"""
     return [c for c in certs if c.get("ok") and not c.get("expired")
             and int(c.get("days_left") or 0) <= days]
+
+
+# ================================================================== 站点与域名
+# 一个 Web 服务下面通常挂着好几个站点（nginx 的 server 块 / Apache 的
+# VirtualHost）。宝塔把它们做成列表 + 域名绑定，这里照做，但**不假设**
+# 配置文件的组织方式：nginx 用 `nginx -T` 把全部有效配置连同文件名一起吐出来，
+# 文件名就在 `# configuration file xxx:` 这行标记里 —— 这是唯一可靠的信息源，
+# 靠猜 include 路径迟早猜错。
+
+_NGINX_MARK = re.compile(r"^#\s*configuration file\s+(.+?):\s*$")
+
+
+@dataclass
+class Site:
+    """一个站点（nginx server 块 / Apache VirtualHost / IIS site）。"""
+
+    kind: str
+    file: str
+    index: int              # 在该文件里的第几个块（0 起）
+    names: list[str] = field(default_factory=list)
+    listen: list[str] = field(default_factory=list)
+    root: str = ""
+    ssl: str = ""
+    line: int = 0
+    note: str = ""
+
+    @property
+    def primary(self) -> str:
+        return self.names[0] if self.names else "（未命名）"
+
+    def as_row(self) -> dict:
+        tone = "warn" if not self.names else ("ok" if self.ssl else "brand")
+        return {
+            "name": self.primary,
+            "aliases": ", ".join(self.names[1:]) or "—",
+            "listen": ", ".join(self.listen) or "—",
+            "root": self.root or "—",
+            "ssl": "有" if self.ssl else "无",
+            "file": self.file,
+            "line": str(self.line or ""),
+            "_tone": tone,
+            "_index": self.index,
+            "_file": self.file,
+            "_kind": self.kind,
+        }
+
+
+def split_config_dump(text: str) -> dict[str, str]:
+    """把 `# configuration file /path:` 分段的输出拆成 {路径: 正文}。
+
+    nginx -T 与我们的 apache 兜底命令都用这个格式，所以一套解析通吃。
+    """
+    files: dict[str, str] = {}
+    cur = ""
+    buf: list[str] = []
+    for raw in (text or "").splitlines():
+        m = _NGINX_MARK.match(raw.rstrip())
+        if m:
+            if cur:
+                files[cur] = "\n".join(buf).strip("\n")
+            cur, buf = m.group(1).strip(), []
+            continue
+        if cur:
+            buf.append(raw)
+    if cur:
+        files[cur] = "\n".join(buf).strip("\n")
+    return files
+
+
+def _strip_comment(line: str) -> str:
+    """去掉引号之外的 `#` 之后的注释，再统计花括号才不会被注释带偏。"""
+    out: list[str] = []
+    quote = ""
+    for ch in line:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+def nginx_server_blocks(text: str) -> list[tuple[int, int]]:
+    """→ [(起始行, 结束行)]，0 起、含首尾。只认 `server {`，不认 location。"""
+    blocks: list[tuple[int, int]] = []
+    stack: list[int] = []
+    lines = (text or "").splitlines()
+    for i, raw in enumerate(lines):
+        body = _strip_comment(raw)
+        for ch in body:
+            if ch == "{":
+                stack.append(i)
+            elif ch == "}" and stack:
+                st = stack.pop()
+                head = lines[st].strip()
+                if re.match(r"^server\b", head):
+                    blocks.append((st, i))
+    return blocks
+
+
+_DIRECTIVE = {
+    "listen": re.compile(r"^\s*listen\s+([^;]+);", re.I),
+    "server_name": re.compile(r"^\s*server_name\s+([^;]+);", re.I),
+    "root": re.compile(r"^\s*root\s+([^;]+);", re.I),
+    "ssl_certificate": re.compile(r"^\s*ssl_certificate\s+([^;]+);", re.I),
+}
+
+
+def parse_nginx_sites(files: dict[str, str]) -> list[Site]:
+    sites: list[Site] = []
+    for path, text in (files or {}).items():
+        blocks = nginx_server_blocks(text)
+        lines = text.splitlines()
+        for idx, (st, en) in enumerate(blocks):
+            body = lines[st:en + 1]
+            got: dict[str, list[str]] = {}
+            for line in body:
+                for key, pat in _DIRECTIVE.items():
+                    m = pat.match(line)
+                    if m:
+                        got.setdefault(key, []).append(m.group(1).strip())
+            names = " ".join(got.get("server_name", [])).split()
+            sites.append(Site(
+                kind="nginx", file=path, index=idx,
+                names=[n for n in names if n != "_"],
+                listen=got.get("listen", []),
+                root=(got.get("root") or [""])[0],
+                ssl=(got.get("ssl_certificate") or [""])[0],
+                line=st + 1))
+    return sites
+
+
+def set_nginx_names(text: str, index: int, names: list[str]) -> str:
+    """改写第 index 个 server 块的 server_name。没有这一行就补一行。"""
+    blocks = nginx_server_blocks(text)
+    if index < 0 or index >= len(blocks):
+        raise ValueError(f"这个文件里没有第 {index + 1} 个 server 块")
+    st, en = blocks[index]
+    lines = (text or "").splitlines()
+    new = " ".join(n for n in names if n) or "_"
+    for i in range(st, min(en, len(lines) - 1) + 1):
+        m = _DIRECTIVE["server_name"].match(lines[i])
+        if m:
+            indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+            lines[i] = f"{indent}server_name {new};"
+            return _join_like(text, lines)
+    head_indent = lines[st][:len(lines[st]) - len(lines[st].lstrip())]
+    lines.insert(st + 1, f"{head_indent}    server_name {new};")
+    return _join_like(text, lines)
+
+
+def _join_like(original: str, lines: list[str]) -> str:
+    body = "\n".join(lines)
+    return body + ("\n" if (original or "").endswith("\n") else "")
+
+
+_VHOST_OPEN = re.compile(r"^\s*<VirtualHost\s+([^>]+)>", re.I)
+_VHOST_CLOSE = re.compile(r"^\s*</VirtualHost>", re.I)
+_APACHE_NAME = re.compile(r"^\s*ServerName\s+(\S+)", re.I)
+_APACHE_ALIAS = re.compile(r"^\s*ServerAlias\s+([^#]+)", re.I)
+_APACHE_ROOT = re.compile(r"^\s*DocumentRoot\s+\"?([^\"\s]+)\"?", re.I)
+
+
+def apache_vhost_blocks(text: str) -> list[tuple[int, int]]:
+    blocks: list[tuple[int, int]] = []
+    start = -1
+    for i, raw in enumerate((text or "").splitlines()):
+        if _VHOST_OPEN.match(raw):
+            start = i
+        elif _VHOST_CLOSE.match(raw) and start >= 0:
+            blocks.append((start, i))
+            start = -1
+    return blocks
+
+
+def parse_apache_sites(files: dict[str, str]) -> list[Site]:
+    sites: list[Site] = []
+    for path, text in (files or {}).items():
+        lines = text.splitlines()
+        for idx, (st, en) in enumerate(apache_vhost_blocks(text)):
+            listen = _VHOST_OPEN.match(lines[st])
+            name, alias, root = "", [], ""
+            for line in lines[st:en + 1]:
+                if not name:
+                    m = _APACHE_NAME.match(line)
+                    if m:
+                        name = m.group(1)
+                        continue
+                m = _APACHE_ALIAS.match(line)
+                if m:
+                    alias += m.group(1).split()
+                    continue
+                m = _APACHE_ROOT.match(line)
+                if m and not root:
+                    root = m.group(1)
+            names = ([name] if name else []) + alias
+            sites.append(Site(
+                kind="apache", file=path, index=idx,
+                names=names, listen=[listen.group(1).strip()] if listen else [],
+                root=root, line=st + 1))
+    return sites
+
+
+def set_apache_names(text: str, index: int, names: list[str]) -> str:
+    """ServerName 取第一个域名，其余进 ServerAlias。"""
+    blocks = apache_vhost_blocks(text)
+    if index < 0 or index >= len(blocks):
+        raise ValueError(f"这个文件里没有第 {index + 1} 个 VirtualHost")
+    st, en = blocks[index]
+    lines = (text or "").splitlines()
+    names = [n for n in names if n]
+    if not names:
+        raise ValueError("域名不能为空")
+    main, alias = names[0], names[1:]
+    has_main = has_alias = False
+    for i in range(st, min(en, len(lines) - 1) + 1):
+        if _APACHE_NAME.match(lines[i]):
+            indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+            lines[i] = f"{indent}ServerName {main}"
+            has_main = True
+        elif _APACHE_ALIAS.match(lines[i]):
+            indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+            lines[i] = (f"{indent}ServerAlias {' '.join(alias)}" if alias
+                        else f"# {indent}ServerAlias")
+            has_alias = True
+    if not has_main:
+        indent = lines[st][:len(lines[st]) - len(lines[st].lstrip())] + "    "
+        lines.insert(st + 1, f"{indent}ServerName {main}")
+        en += 1
+    if alias and not has_alias:
+        indent = lines[st][:len(lines[st]) - len(lines[st].lstrip())] + "    "
+        lines.insert(st + 2, f"{indent}ServerAlias {' '.join(alias)}")
+    return _join_like(text, lines)
+
+
+_IIS_SITE = re.compile(r'SITE\s+"([^"]+)"\s*\((.*?)\)', re.I)
+
+
+def parse_iis_sites(text: str) -> list[Site]:
+    """`appcmd list site` 只是给你看：改绑定的正确入口是 IIS 管理器。"""
+    sites: list[Site] = []
+    for line in (text or "").splitlines():
+        m = _IIS_SITE.search(line)
+        if not m:
+            continue
+        name, meta = m.group(1), m.group(2)
+        bindings = ""
+        bm = re.search(r"bindings:([^,]+)", meta)
+        if bm:
+            bindings = bm.group(1).strip()
+        sites.append(Site(kind="iis", file="", index=len(sites),
+                          names=[name], listen=[bindings] if bindings else [],
+                          note="IIS 绑定请用 IIS 管理器或 netsh 修改"))
+    return sites
+
+
+def site_dump_cmd(kind: str) -> str:
+    """取「全部有效配置 + 文件名」的一条命令。
+
+    统一成 `# configuration file <path>:` 这个格式 —— 这也是 `nginx -T`
+    本来的输出格式，所以解析端只需要一套 split_config_dump()。
+    全部用单引号，免得在 Python 字符串里再套一层转义。
+    """
+    if kind == "nginx":
+        return (
+            'nginx -T 2>/dev/null || ('
+            'for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf '
+            '/etc/nginx/nginx.conf; do '
+            '[ -f "$f" ] && echo "# configuration file $f:" && cat "$f"; '
+            'done)'
+        )
+    if kind == "apache":
+        return (
+            '(for f in /etc/apache2/sites-enabled/* /etc/apache2/conf-enabled/* '
+            '/etc/httpd/conf.d/*.conf; do '
+            '[ -f "$f" ] && echo "# configuration file $f:" && cat "$f"; '
+            'done)'
+        )
+    if kind == "iis":
+        return "appcmd list site"
+    return ""
+
+
+def parse_sites(kind: str, text: str) -> list[Site]:
+    if kind == "iis":
+        return parse_iis_sites(text)
+    files = split_config_dump(text)
+    if kind == "nginx":
+        return parse_nginx_sites(files)
+    if kind == "apache":
+        return parse_apache_sites(files)
+    return []
+
+
+class SiteBinder:
+    """改域名：备份 → 写入 → 配置检查 → 重载，任一步失败就还原。
+
+    和证书部署是同一套路子。不一样的地方是这里写的是**配置文件**，
+    所以「配置检查」比「回读 sha256」更重要 —— 语法错了服务就起不来。
+    """
+
+    def __init__(self, session, site: Site, runner=None):
+        self.session = session
+        self.site = site
+        self.runner = runner or self._default_runner
+        self.steps: list[dict] = []
+
+    def _default_runner(self, cmd: str, admin: bool) -> tuple[int, str, str]:
+        s = self.session
+        if s is None:
+            return 1, "", "尚未连接设备"
+        elev = _need_elevation()
+        try:
+            if admin and hasattr(s, "run_admin"):
+                return s.run_admin(cmd, timeout=60)
+            return s.run(cmd, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            if elev and isinstance(e, elev):
+                raise
+            return 1, "", str(e)
+
+    def _step(self, name: str, cmd: str, admin: bool = True) -> tuple[int, str, str]:
+        rc, out, err = self.runner(cmd, admin)
+        self.steps.append({"name": name, "cmd": cmd, "rc": rc,
+                           "out": (out or "").strip()[:300],
+                           "err": (err or "").strip()[:300]})
+        return rc, out, err
+
+    def _test_cmd(self) -> str:
+        if self.site.kind == "nginx":
+            return "nginx -t 2>&1"
+        return "apache2ctl configtest 2>&1 || httpd -t 2>&1"
+
+    def _reload_cmd(self) -> str:
+        if self.site.kind == "nginx":
+            return "systemctl reload nginx 2>&1 || nginx -s reload 2>&1"
+        return ("systemctl reload apache2 2>&1 || systemctl reload httpd 2>&1 "
+                "|| apache2ctl graceful 2>&1")
+
+    def update(self, names: list[str], reload: bool = True) -> dict:
+        self.steps = []
+        site = self.site
+        if site.kind == "iis":
+            return {"ok": False, "steps": [], "detail": site.note or
+                    "IIS 的绑定不通过配置文件管理"}
+        path = site.file
+        if not path:
+            return {"ok": False, "steps": [], "detail": "不知道站点在哪个文件里"}
+        q = shlex.quote(path)
+        rc, out, _ = self._step("读取", f"cat {q}")
+        if rc != 0 or not out.strip():
+            return {"ok": False, "steps": self.steps,
+                    "detail": f"读不到 {path}（可能需要提权）"}
+        old_text = out
+        try:
+            if site.kind == "nginx":
+                new_text = set_nginx_names(old_text, site.index, names)
+            else:
+                new_text = set_apache_names(old_text, site.index, names)
+        except ValueError as e:
+            return {"ok": False, "steps": self.steps, "detail": str(e)}
+        if new_text == old_text:
+            return {"ok": True, "steps": self.steps,
+                    "detail": "域名没有变化，什么都没写"}
+
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        bak = f"{path}.bak-{ts}"
+        rc, out, _ = self._step("备份", f"cp -a {q} {shlex.quote(bak)}")
+        if rc != 0:
+            return {"ok": False, "steps": self.steps,
+                    "detail": f"备份失败，已中止（不冒险直接改配置）"}
+
+        b64 = base64.b64encode(new_text.encode()).decode()
+        rc, out, err = self._step(
+            "写入", f"printf '%s' {shlex.quote(b64)} | base64 -d > {q}")
+        if rc != 0:
+            self._step("还原", f"cp -a {shlex.quote(bak)} {q}")
+            return {"ok": False, "steps": self.steps,
+                    "detail": f"写入失败：{(err or out).strip()[:200]}"}
+
+        if reload:
+            rc, out, err = self._step("配置检查", self._test_cmd())
+            if rc != 0:
+                self._step("还原", f"cp -a {shlex.quote(bak)} {q}")
+                self._step("重载", self._reload_cmd())
+                return {"ok": False, "steps": self.steps,
+                        "detail": f"配置检查未通过，已还原："
+                                  f"{((err or out) or '').strip()[:240]}"}
+            rc, out, err = self._step("重载", self._reload_cmd())
+            if rc != 0:
+                self._step("还原", f"cp -a {shlex.quote(bak)} {q}")
+                self._step("重载", self._reload_cmd())
+                return {"ok": False, "steps": self.steps,
+                        "detail": f"重载失败，已还原：{((err or out) or '').strip()[:240]}"}
+
+        return {"ok": True, "steps": self.steps, "backup": bak,
+                "detail": f"{path} 已更新（第 {site.index + 1} 个站点），"
+                          f"域名：{' '.join(names)}"}
+
+    def rollback(self) -> dict:
+        """把最近一次 .bak-* 盖回去。"""
+        path = self.site.file
+        if not path:
+            return {"ok": False, "detail": "没有可还原的文件"}
+        q = shlex.quote(path)
+        rc, out, _ = self._step(
+            "找备份", f"ls -1t {q}.bak-* 2>/dev/null | head -1")
+        bak = (out or "").strip().splitlines()[0] if (out or "").strip() else ""
+        if not bak:
+            return {"ok": False, "steps": self.steps, "detail": "没有找到 .bak-* 备份"}
+        rc, out, err = self._step("还原", f"cp -a {shlex.quote(bak)} {q}")
+        if rc != 0:
+            return {"ok": False, "steps": self.steps,
+                    "detail": f"还原失败：{(err or out).strip()[:200]}"}
+        rc, out, err = self._step("重载", self._reload_cmd())
+        return {"ok": rc == 0, "steps": self.steps, "backup": bak,
+                "detail": f"已还原 {bak}" + ("" if rc == 0 else "（重载失败，请手动检查）")}
+
+
+def summarize_sites(sites: list[Site]) -> str:
+    if not sites:
+        return "没有解析到站点"
+    named = sum(1 for s in sites if s.names)
+    return f"{len(sites)} 个站点" + (f"（{named} 个已绑定域名）" if named else "")

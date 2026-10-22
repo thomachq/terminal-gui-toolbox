@@ -354,10 +354,329 @@ class AIConfig:
         model = str(self.data.get("model") or p["model"] or "—")
         return f"{p['label']} · {model} · {base}"
 
+    # ------------------------------------------------------------ 多模型
+    # 扁平字段（provider / base / model / key_enc / temperature）永远是
+    # **当前模型**的镜像。这样引擎、界面、旧配置全都不用改一行；
+    # 切换模型 = 把另一条档案写到这几个字段上。
+    MODEL_FIELDS = ("provider", "base", "model", "temperature", "max_tokens",
+                    "key_enc", "ctx", "note")
+
+    def _model_from_flat(self, name: str = "", mid: str = "") -> dict:
+        p = self.preset()
+        return {
+            "id": mid or new_model_id(),
+            "name": name or f"{p['label']} · {self.data.get('model') or p['model']}",
+            "provider": self.provider,
+            "base": str(self.data.get("base") or p["base"] or ""),
+            "model": str(self.data.get("model") or p["model"] or ""),
+            "temperature": self.data.get("temperature", 0.2),
+            "max_tokens": self.data.get("max_tokens", 1200),
+            "key_enc": str(self.data.get("key_enc") or ""),
+            "ctx": int(self.data.get("ctx") or 0),
+            "note": str(self.data.get("note") or ""),
+            "created": str(int(time.time())),
+        }
+
+    def ensure_models(self) -> list[dict]:
+        """保证 models 里至少有一条。
+
+        老用户的配置只有一份扁平字段 —— 升级后不弹窗、不丢 Key，
+        静默变成「默认模型」这一条，然后照常用。
+        """
+        models = self.data.get("models")
+        if not isinstance(models, list) or not models:
+            models = [self._model_from_flat(name="默认模型")]
+            self.data["models"] = models
+            self.data["active"] = models[0]["id"]
+            self.save()
+            return models
+        clean = [self._clean_model(m) for m in models if isinstance(m, dict)]
+        if not clean:
+            clean = [self._model_from_flat(name="默认模型")]
+            self.data["active"] = clean[0]["id"]
+        if not self.current_id() or self.find_model(self.current_id()) is None:
+            self.data["active"] = clean[0]["id"]
+        self.data["models"] = clean
+        return clean
+
+    @staticmethod
+    def _clean_model(m: dict) -> dict:
+        prov = str(m.get("provider") or DEFAULT_PROVIDER)
+        if prov not in PROVIDERS:
+            prov = DEFAULT_PROVIDER
+        try:
+            temp = max(0.0, min(2.0, float(m.get("temperature", 0.2))))
+        except (TypeError, ValueError):
+            temp = 0.2
+        try:
+            mt = max(64, min(32000, int(m.get("max_tokens") or 1200)))
+        except (TypeError, ValueError):
+            mt = 1200
+        try:
+            ctx = max(0, int(m.get("ctx") or 0))
+        except (TypeError, ValueError):
+            ctx = 0
+        return {
+            "id": str(m.get("id") or new_model_id()),
+            "name": str(m.get("name") or "").strip() or "未命名模型",
+            "provider": prov,
+            "base": str(m.get("base") or "").strip(),
+            "model": str(m.get("model") or "").strip(),
+            "temperature": temp,
+            "max_tokens": mt,
+            "key_enc": str(m.get("key_enc") or ""),
+            "ctx": ctx,
+            "note": str(m.get("note") or ""),
+            "created": str(m.get("created") or int(time.time())),
+        }
+
+    def models(self) -> list[dict]:
+        return self.ensure_models()
+
+    def find_model(self, mid: str) -> dict | None:
+        # 直接读原始列表，不走 ensure_models —— 后者要靠 find_model 判活跃项，
+        # 互相调用会直接爆栈。
+        models = self.data.get("models")
+        if not isinstance(models, list):
+            return None
+        for m in models:
+            if isinstance(m, dict) and m.get("id") == mid:
+                return m
+        return None
+
+    def current_id(self) -> str:
+        return str(self.data.get("active") or "")
+
+    def current(self) -> dict:
+        m = self.find_model(self.current_id())
+        if m is None:
+            m = self.models()[0]
+            self.data["active"] = m["id"]
+        return m
+
+    def set_active(self, mid: str) -> bool:
+        """切当前模型：把它写到扁平字段上，然后启用引擎重读。"""
+        m = self.find_model(mid)
+        if m is None:
+            return False
+        self.data["active"] = m["id"]
+        for k in self.MODEL_FIELDS:
+            if k == "provider":
+                self.data["provider"] = (m["provider"]
+                                         if m["provider"] in PROVIDERS
+                                         else DEFAULT_PROVIDER)
+            elif k in m:
+                self.data[k] = m[k]
+        self.data["base"] = (m.get("base")
+                             or PROVIDERS[self.provider]["base"])
+        self.data["model"] = (m.get("model")
+                              or PROVIDERS[self.provider]["model"])
+        self.save()
+        return True
+
+    def upsert_model(self, rec: dict) -> dict:
+        m = self._clean_model(rec)
+        models = self.models()
+        for i, old in enumerate(models):
+            if old.get("id") == m["id"]:
+                models[i] = m
+                break
+        else:
+            models.append(m)
+        self.data["models"] = models
+        self.save()
+        # 改的正好是当前模型 → 立刻生效，不用用户再点一次「设为当前」
+        if self.current_id() == m["id"]:
+            self.set_active(m["id"])
+        return m
+
+    def remove_model(self, mid: str) -> tuple[bool, str]:
+        """删模型。最后一条删不掉 —— 删空了助手就没模型可用了。"""
+        models = self.models()
+        if len(models) <= 1:
+            return False, "至少要留一个模型"
+        keep = [m for m in models if m.get("id") != mid]
+        if len(keep) == len(models):
+            return False, "没找到这个模型"
+        self.data["models"] = keep
+        if self.current_id() == mid:
+            self.data["active"] = keep[0]["id"]
+            self.save()
+            self.set_active(keep[0]["id"])
+        else:
+            self.save()
+        return True, ""
+
+    def model_key(self, mid: str = "") -> str:
+        """取某条模型的口令（默认当前）。解不开返回空串。"""
+        rec = self.find_model(mid) if mid else self.current()
+        enc = str((rec or {}).get("key_enc") or "")
+        if not enc or crypto_store is None:
+            return ""
+        try:
+            return crypto_store.unprotect(enc) or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def seal_key(plain: str) -> str:
+        if not plain:
+            return ""
+        if crypto_store is None:
+            return plain
+        try:
+            return crypto_store.protect(plain) or ""
+        except Exception:  # noqa: BLE001
+            return plain
+
+    def set_model_key(self, mid: str, plain: str) -> None:
+        m = self.find_model(mid)
+        if m is None:
+            return
+        m["key_enc"] = self.seal_key(plain)
+        self.upsert_model(m)
+
+
+def new_model_id() -> str:
+    import secrets as _s
+    return "m" + _s.token_hex(3)
+
+
+def probe_model(rec: dict, timeout: int = 20) -> tuple[bool, str]:
+    """试连一条模型配置。返回 (能不能用, 一句人话)。
+
+    这是「填完怎么知道对不对」的唯一答案 —— 不然用户只能发一句话看它报不报错。
+    """
+    rec = rec or {}
+    prov = str(rec.get("provider") or DEFAULT_PROVIDER)
+    preset = PROVIDERS.get(prov) or PROVIDERS[DEFAULT_PROVIDER]
+    if preset.get("kind") == "dsh":
+        exe = find_dsh()
+        if exe:
+            return True, f"找到 Harness：{exe}"
+        return False, "没找到 dsh，可设 DSH_CLI 指向 dsh.cmd"
+    base = str(rec.get("base") or preset["base"] or "").rstrip("/")
+    model = str(rec.get("model") or preset["model"] or "")
+    if not base:
+        return False, "还没填接口地址"
+    if not model:
+        return False, "还没填模型名"
+    key = ""
+    enc = str(rec.get("key_enc") or "")
+    if enc and crypto_store is not None:
+        try:
+            key = crypto_store.unprotect(enc) or ""
+        except Exception:  # noqa: BLE001
+            key = ""
+    if preset.get("need_key") and not key:
+        return False, "这条没有 API Key"
+    if not base.endswith("/v1") and "/v1" not in base:
+        base += "/v1"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0,
+        "max_tokens": 8,
+        "stream": False,
+    }
+    headers = {"Accept": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        data = _post_json(base + "/chat/completions", payload, headers,
+                          max(8, int(timeout)))
+    except AIError as e:
+        return False, str(e)
+    except Exception as e:  # noqa: BLE001
+        return False, f"请求失败：{e}"
+    try:
+        text = (data["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return False, f"返回格式不认识：{str(data)[:160]}"
+    return True, text[:60] or "(连通，返回空文本)"
+
+
+def model_view(m: dict, active_id: str) -> dict:
+    """模型管理表的一行。"""
+    m = m or {}
+    prov = str(m.get("provider") or "")
+    preset = PROVIDERS.get(prov) or {}
+    has_key = bool(m.get("key_enc"))
+    need = bool(preset.get("need_key"))
+    if prov == "dsh":
+        ok = bool(find_dsh())
+        state = "可用" if ok else "缺 Harness"
+        tone = "ok" if ok else "err"
+    elif need and not has_key:
+        state, tone = "缺 Key", "warn"
+    else:
+        state, tone = "就绪", "ok"
+    base = str(m.get("base") or preset.get("base") or "—")
+    return {
+        "name": str(m.get("name") or "未命名模型"),
+        "provider": preset.get("label") or prov or "—",
+        "provider_key": prov,
+        "model": str(m.get("model") or preset.get("model") or "—"),
+        "base": base,
+        "ctx": f"{int(m.get('ctx') or 0):,}" if m.get("ctx") else "默认",
+        "temp": f"{float(m.get('temperature') or 0):g}",
+        "key": "已存" if has_key else ("不需要" if not need else "未填"),
+        "state": state,
+        "tone": tone,
+        "active": str(m.get("id") or "") == active_id,
+        "current": "● 当前" if str(m.get("id") or "") == active_id else "",
+        "note": str(m.get("note") or ""),
+        "created": fmt_ts(m.get("created")),
+        "_id": str(m.get("id") or ""),
+        "_raw": m,
+    }
+
+
+def fmt_ts(v) -> str:
+    try:
+        ts = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    try:
+        return time.strftime("%Y/%m/%d %H:%M", time.localtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return ""
+
 
 # ------------------------------------------------------------------ 引擎
 class AIError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------- 模型调用活动上报
+# 用户要求「即使只是调 API，终端里也要看得到输入了什么、输出了什么」。
+# 引擎是唯一知道请求全文与响应全文的地方，所以钩子挂在这里，而不是界面层。
+# 界面注册一个回调，把 (kind, info) 渲染成几行字写进终端；测试则注册一个
+# 收集器，直接断言请求内容 —— 两边共用同一条通道。
+_TRACE = None      # fn(kind: str, info: dict) -> None
+_TRACE_ON = True
+
+
+def set_trace(fn) -> None:
+    """注册活动回调。传 None 取消。"""
+    global _TRACE
+    _TRACE = fn
+
+
+def trace_enabled() -> bool:
+    return bool(_TRACE) and _TRACE_ON
+
+
+def _trace(kind: str, info: dict) -> None:
+    if not _TRACE or not _TRACE_ON:
+        return
+    try:
+        _TRACE(kind, info)
+    except Exception:  # noqa: BLE001
+        # 上报是旁路，不能因为它把一次正常的模型调用带崩
+        pass
 
 
 def _post_json(url: str, payload: dict, headers: dict, timeout: int) -> dict:
@@ -411,13 +730,25 @@ class OpenAIEngine:
         headers = {"Accept": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
-        data = _post_json(base + "/chat/completions", payload, headers,
-                          int(self.cfg.data.get("timeout") or 90))
+        _trace("req", {"base": base, "model": model, "messages": messages,
+                       "provider": str(self.cfg.data.get("provider") or "")})
+        t0 = time.time()
+        try:
+            data = _post_json(base + "/chat/completions", payload, headers,
+                              int(self.cfg.data.get("timeout") or 90))
+        except AIError as e:
+            _trace("resp", {"ok": False, "ms": int((time.time() - t0) * 1000),
+                            "err": str(e)})
+            raise
         try:
             text = data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as e:
+            _trace("resp", {"ok": False, "ms": int((time.time() - t0) * 1000),
+                            "err": f"返回格式不认识：{str(data)[:200]}"})
             raise AIError(f"返回格式不认识：{str(data)[:200]}") from e
         usage = data.get("usage") or {}
+        _trace("resp", {"ok": True, "ms": int((time.time() - t0) * 1000),
+                        "code": 200, "tokens": usage, "text": text})
         return text, {"prompt": usage.get("prompt_tokens"),
                       "completion": usage.get("completion_tokens"),
                       "total": usage.get("total_tokens"),
@@ -463,10 +794,14 @@ class DshEngine:
         else:
             cmd = [exe] + args
         t0 = time.time()
+        _trace("req", {"base": "dsh --profile headless", "model": "dsh-headless",
+                       "messages": messages, "provider": "DeepSeek Harness"})
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
                                encoding="utf-8", errors="replace")
         except subprocess.TimeoutExpired as e:
+            _trace("resp", {"ok": False, "ms": int((time.time() - t0) * 1000),
+                            "err": "dsh 运行超时（300 秒）"})
             raise AIError("dsh 运行超时（300 秒）") from e
         out = p.stdout or ""
         text = ""
@@ -483,10 +818,17 @@ class DshEngine:
             elif ev.get("type") == "turn_end":
                 err = ((ev.get("reason") or {}).get("error") or {})
                 if err.get("message"):
+                    _trace("resp", {"ok": False,
+                                    "ms": int((time.time() - t0) * 1000),
+                                    "err": "dsh：" + str(err["message"])[:300]})
                     raise AIError("dsh：" + str(err["message"])[:300])
         if not text:
             tail = (p.stderr or out)[-300:]
+            _trace("resp", {"ok": False, "ms": int((time.time() - t0) * 1000),
+                            "err": f"dsh 没有返回内容：{tail.strip()}"})
             raise AIError(f"dsh 没有返回内容：{tail.strip()}")
+        _trace("resp", {"ok": True, "ms": int((time.time() - t0) * 1000),
+                        "code": "dsh", "tokens": {}, "text": text})
         return text, {"prompt": None, "completion": len(text) // 3,
                       "total": len(text) // 3, "model": "dsh-headless",
                       "elapsed": round(time.time() - t0, 1)}
