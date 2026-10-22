@@ -34,11 +34,12 @@ hidden = [
     'core.detect', 'core.session', 'core.telnet_session', 'core.metrics',
     'core.cli_channel', 'core.ssh_shell',
     'core.parsers', 'core.routes', 'core.firewall', 'core.docker',
-    'core.files', 'core.redact',
+    'core.files', 'core.redact', 'core.webstack',
     'ui.statusbar', 'ui.logpanel', 'ui.table', 'ui.forms',
     'ui.icon', 'ui.tray', 'ui.terminal',
     'pages.routes_page', 'pages.firewall_page',
     'pages.docker_page', 'pages.files_page', 'pages.api_page',
+    'pages.web_page',
     # 给 AI 智能体的本地 HTTP API
     'api.pool', 'api.server',
     'wbtui',

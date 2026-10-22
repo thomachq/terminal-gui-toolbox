@@ -47,6 +47,7 @@ from pages.docker_page import DockerPage
 from pages.files_page import FilesPage
 from pages.firewall_page import FirewallPage
 from pages.routes_page import RoutesPage
+from pages.web_page import WebPage
 from profiles import ProfileStore, discover_keys, inspect_key, norm_path
 from ui import forms
 from ui.icon import apply_icon, set_app_id
@@ -140,7 +141,8 @@ TOOL_COLS = {
 }
 
 
-class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk):
+class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage,
+                 WebPage, tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
@@ -175,6 +177,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self._tray: Tray | None = None
         self._close_to_tray = True
         self._dk_probed = False
+        self._web_probed = False
         self._routes_loaded = False
         self._fw_probed = False
         self._api_inited = False
@@ -251,6 +254,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             ("routes", "路由表"),
             ("fw", "防火墙"),
             ("docker", "Docker"),
+            ("web", "Web 服务"),
             ("vpn", "隧道客户端证书管理"),
             ("api", "智能体接入"),
         ], on_change=self._show, width=176)
@@ -276,6 +280,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
                              ("routes", self.build_routes),
                              ("fw", self.build_fw),
                              ("docker", self.build_docker),
+                             ("web", self.build_web),
                              ("vpn", self._build_vpn),
                              ("api", self.build_api)):
             page = U.wframe(self.stack, "page")
@@ -394,6 +399,9 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             self.after(200, self.docker_probe)
         elif key == "api":
             self.after(80, self.api_refresh)
+        elif key == "web" and not self._web_probed:
+            self._web_probed = True
+            self.after(200, self.web_probe)
         elif key == "files":
             self.after(120, self.files_sync)
         elif key == "vpn":
@@ -419,6 +427,9 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         elif key == "docker":
             self._dk_probed = True
             self.after(150, self.docker_probe)
+        elif key == "web":
+            self._web_probed = True
+            self.after(150, self.web_probe)
         elif key == "files":
             self.after(150, self.files_sync)
     def _init_tray(self) -> None:
@@ -1495,6 +1506,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
             self._routes_loaded = False
             self._fw_probed = False
             self._dk_probed = False
+            self._web_probed = False
             self.fw_backend = None
             self._log_raw("meta", f"[设备] {dev.os_name or dev.os_family} · "
                                   f"{dev.kernel or ''} · {dev.arch or ''}\n")
@@ -1533,6 +1545,7 @@ class ToolboxApp(RoutesPage, FirewallPage, DockerPage, FilesPage, ApiPage, tk.Tk
         self._routes_loaded = False
         self._fw_probed = False
         self._dk_probed = False
+        self._web_probed = False
         self.fw_backend = None
         self.status.clear()
         self.pill_dev.set("未连接", "mute")
