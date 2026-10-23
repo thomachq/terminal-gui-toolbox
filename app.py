@@ -68,7 +68,7 @@ from pages.web_page import WebPage
 from profiles import ProfileStore, discover_keys, inspect_key, norm_path
 from ui import forms
 from ui.icon import apply_icon, set_app_id
-from ui.logpanel import LogModel, LogPanel
+from ui.logpanel import LogModel
 from ui.statusbar import StatusBar
 from ui.table import KVGrid, Column, DataTable, Segmented
 from ui.tabs import TabBar
@@ -103,7 +103,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.5"
+APP_VER = "1.0.6"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -186,9 +186,6 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.log_model = LogModel()
         self.q: queue.Queue = queue.Queue()
         self._pages: dict[str, tk.Frame] = {}
-        self._log_panel: LogPanel | None = None
-        self._log_win: tk.Toplevel | None = None
-        self._log_visible = True
         self._keypw_job = None
         self._lock_overlay = None
         self._last_active = time.time()
@@ -481,12 +478,16 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
         self.ws_hosts = U.wframe(self.workspace, "page")
         self.ws_hosts.grid(row=0, column=0, sticky="nsew")
+        # 现在最上层的是哪块工作区。Tk 没有公开的 z 序查询接口，而
+        # winfo_containing 在 Windows 上走 WindowFromPoint —— 窗口被别的程序
+        # 盖住就返回 None，拿它做判断会时灵时不灵。所以在唯一抬窗的地方记一份。
+        self._ws_top = self.ws_hosts
 
-        body = U.wframe(self.ws_hosts, "page")
-        body.pack(fill="both", expand=True, padx=U.px(10))
-        body.pack_propagate(False)
-
-        self.nav = U.Nav(self.main, [
+        # 左侧二级导航是「主机资源」这个页签自己的东西，不是窗口的东西。
+        # 挂在这里，切到设置 / 终端页签时它会跟着整页一起被盖住 ——
+        # 宝塔终端就是这样：每个页签自带宽窄不一的侧栏，而不是全局一条导航。
+        # （之前挂在 self.main 上，导致「设置」页左边还杵着主机管理的菜单。）
+        self.nav = U.Nav(self.ws_hosts, [
             # 上面一组是「有哪些机器、凭什么登、跑什么脚本」—— 资产。
             # 组名留空：顶部页签已经叫「主机资源」了，这里不再重复。
             ("group", "", [
@@ -494,7 +495,6 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 ("proxy", "代理池"),
                 ("cred", "凭证管理"),
                 ("script", "脚本库"),
-                ("log", "日志管理"),
             ]),
             # 下面一组是「对机器做什么」—— 操作
             ("group", "运维工具", [
@@ -510,11 +510,20 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 ("vpn", "隧道客户端证书管理"),
                 ("api", "智能体接入"),
             ]),
+            # 日志管理单独放最底下（用户要求）：它是「事后回看」的地方，
+            # 不该混在「对机器做什么」的工具列表里，翻起来也更顺手。
+            ("group", "审计", [
+                ("log", "日志管理"),
+            ]),
         ], on_change=self._show, width=176, alias=NAV_ALIAS)
-        # 导航留在最左边。before=workspace 是必须的：workspace 先 pack 了，
-        # 后 pack 的 side="left" 会排到它右边去 —— 导航就跑到终端和助手中间了。
+        # 先 pack 导航、再 pack 内容：两个都是 side="left"，后来的会排在右边。
+        # 顺序反了导航就跑到页面中间去了。
         self.nav.pack(side="left", fill="y", padx=(U.px(6), 0),
-                      pady=(U.px(2), U.px(8)), before=self.workspace)
+                      pady=(U.px(2), U.px(8)))
+
+        body = U.wframe(self.ws_hosts, "page")
+        body.pack(side="left", fill="both", expand=True, padx=U.px(10))
+        body.pack_propagate(False)
 
         # 各页的内容容器（导航右侧）
         self.stack = U.wframe(body, "page")
@@ -544,11 +553,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             self._pages[key] = page
             builder(page)
 
-        # 日志 dock
-        self.log_dock = U.wframe(self.paned, "page")
-        self.paned.add(self.log_dock, stretch="never", minsize=U.px(320))
-        self._mount_log(self.log_dock)
-        self.after(180, self._init_sash)
+        # 右侧「命令日志」面板已撤（v1.0.6）：它和「日志管理」页记的是同一件事，
+        # 两份记录只会让人纠结去哪查。命令与输出现在统一进「日志管理」，
+        # 并且在那里做了口令脱敏。右边这一栏现在只留给智能运维助手。
         self.tabbar.add("hosts", "主机资源", closable=False)
         self.tabbar.select("hosts")
         # 所有页都 grid 在同一格，后建的在最上层 —— 必须显式选一页。
@@ -559,92 +566,10 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         if not getattr(self.nav, "current", None):
             self.nav.select("hosts")
 
-    def _init_sash(self) -> None:
-        """给日志侧边栏一个合理的初始宽度（约 1/3），别一开窗就半屏黑。"""
-        try:
-            total = self.paned.winfo_width()
-            if total > U.px(700):
-                self.paned.sash_place(0, int(total * 0.64), 0)
-        except tk.TclError:
-            pass
-
-    def _mount_log(self, parent) -> None:
-        if self._log_panel is not None:
-            self._log_panel.destroy()
-        self._log_panel = LogPanel(
-            parent, self.log_model, floating=(parent is not self.log_dock),
-            on_float=self._float_log, on_dock=self._dock_log)
-        self._log_panel.pack(fill="both", expand=True)
-
-    def _float_log(self) -> None:
-        """分离成独立窗口，可拖到第二块屏。"""
-        if self._log_win is not None:
-            return
-        win = tk.Toplevel(self)
-        win.title("命令日志 — Terminal GUI Toolbox")
-        win.geometry(f"{U.px(760)}x{U.px(460)}+{U.px(120)}+{U.px(120)}")
-        win.configure(bg=U.T.card)
-        self._log_win = win
-        self._log_panel.destroy()
-        self._log_panel = LogPanel(win, self.log_model, floating=True,
-                                   on_dock=self._dock_log,
-                                   on_close=self._dock_log)
-        self._log_panel.pack(fill="both", expand=True)
-        win.protocol("WM_DELETE_WINDOW", self._dock_log)
-        # 分离后把 dock 从分隔器里拿掉，内容区自动占满
-        try:
-            self.paned.forget(self.log_dock)
-        except tk.TclError:
-            pass
-        self._log_visible = False
-        self.status.set_state("日志已分离为独立窗口", "ok")
-
-    def _docked(self) -> bool:
-        """日志侧边栏当前是否停在分隔器里。
-
-        注意：`PanedWindow.panes()` 在 Tk 8.6 返回字符串路径，在 Tk 9 返回
-        `Tcl_Obj`，`str(pane) in panes()` 在 9 上恒为 False —— 必须两边都转字符串。
-        """
-        try:
-            return str(self.log_dock) in [str(p) for p in self.paned.panes()]
-        except tk.TclError:
-            return False
-
-    def _dock_log(self) -> None:
-        if self._log_win is not None:
-            try:
-                self._log_win.destroy()
-            except tk.TclError:
-                pass
-            self._log_win = None
-        if not self._docked():
-            self.paned.add(self.log_dock, stretch="never", minsize=U.px(320))
-        self._log_visible = True
-        self._mount_log(self.log_dock)
-        self.status.set_state("日志已归位", "ok")
-
-    def _toggle_log(self, show: bool | None = None) -> None:
-        want = (not self._log_visible) if show is None else show
-        if want:
-            if self._log_win is None and not self._docked():
-                self.paned.add(self.log_dock, stretch="never", minsize=U.px(320))
-                self._mount_log(self.log_dock)
-            self._log_visible = True
-        else:
-            if self._log_win is None and self._docked():
-                try:
-                    self.paned.forget(self.log_dock)
-                except tk.TclError:
-                    pass
-            self._log_visible = False
-        self.status.set_state("日志已展开" if want else "日志已折叠")
-
     def _statusbar(self):
         bar = U.wframe(self, "page")
         bar.pack(fill="x", padx=U.px(10), pady=(0, U.px(8)))
-        self.status = StatusBar(bar, on_fold=lambda: self._toggle_log(False),
-                                on_unfold=lambda: self._toggle_log(True),
-                                on_disconnect=self._disconnect)
+        self.status = StatusBar(bar, on_disconnect=self._disconnect)
         self.status.pack(fill="x")
 
     def _show(self, key: str):
@@ -974,9 +899,6 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         U.toggle_theme()
         self.configure(bg=U.T.page)
         self.status.paint_all()
-        if self._log_panel:
-            self._log_panel.destroy()
-            self._mount_log(self._log_win or self.log_dock)
 
     # ============================================================ 线程与队列
     def post(self, fn, *a):
@@ -1094,21 +1016,55 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         return redact.scrub(text)
 
     def _log_raw(self, kind: str, text: str) -> None:
+        """留一份内存流水（诊断、导出时用）。
+
+        界面上不再有第二份「命令日志」面板 —— 能查的地方只有「日志管理」，
+        两边都摆一份只会让人纠结去哪看。这里只是留底。
+        """
         self.log_model.add(kind, text)
-        if self._log_panel:
-            self._log_panel.append(kind, text)
+
+    def _audit_command(self, cmd: str, rc: int, out: str, err: str,
+                       ms: int) -> None:
+        """把一条命令执行记进操作审计（「日志管理」页读的就是它）。
+
+        用户的要求是「日志里能看到执行了什么命令、输出了什么」，同时
+        「涉及输入密码、口令的不要显示」。所以这里三件事必须做：
+
+          1. 命令过 scrub_cmd：sshpass -p、mysql -pXXX、curl -u 用户:口令、
+             URL 内嵌凭据、echo 口令 | sudo -S 全都打成 ******；
+          2. 输出过 scrub：私钥正文整块换成一行说明，内容不上日志；
+          3. 输出截断到 4000 字：一条几兆的记录会把日志页拖垮，
+             定位问题也用不着那么多。
+        """
+        safe_cmd = redact.scrub_cmd(cmd or "")
+        body = self._scrub(out or "")
+        errs = self._scrub(err or "")
+        detail = f"$ {safe_cmd}\nrc={rc} · {ms} ms"
+        if body.strip():
+            detail += "\n" + body[:4000]
+            if len(body) > 4000:
+                detail += "\n…（输出共 %d 字，已截断）" % len(body)
+        if errs.strip():
+            detail += "\n[stderr] " + errs[:1000]
+        # 状态只能是 ok / fail / warn / info（audit.STATUS 里就这四个，
+        # 传别的会被默默归一成 info —— 失败的命令就看不出来了）
+        self._audit("terminal.command", "fail" if rc != 0 else "ok", detail)
 
     def _trace_cmd(self, display, rc, out, err, ms):
+        cmd = str(display or "")
+
         def render():
             self._log_raw("meta", time.strftime("[%H:%M:%S] "))
             self._log_raw("ok" if rc == 0 else "bad", f"rc={rc}  {ms}ms\n")
-            self._log_raw("cmd", "$ " + redact.scrub_cmd(str(display)) + "\n")
+            self._log_raw("cmd", "$ " + redact.scrub_cmd(cmd) + "\n")
             o, e = self._scrub(out), self._scrub(err)
             if o.strip():
                 self._log_raw("out", o if o.endswith("\n") else o + "\n")
             if e.strip():
                 self._log_raw("bad", e if e.endswith("\n") else e + "\n")
             self._log_raw("meta", "\n")
+            # 落一条操作审计 —— 运维工具跑的每条命令都会出现在「日志管理」里
+            self._audit_command(cmd, rc, out, err, ms)
             # 终端开着就把同一条记录也送过去（终端自己敲的命令会被它标记跳过）
             self._term_feed(display, rc, out, err, ms)
         self.post(render)
@@ -2133,14 +2089,25 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             pass
 
     # ------------------------------------------------------------ 页签
+    def _ws_raise(self, widget) -> None:
+        """把一块工作区抬到最上层，并记下「上面现在是谁」。
+
+        所有切页签都从这里过 —— 记错了就说明真的抬错了。
+        """
+        try:
+            widget.tkraise()
+        except tk.TclError:
+            return
+        self._ws_top = widget
+
     def _on_tab(self, key: str) -> None:
         if key == "hosts":
-            self.ws_hosts.tkraise()
+            self._ws_raise(self.ws_hosts)
             return
         pane = self._tab_pane(key)
         if pane is not None:
             try:
-                pane.master.tkraise()
+                self._ws_raise(pane.master)
             except tk.TclError:
                 pass
 
@@ -3042,7 +3009,7 @@ def main():
             if want == "ai":
                 # 助手已经不占选项卡了，但 --page ai 还得能用
                 app.after(200, app.ai_dock_open)
-                want = "conn"
+                want = "hosts"
             if want in app._pages:
                 app.nav.select(want)
     if "--smoke" in sys.argv:

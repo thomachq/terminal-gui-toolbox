@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-"""日志管理 —— 操作审计流。
+"""日志管理 —— 操作审计流，也是全程序唯一的一份日志。
 
 形态照用户给的图：一行一条事件（标题 + 事件名 + 状态 + 时间），点开看详情，
 底部是「第 x-y 条，共 n 条」加分页。分页放在这里不是好看 —— 审计日志动辄
 上千条，一次全渲染会卡住窗口（Treeview 塞几千行很慢）。
+
+v1.0.6 起，右侧那个「命令日志」面板已撤：两边记的是同一件事，分开只让人
+纠结去哪查。运维工具执行的每条命令（命令原文 + 输出 + rc + 耗时）现在都由
+app._audit_command 落成 `terminal.command` 事件，命令里的口令在落盘前就
+被 core/redact.scrub_cmd 打成 ******，输出里的私钥正文也被整块替换。
 """
 from __future__ import annotations
 
@@ -61,7 +66,8 @@ class LogPage:
             pg, LOG_COLS, height=13,
             search_hint="搜索事件、详情、设备",
             empty_title="还没有操作记录",
-            empty_hint="AI 执行命令、批准审批、写文件、开关终端会话都会记在这里。",
+            empty_hint="运维工具跑的命令与输出、AI 执行的动作、审批、"
+                       "开关终端、增删主机都会记在这里；口令与私钥已打码。",
             on_activate=lambda r: self.audit_detail((r or {}).get("_raw") or {}))
         self.tbl_audit.grid(row=2, column=0, sticky="nsew")
         self.tbl_audit.set_menu([

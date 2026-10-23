@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""打 v1.0.5 的四个交付包。
+"""打 v1.0.6 的四个交付包。
 
 为什么用脚本而不是右键压缩：
   · 排除项（data / .git / build / __pycache__ / *.bak）漏一个就会把 CA 私钥
@@ -19,7 +19,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-VER = "1.0.5"
+VER = "1.0.6"
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "_release" / f"v{VER}"
 STAMP = (2026, 10, 23, 1, 0, 0)
@@ -28,7 +28,7 @@ STAMP = (2026, 10, 23, 1, 0, 0)
 JUNK_DIRS = {"data", "build", "__pycache__", ".git", ".venv", "node_modules",
              "_release", "_test_data", "screenshots_tmp"}
 JUNK_EXT = {".pyc", ".pyo", ".bak", ".log", ".spec.bak", ".tmp", ".dbg"}
-JUNK_PREFIX = ("dbg", "err.txt", "out.txt", "build_log")
+JUNK_PREFIX = ("dbg", "err.txt", "out.txt", "build_log", "_TODO")
 
 
 def skip(rel: Path, keep_git: bool = False) -> bool:

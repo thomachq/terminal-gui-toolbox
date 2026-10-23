@@ -248,8 +248,11 @@ if (dst_dir / "hello.txt").is_file():
         == "hello from local pane\n", "内容一致")
 chk("完成" in a.lbl_fl_prog.cget("text"), "进度条给出完成提示",
     a.lbl_fl_prog.cget("text"))
-chk(any(r["name"].startswith("hello.txt")
-        for r in a._fl_remote_ui["tbl"].all_rows()), "远程栏已自动刷新")
+# _fl_reload 是异步的（后台线程读目录），_fl_busy 变 false 只代表传完了。
+# 直接断言列表必然偶尔踩空 —— 等它自己刷出来，超时才算失败。
+chk(wait_for(a, lambda: any(r["name"].startswith("hello.txt")
+                            for r in a._fl_remote_ui["tbl"].all_rows()), 20),
+    "远程栏已自动刷新")
 
 print("== 9. 未连接时的防守 ==")
 a._fl_remote = None

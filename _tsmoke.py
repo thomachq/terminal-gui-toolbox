@@ -72,7 +72,8 @@ def main() -> int:
 
     # ---------------- 五页
     expected = {
-        "conn": ["btn_connect", "e_host", "txt_out"],
+        # v1.0.4 起主机页是「清单 / 连接与设备」两段，默认看到的是清单
+        "hosts": ["tbl_host", "lbl_host_sum"],
         # 第三批起「网络工具 / 系统信息 / 防火墙」的正文换成了表格，
         # 原始输出挪进分段页签（默认不显示，所以别拿 txt_* 量宽度）
         "tools": ["tbl_tool", "lbl_ping"],
@@ -102,7 +103,7 @@ def main() -> int:
             chk(ok2, f"页面 {key} · {a}", f"w={w.winfo_width()}")
 
     # ---------------- 状态栏
-    app.nav.select("conn")
+    app.nav.select("hosts")
     pump(app, 0.3)
     sb = app.status
     chk(sb.winfo_height() >= 30, "状态栏高度", f"{sb.winfo_height()}px")
@@ -146,46 +147,51 @@ def main() -> int:
     chk(len(sb.cell_dev.cv.find_all()) >= 1, "系统徽标已绘制",
         f"{len(sb.cell_dev.cv.find_all())} 个图元")
 
-    # ---------------- 日志：写入 / 分离 / 归位
+    # ---------------- 日志：内存流水 + 合并进「日志管理」
     for i in range(12):
         app._log_raw("cmd" if i % 3 else "out", f"第 {i} 行 测试输出\n")
     pump(app, 0.3)
     before = len(app.log_model.lines)
     chk(before >= 12, "日志写入", f"{before} 行")
-    chk(app._log_panel is not None and app._log_panel.winfo_width() > 100,
-        "日志侧边栏停靠", f"w={app._log_panel.winfo_width()}")
-
-    app._float_log()
-    pump(app, 0.6)
-    chk(app._log_win is not None and app._log_win.winfo_exists(), "日志分离成窗口")
-    chk(not app._docked(), "分离后从分隔器移除",
+    # v1.0.6：右侧「命令日志」面板与「日志管理」重复，已撤掉面板本身
+    chk(not hasattr(app, "_log_panel"), "不再有右侧命令日志面板")
+    chk(not hasattr(app, "log_dock"), "分隔器里不再有日志栏",
         f"panes={len(app.paned.panes())}")
-    # 断的是「行数只增不减」而不是「完全相等」：状态栏采样器与连接日志会继续写，
-    # 早先写成 == 会偶发失败（22 vs 17），那是采样器在跑，不是日志丢了。
-    chk(len(app.log_model.lines) >= before, "分离不丢日志",
-        f"{len(app.log_model.lines)} vs {before}")
-    if app._log_panel is not None:
-        txt = app._log_panel.txt
-        body = txt.get("1.0", "end")
-        chk("第 11 行" in body, "分离后重放历史", f"{len(body)} 字符")
-        spans = txt.dump("1.0", "end", tag=True)
-        chk(len(spans) > 0, "日志着色 tag 存在", f"{len(spans)} 个 span")
 
-    app._dock_log()
-    pump(app, 0.6)
-    chk(app._log_win is None, "日志归位后窗口销毁")
-    chk(app._docked(), "归位后回到分隔器")
-    chk(len(app.log_model.lines) >= before, "归位不丢日志",
-        f"{len(app.log_model.lines)} vs {before}")
+    # 命令与输出要落进操作审计（日志管理页读的就是这份），且口令必须打码
+    app._audit_command("sshpass -p Hunter2 ssh root@10.0.0.9", 0,
+                       "connected to 10.0.0.9\nuptime 3 days", "", 42)
+    pump(app, 0.2)
+    # 采样器与后台探测也在写命令日志，所以按命令里的唯一标记过滤，
+    # 不能直接取「最后一条」—— 那样取到的是别的进程刚跑的命令
+    evs = app.audit.tail(300)
+    hit = [e for e in evs
+           if e.get("event") == "terminal.command"
+           and "sshpass" in str(e.get("detail") or "")]
+    chk(bool(hit), "命令执行记进操作审计")
+    if hit:
+        d = str(hit[-1].get("detail") or "")
+        chk("Hunter2" not in d, "口令没有落进日志", d[:60])
+        chk("******" in d, "口令被打码", d[:60])
+        chk("uptime 3 days" in d, "输出也记下来了", d[:80])
+        chk("rc=0" in d, "带上了返回码")
 
-    app._toggle_log(False)
+    app._audit_command("mysql -uroot -pSecret9 -e 'show databases'", 1,
+                       "", "Access denied for user 'root'", 8)
+    pump(app, 0.2)
+    # tail() 是**时间倒序**（最新在前），所以本轮刚写的那条是 evs2[0]。
+    # 用 "--mark-mysql9" 这种唯一标记过滤，避免命中去重跑留下的历史记录。
+    evs2 = [e for e in app.audit.tail(300)
+            if e.get("event") == "terminal.command"
+            and "mysql -uroot" in str(e.get("detail") or "")]
+    d2 = str(evs2[0].get("detail") or "") if evs2 else ""
+    chk("Secret9" not in d2, "mysql -pXXX 里的口令也被挡住", d2[:60])
+    chk(bool(evs2) and evs2[0].get("status") == "fail", "失败的命令标成 fail")
+    chk("[stderr]" in d2 and "Access denied" in d2, "stderr 也收进来了")
+
+    # ---------------- 认证区联动（「连接与设备」是主机页的第二段）
+    app.seg_hosts.select("conn")
     pump(app, 0.4)
-    chk(not app._docked(), "折叠日志")
-    app._toggle_log(True)
-    pump(app, 0.4)
-    chk(app._docked(), "展开日志")
-
-    # ---------------- 认证区联动
     app.v_proto.set("local")
     app._proto_changed()
     pump(app, 0.2)

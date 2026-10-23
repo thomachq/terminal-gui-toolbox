@@ -39,6 +39,10 @@ hidden = [
     # 主机资源四件套 + 操作审计 + AI 活动流（v1.0.4）
     'core.hosts', 'core.creds', 'core.proxies', 'core.scripts',
     'core.audit', 'core.aitrace',
+    # 剪贴板读文件/图片（v1.0.6）：纯 ctypes，不进 hiddenimports
+    # 打包后会因为「只在运行时 import」被漏掉
+    'core.clipfile',
+    'core.aisession',
     'core.ai_skills', 'core.ai_skills_builtin', 'core.agent',
     'ui.statusbar', 'ui.logpanel', 'ui.table', 'ui.forms',
     'ui.icon', 'ui.tray', 'ui.terminal', 'ui.tabs', 'ui.md',

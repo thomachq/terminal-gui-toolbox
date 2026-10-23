@@ -8,6 +8,8 @@
   key       结果字典里的键名
   label     左侧标签
   kind      text / password / int / select / check / textarea / readonly
+            file        —— 明文路径 + 「浏览…」按钮（私钥、证书这类）
+            secret_file —— 打码显示 + 「浏览…」，选中文件后转为明文
   default   默认值
   options   select 用：["a","b"] 或 [("值","显示")]
   required  必填
@@ -16,12 +18,15 @@
   unit      值右侧的单位文字
   pattern   (正则, 错误提示)
   placeholder
+  filetypes file/secret_file 用：[(“私钥”, “*.pem *.key”), ...]
+  initialdir 浏览时的起始目录（不给就优先 ~/.ssh）
 """
 from __future__ import annotations
 
+import os
 import re
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import wbtui as U
 
@@ -154,6 +159,41 @@ class FormDialog(tk.Toplevel):
             tx.pack(fill="x", expand=True)
             self._getters[f["key"]] = lambda t=tx: t.get("1.0", "end").rstrip("\n")
             self._widgets[f["key"]] = tx
+        elif kind in ("file", "secret_file"):
+            # 私钥/证书这类要填「路径」的字段。让用户手打一串
+            # C:\Users\...\.ssh\id_ed25519 是折磨，还容易错一个字符查半天。
+            masked = (kind == "secret_file")
+            ent = ttk.Entry(cell, width=width, font=U.FONT_S,
+                            show="•" if masked else "")
+            ent.insert(0, str(val or ""))
+            ent.pack(side="left")
+            self._getters[f["key"]] = lambda e=ent: e.get().strip()
+            self._widgets[f["key"]] = ent
+
+            def browse(_e=None, e=ent, spec=f, mk=masked):
+                start = str(e.get() or "").strip()
+                d = os.path.dirname(start)
+                if not (d and os.path.isdir(d)):
+                    d = spec.get("initialdir") or ""
+                    if not d:
+                        # 私钥八成在 ~/.ssh：默认定到那儿，少点三下
+                        ssh = os.path.join(os.path.expanduser("~"), ".ssh")
+                        d = ssh if os.path.isdir(ssh) else os.path.expanduser("~")
+                path = filedialog.askopenfilename(
+                    parent=self, title=spec.get("pick_title") or "选择文件",
+                    initialdir=d,
+                    filetypes=spec.get("filetypes") or [("全部文件", "*.*")])
+                if not path:
+                    return
+                if mk:
+                    # 选中的是一个路径，不是口令 —— 转成明文，好核对
+                    e.configure(show="")
+                e.delete(0, "end")
+                e.insert(0, path)
+
+            U.RoundButton(cell, "浏览…", browse, variant="secondary",
+                          font=U.FONT_XS, height=24, padx=10).pack(
+                side="left", padx=(U.px(6), 0))
         else:
             show = "•" if kind == "password" else ""
             ent = ttk.Entry(cell, width=width, font=U.FONT_S, show=show)

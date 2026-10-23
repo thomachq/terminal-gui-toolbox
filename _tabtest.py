@@ -154,6 +154,54 @@ chk(win.ws_hosts.winfo_ismapped(), "主机资源可见")
 # 主机资源页签不可关（closable=False → 没有关闭按钮）
 chk(win.tabbar.tabs["hosts"]["close"] is None, "主机资源没有关闭按钮")
 
+# ================================================================== 导航归属
+sec("6b. 左侧导航只属于主机资源页签")
+# 结构层面：导航是主机资源容器的孩子，不是窗口层的。这一条是根因级断言 ——
+# 只要它还挂在窗口层，切页签就一定露出来。
+eq(str(win.nav.master), str(win.ws_hosts), "导航挂在主机资源容器里")
+
+
+def top_at(w):
+    """w（或它的某个祖先）是不是当前抬在最上面的那块工作区。
+
+    原先用 winfo_containing 做像素级命中判断，但 Windows 上它走
+    WindowFromPoint：窗口只要被别的程序盖住就返回 None，同一份代码在不同
+    桌面状态下结论会变。改成问程序自己记的那份 z 序（app._ws_raise 维护），
+    结论只取决于「谁被 tkraise 了」。
+    """
+    cur = getattr(win, "_ws_top", None)
+    chain = []
+    node = w
+    while node is not None:
+        chain.append(node)
+        node = getattr(node, "master", None)
+    return chain if cur in chain else []
+
+
+pump(win, 0.3)
+chk(win.nav in top_at(win.nav), "主机资源页签：导航在最上层")
+
+win.open_terminal()
+pump(win, 0.6)
+chk(win.nav not in top_at(win.nav), "终端页签：导航被盖住")
+chk(win.ws_hosts not in top_at(win.ws_hosts), "终端页签：主机资源整页被盖住")
+win.tabbar.close("term")
+pump(win, 0.4)
+
+win.open_settings()
+pump(win, 0.6)
+chk(win.nav not in top_at(win.nav), "设置页签：导航被盖住")
+sc = win._settings_reg().get(win.SETTINGS_TAB)
+chk(sc is not None, "设置页签已嵌进工作区")
+if sc is not None:
+    chk(hasattr(sc, "_nav_btns"), "设置页有自己的分区导航")
+    pump(win, 0.2)
+    chk(sc._nav_btns["look"] in top_at(sc._nav_btns["look"]),
+        "设置页的分区导航在最上层")
+win.tabbar.close(win.SETTINGS_TAB)
+pump(win, 0.4)
+chk(win.nav in top_at(win.nav), "切回主机资源，导航回来了")
+
 # ================================================================== 细节
 sec("7. 页签细节")
 win.tabbar.add("t2", "测试页", closable=True)

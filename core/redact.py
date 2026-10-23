@@ -37,10 +37,47 @@ PPK = re.compile(
 ARG_SECRET = re.compile(
     r"(?P<key>(?:^|\s)(?:--password|--passwd|--passphrase|--key-passphrase)"
     r"(?:=|\s+))(?P<val>\"[^\"]*\"|'[^']*'|\S+)", re.I)
-# 形如 PASSWORD=xxx / PASSWD=xxx 的环境变量赋值
+# 形如 PASSWORD=xxx / PASSWD=xxx 的环境变量赋值。
+# 特意不收裸 `PWD`：那在 Linux 里是「当前目录」，遮掉等于把定位信息毁了；
+# 只认 `_PWD` 这种明显是口令的（MYSQL_PWD、DB_PWD）。
 ENV_SECRET = re.compile(
-    r"(?P<key>\b(?:[A-Z0-9_]*(?:PASSWORD|PASSWD|PASSPHRASE|_PW|SECRET|TOKEN))"
-    r"\s*=\s*)(?P<val>\"[^\"]*\"|'[^']*'|\S+)")
+    r"(?P<key>\b(?:[A-Z0-9_]*(?:PASSWORD|PASSWD|PASSPHRASE|_PWD|_PW|SECRET"
+    r"|TOKEN))\s*=\s*)(?P<val>\"[^\"]*\"|'[^']*'|\S+)")
+
+# 客户端把口令直接挂在参数上。这几条是运维里最常见的几种，照着它们的
+# 语法单独写，不敢用通用的 `-p`：ssh 的 -p 是端口、tar 的 -p 是权限，
+# 一律打码只会让人看不懂日志。
+#   sshpass -p xxx / mysql -pXXX / mysqldump -pXXX / redis-cli -a xxx
+# 注意值必须以非 `-` 开头：`mysql -p -u root` 是「提示输入」，不该打码。
+CLIENT_SECRET = re.compile(
+    r"(?P<key>\b(?:sshpass\s+-p|redis-cli\s+-a|docker\s+login\s+-p"
+    r"|(?:mysql|mysqldump|mysqladmin)\b[^\n]*?\s-p)\s*)"
+    r"(?P<val>[^-\s]\S*)", re.I)
+
+# openssl -passin pass:xxx —— 格式自带一个 pass: 前缀，单独一条更好读
+PASSIN = re.compile(r"(?P<key>\s-passin\s+pass:)(?P<val>\S+)", re.I)
+
+# curl -u user:pass —— 冒号前是用户名（留着），冒号后才是口令
+CURL_AUTH = re.compile(
+    r"(?P<key>\bcurl\b[^\n]*?\s-u\s+[^\s:]+:)(?P<val>\S+)", re.I)
+
+# URL 里内嵌的凭据：https://user:pass@host、redis://:pass@host
+URL_AUTH = re.compile(
+    r"(?P<key>[a-z][a-z0-9+.-]*://[^/\s:@]*:)(?P<val>[^@\s/]+)(?=@)", re.I)
+
+# echo '密码' | sudo -S —— 把口令喂给 sudo 的经典写法
+ECHO_SUDO = re.compile(
+    r"(?P<key>\becho\s+(?P<q>['\"]))(?P<val>.*?)(?P=q)(?=\s*\|\s*sudo\b)",
+    re.I | re.S)
+
+# smbclient -U user%pass
+SMB_SECRET = re.compile(
+    r"(?P<key>\bsmbclient\b[^\n]*?-U\s+[^\s%]*%)(?P<val>\S+)", re.I)
+
+# htpasswd -b 文件 用户 口令 —— -b 的意思就是「口令写在命令行里」
+HTPASSWD = re.compile(
+    r"(?P<key>\bhtpasswd\b[^\n]*?\s-[a-zA-Z]*b[a-zA-Z]*\s+\S+\s+\S+\s+)"
+    r"(?P<val>[^\s-]\S*)", re.I)
 
 MASK = "******"
 HIDDEN_HINT = "私钥内容已隐藏"
@@ -74,10 +111,21 @@ def scrub(text: str) -> str:
 
 
 def scrub_cmd(cmd: str) -> str:
-    """命令行里内联的密码换成 ******（PEM 正文同样处理）。"""
+    """命令行里内联的口令换成 ******（PEM 正文同样处理）。
+
+    顺序有讲究：先挡「整块私钥」，再挡参数与环境变量，最后是几种客户端
+    自己的写法。都是幂等的 —— 同一行连过两遍不会越遮越乱。
+    """
     out = scrub(cmd)
     out = ARG_SECRET.sub(lambda m: m.group("key") + MASK, out)
     out = ENV_SECRET.sub(lambda m: m.group("key") + MASK, out)
+    out = CLIENT_SECRET.sub(lambda m: m.group("key") + MASK, out)
+    out = CURL_AUTH.sub(lambda m: m.group("key") + MASK, out)
+    out = URL_AUTH.sub(lambda m: m.group("key") + MASK, out)
+    out = ECHO_SUDO.sub(lambda m: m.group("key") + MASK + m.group("q"), out)
+    out = SMB_SECRET.sub(lambda m: m.group("key") + MASK, out)
+    out = HTPASSWD.sub(lambda m: m.group("key") + MASK, out)
+    out = PASSIN.sub(lambda m: m.group("key") + MASK, out)
     return out
 
 

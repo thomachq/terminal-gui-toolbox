@@ -25,14 +25,18 @@
 from __future__ import annotations
 
 import base64
+import os
+import re
 import shlex
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog
 
 import wbtui as U
 from core import agent as A
-from core import ai_skills, aiops, aitrace
+from core import ai_skills, aiops, aisession, aitrace, clipfile
 from pages.model_page import ModelDialog
 from ui import forms
 from ui.md import MdView
@@ -48,6 +52,33 @@ MODE_LABEL = dict(MODE_OPTS)
 MODE_BY_LABEL = {v: k for k, v in MODE_OPTS}
 
 AUTO_SKILL = "自动（按问题挑技能）"
+
+# 侧栏宽度（逻辑像素，会乘 U.S）。
+# 参考 WorkBuddy：它常驻在右边，只占窗口的一条 —— 内容靠折行，不靠加宽。
+# 之前默认 400 还只在宽窗口里生效，窗口一窄就按内容要多少给多少，
+# 结果助手吃掉半个屏，左边的主机表被挤成一条。
+DOCK_W_DEFAULT = 372
+DOCK_W_MIN = 340          # 再窄的话消息卡片里一行只剩十来个字
+DOCK_W_MAX = 560          # 再宽就不像侧栏了
+DOCK_W_RATIO = 0.42       # 无论如何不超过窗口的这个比例
+
+# 一次最多带几个附件。带多了模型会被文件内容挤爆上下文，
+# 而且用户自己也记不住到底贴了几个。
+MAX_ATTACH = 8
+
+# 附件内容内联进提示词的上限。再大就让它用工具去读 —— 一次性灌进上下文，
+# 既贵又容易把关键指令挤到窗口外面。
+ATTACH_INLINE_LIMIT = 32 * 1024
+
+# 当成「图片」显示的扩展名。决定 chip 上那个小图标，以及要不要内联内容 ——
+# 图片内联成乱码没有任何意义，只报路径和尺寸。
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
+
+# 工具输出里认路径用的。只认「看起来像文件」的东西（有扩展名），
+# 抓到的还要过一遍 os.path.isfile —— 宁可少列，不能列一堆点不开的。
+_PATH_RE = re.compile(
+    r"(?>[A-Za-z]:\\[^\s\"'<>|*?\r\n]+"
+    r"|/(?:[\w.@%+~-]+/)*[\w.@%+~-]+\.[A-Za-z0-9]{1,8})")
 
 # 空会话时的建议。写成「说人话的请求」，点一下就知道该怎么问 ——
 # 比写一段「您可以这样问我：……」的说明有用得多。
@@ -177,7 +208,8 @@ class AiDockPage:
     def ai_dock_build(self, parent) -> tk.Frame:
         """造一次，之后开关只是 add / forget，不重建（会话内容要留住）。"""
         dock = U.wframe(parent, "page")
-        dock.configure(width=U.px(self.agent_cfg.data.get("dock_width", 400)))
+        dock.configure(width=U.px(self.agent_cfg.data.get("dock_width")
+                                  or DOCK_W_DEFAULT))
         dock.pack_propagate(False)
         self.ai_dock = dock
         self._ai_flow_labels: list[tk.Label] = []
@@ -214,22 +246,42 @@ class AiDockPage:
         U.register(self._ai_head_line,
                    lambda: self._ai_head_line.configure(bg=U.T.border))
 
-        # ---- 消息流
-        self._ai_scroll = _Scroll(dock, U.T.page)
-        self._ai_scroll.pack(fill="both", expand=True, padx=U.px(8))
-        self._ai_flow = self._ai_scroll.inner
+        # ---- 会话页签条（CodeBuddy 形态：一条横排，末尾一个 ＋）
+        # 每个页签是一次独立的对话，各有自己的上下文与消息流；
+        # 关掉页签只是把它从这条横条上收起来，记录还在「所有会话」里。
+        self._ai_sess_store = aisession.Store(self.agent_cfg.path.parent)
+        self._ai_sessions: dict[str, aisession.Session] = {}
+        self._ai_open: dict[str, dict] = {}
+        self._ai_sess_order: list[str] = []
+        self._ai_tabs = tk.Frame(dock, bg=U.T.page)
+        self._ai_tabs.pack(fill="x", padx=U.px(8), pady=(U.px(4), 0))
+
+        # ---- 消息流（每个会话一个，切换时换容器，不重放控件）
+        self._ai_scroll = None
+        self._ai_flow = None
         dock.bind("<Configure>", self._ai_dock_reflow)
 
         # ---- 输入区
         foot = U.wframe(dock, "page")
-        foot.pack(fill="x", padx=U.px(10), pady=(U.px(6), U.px(8)))
+        foot.pack(side="bottom", fill="x", padx=U.px(10),
+                  pady=(U.px(6), U.px(8)))
+        self._ai_foot = foot
         box = tk.Frame(foot, bg=U.T.card, bd=0, highlightthickness=1,
                        highlightbackground=U.T.border)
         box.pack(fill="x")
 
+        # ---- 输入区：附件条在文本框上面，有东西才占高度
+        self._ai_attach: list[dict] = []
+        self._ai_files_seen: dict[str, str] = {}
+        self._ai_attach_bar = tk.Frame(box, bg=U.T.card)
+
         self._ai_input = U.TextBox(box, role="card", height=3, readonly=False)
         self._ai_input.pack(fill="x", padx=U.px(6), pady=(U.px(6), 0))
         self._ai_input.txt.bind("<Control-Return>", self._ai_send_hotkey)
+        # Ctrl+V 先让 Tk 粘文本 —— 这条路它比谁都稳（输入法、撤销栈都在它手里）。
+        # 只有剪贴板里根本不是文本（图片 / 在资源管理器里复制的文件）才轮到我们。
+        for seq in ("<Control-v>", "<Control-V>", "<Shift-Insert>"):
+            self._ai_input.txt.bind(seq, self._ai_paste)
 
         bar = U.wframe(box, "card")
         bar.pack(fill="x", padx=U.px(6), pady=(U.px(4), U.px(6)))
@@ -268,7 +320,8 @@ class AiDockPage:
         self._ai_scope_sids: list[str] = []   # sid 或 LOCAL_SID
         self._ai_skill_now = ""
         self._ai_pending = None
-        self._ai_paint_welcome()
+        # 会话底座：接着上次没聊完的，没有就开一个空的
+        self._ai_sess_boot()
         self._ai_refresh_dock_state()
         return dock
 
@@ -318,6 +371,16 @@ class AiDockPage:
         # 记下引导页占用的控件：发出第一条消息时整块收起来，
         # 否则一屏里既有一堆「试试这些」又有对话，看着像没进入状态
         self._ai_welcome_widgets = list(self._ai_flow.winfo_children())
+        st = self._ai_sess_state()
+        if st is not None:
+            st["welcome"] = self._ai_welcome_widgets
+
+    def _ai_sess_state(self):
+        """当前会话的界面临时状态（每个会话一份）。"""
+        sess = getattr(self, "_ai_sess", None)
+        if sess is None:
+            return None
+        return self._ai_open.get(sess.id)
 
     # ------------------------------------------------------------ 欢迎块的小件
     def _ai_avatar(self, parent, size: int = 22) -> tk.Canvas:
@@ -389,7 +452,14 @@ class AiDockPage:
         self.ai_dock_send()
 
     def _ai_more_menu(self) -> None:
+        try:
+            n = len(self._ai_sess_store.all())
+        except (AttributeError, OSError):
+            n = 0
         rows = [
+            ("新建会话", self._ai_tab_new),
+            (f"所有会话（{n}）", self._ai_sess_list),
+            None,
             ("模型设置", self.ai_model_settings),
             ("助手设置（人设 / 技能 / 工具）", self.ai_agent_settings),
             ("清空会话", self.ai_dock_clear),
@@ -473,10 +543,33 @@ class AiDockPage:
         self.after(60, self._ai_dock_sash)
         self.after(300, self._ai_dock_sash)
         self.after(120, lambda: self._ai_input.txt.focus_set())
+        # 主窗被拉窄时，助手不能还占着当初的宽度 —— 跟着一起收
+        try:
+            self.paned.bind("<Configure>", self._ai_dock_clamp, add="+")
+        except tk.TclError:
+            pass
+
+    def _ai_dock_clamp(self, _e=None) -> None:
+        """窗口变窄时只做「收」，不主动变宽 —— 用户拖过的宽度要尊重。"""
+        if not getattr(self, "_ai_dock_on", False):
+            return
+        try:
+            total = self.paned.winfo_width()
+            cur = self.ai_dock.winfo_width()
+        except tk.TclError:
+            return
+        if total < U.px(320) or cur <= 1:
+            return
+        cap = min(U.px(DOCK_W_MAX), int(total * DOCK_W_RATIO))
+        if cur > cap:
+            self._ai_dock_sash()
 
     def ai_dock_close(self) -> None:
         if not getattr(self, "ai_dock", None):
             return
+        # 收起之前先把宽度与当前会话落盘，否则这一轮的对话就没了
+        self._ai_dock_remember()
+        self._ai_sess_save()
         try:
             self.paned.forget(self.ai_dock)
         except tk.TclError:
@@ -496,36 +589,61 @@ class AiDockPage:
         self.btn_ai_dock.set_text("智能运维助手")
 
     def _ai_dock_sash(self) -> None:
-        """把侧栏拉到设定宽度，日志栏让位但仍然留够。"""
+        """把侧栏摆到设定宽度。
+
+        宽度是可拖的（用户要求），但两头都要夹住：
+
+          下限 —— 窄到消息卡片一行放不下十来个字就没法看了
+          上限 —— 窗口的 42%（且不超过 560）。这是「侧栏」和「半个屏」的分界
+
+        之前只在 `total > want + 420` 时才摆，窗口一窄就完全不生效，
+        于是 pane 按内容要宽度 —— 越聊越宽。现在无条件摆，夹在区间里。
+        """
         try:
             total = self.paned.winfo_width()
-            # 宽度是可拖的（用户要求）。这里只夹在「窄到不可用」和
-            # 「宽到把终端挤成一条缝」之间，正常的拖动结果原样尊重。
-            want = U.px(int(self.agent_cfg.data.get("dock_width") or 400))
-            want = max(U.px(300), min(want, U.px(720)))
+            if total < U.px(320):
+                return
+            cap = min(U.px(DOCK_W_MAX), int(total * DOCK_W_RATIO))
+            floor = min(U.px(DOCK_W_MIN), max(U.px(260), int(total * 0.30)))
+            want = U.px(int(self.agent_cfg.data.get("dock_width")
+                            or DOCK_W_DEFAULT))
+            want = max(floor, min(want, cap))
             # Tk 的 PanedWindow 没有 index()，只能从 panes() 里自己数
             panes = [str(p) for p in self.paned.panes()]
             idx = panes.index(str(self.ai_dock)) - 1
-            if total > want + U.px(420) and idx >= 0:
-                self.paned.sash_place(idx, total - want, 0)
-        except tk.TclError:
+            if idx >= 0:
+                self.paned.sash_place(idx, max(0, total - want), 0)
+        except (tk.TclError, ValueError):
             pass
 
     def _ai_sash_done(self, _e=None) -> None:
         """用户拖完分隔条：把当前宽度记下来，下次打开还是这个宽度。"""
         if not getattr(self, "_ai_dock_on", False):
             return
+        self._ai_dock_remember()
+
+    def _ai_dock_remember(self) -> None:
+        """记住当前实际宽度（存**逻辑**像素，跟 DOCK_W_* 同一套单位）。"""
         try:
             w = self.ai_dock.winfo_width()
         except tk.TclError:
             return
         if w < U.px(240):
             return
-        self.agent_cfg.data["dock_width"] = int(round(w / max(0.5, U.S)))
+        # 除以缩放比才是逻辑像素。之前这里存的是物理像素，
+        # 而读取时又乘了一遍 U.px —— 高 DPI 下每次开关都变宽一截。
+        logical = int(round(w / max(0.5, float(U.S))))
+        if logical == int(self.agent_cfg.data.get("dock_width") or 0):
+            return
+        self.agent_cfg.data["dock_width"] = logical
         self.agent_cfg.save()
 
     def _ai_dock_reflow(self, event=None) -> None:
-        """侧栏宽度变了，消息卡片跟着重排 —— 否则文字会一直按旧宽度折行。"""
+        """侧栏宽度变了，消息卡片跟着重排 —— 否则文字会一直按旧宽度折行。
+
+        **不在这里记宽度**：这个回调在程序摆放分隔条时也会被触发，
+        边摆边记会把自己越记越偏（旧代码就这么把记忆搞坏的）。
+        """
         w = (event.width if event is not None else self.ai_dock.winfo_width())
         wrap = max(U.px(180), w - U.px(46))
         for lb in self._ai_flow_labels:
@@ -533,9 +651,6 @@ class AiDockPage:
                 lb.configure(wraplength=wrap)
             except tk.TclError:
                 pass
-        if event is not None and event.width > U.px(340):
-            self.agent_cfg.data["dock_width"] = int(w)
-            self.agent_cfg._clean()
 
     # ================================================================ 卡片
     def _ai_label(self, parent, text: str, fg: str, font, wrap: bool = True):
@@ -546,7 +661,10 @@ class AiDockPage:
                                      - U.px(46)) if wrap else 0)
         return lb
 
-    def _ai_note(self, text: str, tone: str = "mute") -> None:
+    def _ai_note(self, text: str, tone: str = "mute",
+                 record: bool = False) -> None:
+        """一行灰字提示。默认**不**进 transcript —— 这些是过程提示
+        （「套用技能…」「已停止」），重放时再刷一遍只会让历史更乱。"""
         fg = {"mute": U.T.text_mute, "dim": U.T.text_dim,
               "ok": U.T.ok, "warn": U.T.warn, "err": U.T.err}.get(tone, U.T.text_dim)
         wrap = tk.Frame(self._ai_flow, bg=U.T.page)
@@ -554,21 +672,29 @@ class AiDockPage:
         lb = self._ai_label(wrap, text, fg, U.FONT_XS)
         lb.pack(fill="x")
         self._ai_flow_labels.append(lb)
+        if record:
+            self._ai_sess_remember("note", text)
 
     def _ai_hide_welcome(self) -> None:
-        """第一条消息一来就把引导页收掉（只收一次）。"""
-        for w in getattr(self, "_ai_welcome_widgets", []):
+        """第一条消息一来就把引导页收掉（只收一次，按会话各算各的）。"""
+        st = self._ai_sess_state()
+        keep = st.get("welcome") if st is not None else None
+        todo = keep if keep is not None else getattr(self, "_ai_welcome_widgets", [])
+        for w in todo or []:
             try:
                 w.pack_forget()
             except tk.TclError:
                 pass
+        if st is not None:
+            st["welcome"] = []
         self._ai_welcome_widgets = []
 
-    def _ai_bubble(self, text: str) -> None:
+    def _ai_bubble(self, text: str, attach=None, record: bool = True) -> None:
         """用户消息：靠右的浅色块，和助手内容区分开。
 
         左边留出一大段空白是刻意的 —— 宽度差一眼就能看出「谁说的」，
-        不用额外画头像。
+        不用额外画头像。带了附件就在文字下面补一行文件名：发出去之后
+        用户还得能看见「我到底给了它什么」。
         """
         self._ai_hide_welcome()
         outer = tk.Frame(self._ai_flow, bg=U.T.page)
@@ -583,8 +709,21 @@ class AiDockPage:
                       padx=U.px(12), pady=U.px(8))
         lb.pack()
         self._ai_flow_labels.append(lb)
+        if attach:
+            names = "、".join(_clip_str(n, 18) for n in attach[:4])
+            if len(attach) > 4:
+                names += f" 等 {len(attach)} 个"
+            tk.Label(box, text="▤ " + names, bg=U.T.brand_soft,
+                     fg=U.T.text_dim, font=U.FONT_XS, justify="left",
+                     anchor="w", wraplength=max(U.px(150),
+                                                (self.ai_dock.winfo_width()
+                                                 or U.px(400)) - U.px(110)),
+                     padx=U.px(12), pady=U.px(3)).pack(fill="x")
+        if record:
+            self._ai_sess_remember("user", text, attach)
 
-    def _ai_reply(self, text: str, step: int | None = None) -> None:
+    def _ai_reply(self, text: str, step: int | None = None,
+                  record: bool = True) -> None:
         """助手正文：左边头像 + 名字，正文按 Markdown 渲染后铺在页面上。
 
         正文不套卡片边框 —— 每句话都框一层，一屏下来全是方框，重点反而没了。
@@ -639,6 +778,8 @@ class AiDockPage:
         md.frame.pack(fill="x", pady=(U.px(4), 0))
         self._ai_md_views.append(md)
         self._ai_scroll.to_end()
+        if record:
+            self._ai_sess_remember("ai", text)
 
     def _ai_open_link(self, url: str) -> None:
         """点正文里的链接：先给用户看一眼去哪，再交给系统浏览器。"""
@@ -815,16 +956,506 @@ class AiDockPage:
             return "已断开"
         return slot.label or sid
 
-    # ================================================================ 主机范围
-    def _ai_hosts_menu(self) -> None:
-        """主机选择浮层：当前设备 / 全部主机 / 本机 / 逐台勾选。
+    # ================================================================ 会话
+    # 一次对话 = 一个会话。页签就是「这次对话」，关掉只是收起来，
+    # 记录还在「所有会话」里，随时能翻回来接着聊。
+    def _ai_sess_boot(self) -> None:
+        """建会话底座：接着上次那个聊，没有就开一个空的。"""
+        store = self._ai_sess_store
+        store.ensure()
+        got = store.all()
+        sess = got[0] if got else store.create()
+        self._ai_sessions[sess.id] = sess
+        self._ai_sess = sess
+        self._ai_sess_order = [sess.id]
+        st = self._ai_sess_mount(sess)
+        try:
+            st["scroll"].pack(fill="both", expand=True, padx=U.px(8))
+        except tk.TclError:
+            pass
+        self._ai_sess_bind(sess, st)
+        self._ai_sess_replay(sess, st)
+        self._ai_tab_paint()
 
-        「当前设备」和「全部主机」互斥，勾主机则自动取消这两项；
-        一个都不勾就退回「当前设备」—— 空白状态不能是一种可执行状态。
+    def _ai_sess_mount(self, sess) -> dict:
+        """给一个会话造它的消息流容器（造了先不摆）。"""
+        sc = _Scroll(self.ai_dock, U.T.page)
+        st = {"scroll": sc, "flow": sc.inner, "labels": [], "md": [],
+              "cards": [], "attach": [], "files": dict(sess.files or {}),
+              "painted": False}
+        self._ai_open[sess.id] = st
+        return st
+
+    def _ai_sess_bind(self, sess, st) -> None:
+        """把「当前会话」的指针全部指向这一个会话。
+
+        这些属性原来是单体字段（一个助手只有一份），现在变成「当前会话的」。
+        全部换指针，比给每个方法加参数改动小得多，也不会漏掉某处。
+        """
+        self._ai_scroll = st["scroll"]
+        self._ai_flow = st["flow"]
+        self._ai_flow_labels = st["labels"]
+        self._ai_md_views = st["md"]
+        self._ai_tool_cards = st["cards"]
+        self._ai_attach = st["attach"]
+        self._ai_files_seen = st["files"]
+        self._ai_sess = sess
+        # 直接给同一个 list：Agent 往里 append 就等于写进会话
+        self.agent.history = sess.history
+        self.agent.tokens = int(sess.tokens or 0)
+
+    def _ai_sess_sync(self) -> None:
+        """把当前会话的实时状态写回会话对象并落盘。"""
+        sess = getattr(self, "_ai_sess", None)
+        if sess is None:
+            return
+        sess.tokens = int(getattr(self.agent, "tokens", 0) or 0)
+        sess.files = dict(self._ai_files_seen or {})
+        sess.trim_history()
+        self._ai_sess_store.save(sess)
+
+    def _ai_sess_save(self) -> None:
+        self._ai_sess_sync()
+
+    def _ai_sess_activate(self, sid: str) -> None:
+        """切到某个会话：换容器 + 换上下文，必要时把历史重画出来。"""
+        cur = getattr(self, "_ai_sess", None)
+        if cur is not None and sid == cur.id:
+            self._ai_tab_paint()
+            return
+        self._ai_sess_sync()
+        sess = self._ai_sessions.get(sid)
+        if sess is None:
+            sess = self._ai_sess_store.load(sid)
+            if sess is None:
+                self.toast("这个会话的记录已经不在了", "warn")
+                return
+            self._ai_sessions[sid] = sess
+        st = self._ai_open.get(sid) or self._ai_sess_mount(sess)
+        if self._ai_scroll is not None:
+            try:
+                self._ai_scroll.pack_forget()
+            except tk.TclError:
+                pass
+        try:
+            st["scroll"].pack(fill="both", expand=True, padx=U.px(8),
+                              before=self._ai_foot)
+        except tk.TclError:
+            pass
+        self._ai_sess_bind(sess, st)
+        if sid not in self._ai_sess_order:
+            self._ai_sess_order.append(sid)
+        self._ai_sess_replay(sess, st)
+        self._ai_attach_paint()
+        self._ai_refresh_dock_state()
+        self._ai_tab_paint()
+
+    def _ai_sess_replay(self, sess, st) -> None:
+        """按 transcript 把气泡重画一遍（每个会话只画一次）。"""
+        if st.get("painted"):
+            return
+        st["painted"] = True
+        if not sess.transcript:
+            self._ai_paint_welcome()
+            return
+        self._ai_hide_welcome()
+        for rec in sess.transcript:
+            role = str(rec.get("role") or "")
+            text = str(rec.get("text") or "")
+            if not text:
+                continue
+            if role == "user":
+                self._ai_bubble(text, rec.get("attach"), record=False)
+            elif role == "ai":
+                self._ai_reply(text, record=False)
+            else:
+                self._ai_note(text, "dim", record=False)
+        try:
+            self._ai_scroll.to_end()
+        except (AttributeError, tk.TclError):
+            pass
+        self._ai_dock_reflow()
+
+    def _ai_sess_remember(self, role: str, text: str, attach=None) -> None:
+        """把一条消息记进当前会话，并在首问后给它起名字。"""
+        sess = getattr(self, "_ai_sess", None)
+        if sess is None or not text:
+            return
+        sess.say(role, text, attach)
+        if role == "user" and sess.auto_title(text):
+            self._ai_tab_paint()
+        self._ai_sess_store.save(sess)
+
+    # ------------------------------------------------------------ 页签
+    def _ai_tab_paint(self) -> None:
+        box = getattr(self, "_ai_tabs", None)
+        if box is None:
+            return
+        try:
+            for w in box.winfo_children():
+                w.destroy()
+        except tk.TclError:
+            return
+        ids = [i for i in self._ai_sess_order if i in self._ai_open]
+        if not ids:
+            return
+        try:
+            avail = self.ai_dock.winfo_width() - U.px(30)
+        except tk.TclError:
+            avail = U.px(DOCK_W_DEFAULT)
+        chip = U.px(102)
+        fit = max(1, int(max(avail, chip) // chip))
+        show = ids[:fit]
+        for sid in show:
+            self._ai_tab_chip(box, sid)
+        rest = len(ids) - len(show)
+        if rest > 0:
+            more = tk.Label(box, text=f"+{rest}", bg=U.T.page,
+                            fg=U.T.text_mute, font=U.FONT_XS,
+                            bd=0, cursor="hand2", padx=U.px(4))
+            more.pack(side="left", pady=U.px(4))
+            more.bind("<Button-1>", lambda e: self._ai_sess_list())
+        plus = tk.Label(box, text="＋", bg=U.T.page, fg=U.T.text_dim,
+                        font=U.FONT_S, bd=0, cursor="hand2", padx=U.px(6))
+        plus.pack(side="left", pady=U.px(2))
+        plus.bind("<Button-1>", lambda e: self._ai_tab_new())
+        plus.bind("<Enter>", lambda e: plus.configure(fg=U.T.brand))
+        plus.bind("<Leave>", lambda e: plus.configure(fg=U.T.text_dim))
+
+    def _ai_tab_chip(self, box, sid: str) -> None:
+        sess = self._ai_sessions.get(sid)
+        title = (sess.title if sess is not None else "会话") or "会话"
+        if len(title) > 7:
+            title = title[:6] + "…"
+        cur = sess is not None and sess is getattr(self, "_ai_sess", None)
+        bg = U.T.brand_soft if cur else U.T.alt
+        fg = U.T.brand if cur else U.T.text_dim
+        f = tk.Frame(box, bg=bg, cursor="hand2")
+        f.pack(side="left", padx=(0, U.px(4)), pady=U.px(3))
+        lb = tk.Label(f, text=title, bg=bg, fg=fg, font=U.FONT_XS, bd=0,
+                      padx=U.px(7), pady=U.px(4))
+        lb.pack(side="left")
+        x = tk.Label(f, text="×", bg=bg, fg=U.T.text_mute, font=U.FONT_XS,
+                     bd=0, padx=U.px(5), pady=U.px(4), cursor="hand2")
+        x.pack(side="left")
+
+        def go(_e=None, s=sid):
+            self._ai_sess_activate(s)
+
+        for w in (f, lb):
+            w.bind("<Button-1>", go)
+        x.bind("<Button-1>", lambda e, s=sid: self._ai_tab_close(s))
+        x.bind("<Enter>", lambda e: x.configure(fg=U.T.err))
+        x.bind("<Leave>", lambda e: x.configure(fg=U.T.text_mute))
+
+    def _ai_tab_new(self, _e=None):
+        """＋：开一个新会话。新页签，不是清空当前那个。"""
+        self._ai_sess_sync()
+        sess = self._ai_sess_store.create()
+        self._ai_sessions[sess.id] = sess
+        self._ai_sess_order.append(sess.id)
+        self._ai_sess_mount(sess)
+        self._ai_sess_activate(sess.id)
+        try:
+            self._ai_input.txt.focus_set()
+        except tk.TclError:
+            pass
+        return sess
+
+    def _ai_tab_close(self, sid: str) -> None:
+        """关页签：只是把它从横条上收起来，记录留着，随时能翻回来。"""
+        cur = getattr(self, "_ai_sess", None)
+        is_cur = cur is not None and sid == cur.id
+        if is_cur and getattr(self, "ai_busy", False):
+            self.toast("这个会话正在执行，先停止再关", "warn")
+            return
+        self._ai_sess_sync()
+        st = self._ai_open.pop(sid, None)
+        if st is not None:
+            try:
+                st["scroll"].pack_forget()
+            except tk.TclError:
+                pass
+            try:
+                st["scroll"].destroy()
+            except tk.TclError:
+                pass
+        if sid in self._ai_sess_order:
+            self._ai_sess_order.remove(sid)
+        if is_cur:
+            self._ai_scroll = None
+            self._ai_flow = None
+            self._ai_sess = None           # 让 activate 不会提前返回
+            left = [i for i in self._ai_sess_order if i in self._ai_open]
+            if left:
+                self._ai_sess_activate(left[-1])
+            else:
+                self._ai_tab_new()
+            return
+        self._ai_tab_paint()
+
+    def _ai_sess_list(self) -> None:
+        """「所有会话」：把盘上的记录全列出来，点一条就接着聊。"""
+        store = self._ai_sess_store
+        items = store.all()
+        if not items:
+            self.toast("还没有任何会话记录", "warn")
+            return
+        top = tk.Toplevel(self)
+        top.title("所有会话")
+        top.configure(bg=U.T.page)
+        try:
+            top.transient(self.winfo_toplevel())
+            top.geometry(f"{U.px(470)}x{U.px(560)}")
+        except tk.TclError:
+            pass
+
+        head = tk.Frame(top, bg=U.T.page)
+        head.pack(fill="x", padx=U.px(14), pady=(U.px(12), U.px(6)))
+        tk.Label(head, text=f"所有会话 · {len(items)} 个", bg=U.T.page,
+                 fg=U.T.text, font=U.FONT_T, bd=0).pack(side="left")
+        tk.Button(head, text="新建会话", bd=0, relief="flat",
+                  bg=U.T.brand, fg="#FFFFFF", font=U.FONT_XS,
+                  activebackground=U.T.brand_hover, activeforeground="#FFFFFF",
+                  padx=U.px(10), pady=U.px(3), highlightthickness=0,
+                  command=lambda: (top.destroy(), self._ai_tab_new())).pack(
+            side="right")
+
+        body = tk.Frame(top, bg=U.T.page)
+        body.pack(fill="both", expand=True, padx=U.px(8), pady=(0, U.px(10)))
+
+        def fill(inner):
+            for s in items[:200]:
+                row = tk.Frame(inner, bg=U.T.card, cursor="hand2")
+                row.pack(fill="x", pady=(0, U.px(3)))
+                cell = tk.Frame(row, bg=U.T.card)
+                cell.pack(side="left", fill="x", expand=True,
+                          padx=U.px(10), pady=U.px(6))
+                line = tk.Frame(cell, bg=U.T.card)
+                line.pack(fill="x")
+                tk.Label(line, text=s.title or "会话", bg=U.T.card,
+                         fg=U.T.text, font=U.FONT_S, bd=0,
+                         anchor="w").pack(side="left")
+                tk.Label(line, text=time.strftime(
+                    "%m-%d %H:%M", time.localtime(s.updated or s.created)),
+                    bg=U.T.card, fg=U.T.text_mute, font=U.FONT_XS,
+                    bd=0).pack(side="right")
+                tk.Label(cell, text=s.digest(), bg=U.T.card, fg=U.T.text_dim,
+                         font=U.FONT_XS, bd=0, anchor="w",
+                         wraplength=U.px(330), justify="left").pack(
+                    fill="x", pady=(U.px(2), 0))
+                tk.Label(cell, text=f"{len(s.transcript)} 条 · "
+                                    f"{s.tokens} tokens",
+                         bg=U.T.card, fg=U.T.text_mute, font=U.FONT_XS,
+                         bd=0, anchor="w").pack(fill="x")
+
+                def open_it(_e=None, sid=s.id):
+                    top.destroy()
+                    if sid in self._ai_open:
+                        self._ai_sess_activate(sid)
+                    else:
+                        self._ai_sessions.pop(sid, None)
+                        self._ai_sess_activate(sid)
+
+                for w in (row, cell) + tuple(cell.winfo_children()) + tuple(
+                        line.winfo_children()):
+                    w.bind("<Button-1>", open_it)
+
+        _scroll_list(body, U.T.page, 460, fill)
+        top.bind("<Escape>", lambda e: top.destroy())
+
+    # ================================================================ 附件
+    def _ai_attach_dir(self) -> Path:
+        """粘贴进来的图片落在哪儿。跟 agent.json 同一个 data/ 目录，
+        导出/备份的时候一起带走，不会散落在临时目录里。"""
+        try:
+            return Path(self.agent_cfg.path).parent / "attachments"
+        except (AttributeError, TypeError, ValueError):
+            return Path("data") / "attachments"
+
+    def _ai_attach_paint(self) -> None:
+        """重画附件条。空的时候整条收起来 —— 没附件还占一行高度最碍事。"""
+        bar = getattr(self, "_ai_attach_bar", None)
+        if bar is None:
+            return
+        for w in bar.winfo_children():
+            w.destroy()
+        if not self._ai_attach:
+            try:
+                bar.pack_forget()
+            except tk.TclError:
+                pass
+            return
+        try:
+            bar.pack(fill="x", padx=U.px(6), pady=(U.px(6), 0),
+                     before=self._ai_input)
+        except tk.TclError:
+            pass
+        # 两列：侧栏最窄也有 300px，一张 chip 放文件名放不下更多信息了
+        bar.columnconfigure(0, weight=1, uniform="att")
+        bar.columnconfigure(1, weight=1, uniform="att")
+        for i, a in enumerate(self._ai_attach):
+            self._ai_attach_chip(bar, a).grid(
+                row=i // 2, column=i % 2, sticky="ew",
+                padx=(0, U.px(4)), pady=(0, U.px(4)))
+
+    def _ai_attach_chip(self, parent, a: dict) -> tk.Frame:
+        card = tk.Frame(parent, bg=U.T.alt, bd=0)
+        row = tk.Frame(card, bg=U.T.alt)
+        row.pack(fill="x", padx=U.px(6), pady=U.px(4))
+        tk.Label(row, text="▣" if a.get("image") else "▤", bg=U.T.alt,
+                 fg=U.T.brand, font=U.FONT_XS, bd=0).pack(side="left")
+        name = a.get("name") or ""
+        if len(name) > 14:
+            name = name[:11] + "…"
+        lb = tk.Label(row, text=name, bg=U.T.alt, fg=U.T.text,
+                      font=U.FONT_XS, bd=0, anchor="w")
+        lb.pack(side="left", padx=(U.px(4), 0))
+        x = tk.Label(row, text="×", bg=U.T.alt, fg=U.T.text_mute,
+                     font=U.FONT_XS, bd=0, cursor="hand2")
+        x.pack(side="right", padx=(U.px(4), 0))
+        x.bind("<Button-1>", lambda e, k=a["key"]: self._ai_attach_remove(k))
+        return card
+
+    def _ai_attach_paths(self, paths, *, source: str = "添加") -> int:
+        """把一批路径加进附件：去重、必须真实存在、最多 MAX_ATTACH 个。"""
+        added = 0
+        for raw in paths:
+            s = str(raw or "").strip().strip('"')
+            if not s:
+                continue
+            try:
+                path = Path(s)
+                if not path.is_file():
+                    continue
+            except (OSError, ValueError):
+                continue
+            key = str(path).casefold() if os.name == "nt" else str(path)
+            if any(a["key"] == key for a in self._ai_attach):
+                continue
+            if len(self._ai_attach) >= MAX_ATTACH:
+                self.toast(f"最多带 {MAX_ATTACH} 个附件，先删几个再加", "warn")
+                break
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            self._ai_attach.append({
+                "key": key, "path": str(path), "name": path.name,
+                "size": size,
+                "image": path.suffix.lower() in IMAGE_EXT,
+                "source": source,
+            })
+            self._ai_files_seen.setdefault(str(path), source)
+            added += 1
+        if added:
+            self._ai_attach_paint()
+        return added
+
+    def _ai_attach_remove(self, key: str) -> None:
+        # 原地删：_ai_attach 是会话状态里的那个 list，换新对象会让它脱钩
+        self._ai_attach[:] = [a for a in self._ai_attach if a["key"] != key]
+        self._ai_attach_paint()
+
+    def _ai_attach_clear(self) -> None:
+        self._ai_attach[:] = []
+        self._ai_attach_paint()
+
+    def _ai_add_files(self) -> None:
+        """＋ → 添加文件。多选，选完直接挂在输入框上。"""
+        paths = filedialog.askopenfilenames(
+            parent=self, title="附加给助手的文件（可多选）")
+        if not paths:
+            return
+        n = self._ai_attach_paths(paths)
+        if n:
+            self.toast(f"加了 {n} 个附件", "ok")
+        else:
+            self.toast("这些文件已经在附件里了", "warn")
+
+    def _ai_paste(self, _e=None):
+        """Ctrl+V：文本归 Tk，图片/文件归我们。
+
+        先问一句「剪贴板里有文本吗」—— 有文本就让 Tk 走它自己的粘贴，那里面有
+        输入法状态、撤销栈、选区替换，我们插手只会出错。取不到文本（TclError）
+        说明剪贴板里根本不是文字，才轮到读文件/位图。
+        """
+        try:
+            self.clipboard_get()
+            return None
+        except tk.TclError:
+            pass
+        paths, msg = clipfile.grab(self._ai_attach_dir())
+        if paths:
+            n = self._ai_attach_paths(paths, source="粘贴")
+            if n:
+                self.toast(f"{msg}，已加到附件", "ok")
+            else:
+                self.toast("这张图/这个文件已经在附件里了", "warn")
+            return "break"
+        self.toast(msg, "warn")
+        return "break"
+
+    def _ai_scan_files(self, text: str, source: str = "对话") -> None:
+        """从工具输出里认出「本机真实存在的文件」，记进「引用对话中的文件」。
+
+        远端路径不算：那台机器上的文件本地点不开，列出来就是一条死链接。
+        所以这里唯一的标准是 os.path.isfile —— 宁可少列，不能点了个空。
+        """
+        if not text:
+            return
+        for m in _PATH_RE.finditer(text):
+            p = m.group(0).rstrip(".,;:)]}，。；：）】")
+            if len(p) < 5:
+                continue
+            try:
+                if not os.path.isfile(p):
+                    continue
+            except (OSError, ValueError):
+                continue
+            self._ai_files_seen.setdefault(p, source)
+
+    def _ai_session_files(self) -> list[tuple[str, str]]:
+        """本会话出现过的、当前还存在的文件。已经挂成附件的不再重复列出。"""
+        in_attach = {a["path"] for a in self._ai_attach}
+        out: list[tuple[str, str]] = []
+        for p, src in self._ai_files_seen.items():
+            if p in in_attach:
+                continue
+            try:
+                if not os.path.isfile(p):
+                    continue
+            except (OSError, ValueError):
+                continue
+            out.append((p, src))
+        return out[:40]
+
+    # ================================================================ 连接器
+    def _ai_hosts_menu(self) -> None:
+        _popup(self, self.btn_ai_hosts, self._ai_conn_build, width=U.px(250))
+
+    def _ai_conn_build(self, host) -> None:
+        """连接器面板：AI 能在哪些连接上执行（本机 / 各会话 / 全部）。
+
+        「当前设备」和「全部主机」互斥，勾主机则自动取消这两项；一个都不勾就
+        退回「当前设备」—— 空白状态不能是一种可执行状态。
+
+        旧「当前设备」按钮和 ＋ → 连接器 共用这一份逻辑：两个入口两种形态，
+        数据模型只有一套，免得哪天改一处漏一处。
         """
         slots = list(self.sessions)
+        head = tk.Frame(host, bg=U.T.card)
+        head.pack(fill="x", padx=U.px(10), pady=(U.px(9), 0))
+        tk.Label(head, text="连接器", bg=U.T.card, fg=U.T.text,
+                 font=U.FONT_S, bd=0).pack(side="left")
+        tk.Label(head, text=f"{len(slots) + 1} 个", bg=U.T.card,
+                 fg=U.T.text_mute, font=U.FONT_XS, bd=0).pack(side="right")
+        tk.Label(host, text="助手只在你勾选的连接上执行命令", bg=U.T.card,
+                 fg=U.T.text_mute, font=U.FONT_XS, bd=0, anchor="w").pack(
+            fill="x", padx=U.px(10), pady=(0, U.px(4)))
 
-        def build(host):
+        def build(host2):
+            host = host2
             cur_all = self._ai_scope_all
             picked = set(self._ai_scope_sids)
             rows = [("cur", "当前设备", "跟随左侧：切到哪台就作用于哪台"),
@@ -875,7 +1506,7 @@ class AiDockPage:
                 tk.Label(cell, text=sub, bg=U.T.card, fg=U.T.text_mute,
                          font=U.FONT_XS, anchor="w").pack(fill="x")
 
-        _popup(self, self.btn_ai_hosts, build, width=U.px(250))
+        build(host)
 
     def _ai_targets(self) -> list[tuple[str, object]]:
         """按主机范围给出 [(显示名, session)]。默认只有当前设备那一台。"""
@@ -907,52 +1538,317 @@ class AiDockPage:
                 pass
         return self._local
 
-    def _ai_plus_menu(self) -> None:
-        """底部「＋」：主机范围 / 技能 / 模型管理 / 清空，一次收进去。
+    # ------------------------------------------------------------ ＋ 菜单
+    def _ai_menu_row(self, parent, glyph: str, label: str, hint: str = "",
+                     on_click=None, *, arrow: bool = False) -> tk.Frame:
+        """一级菜单的一行：符号 + 名字 + 右侧当前值（+ ›）。
 
-        会话窄，两个常驻 chip 就要占掉半行；收进 ＋ 之后底部只剩
-        「＋ · 模型 · 发送」，一眼能看清当前用哪个模型。
+        右侧那个「当前值」是这套菜单的关键：技能写「自动」、连接器写「当前设备」，
+        不点开也知道现在是什么状态 —— 否则菜单只是个入口列表。
+        """
+        row = tk.Frame(parent, bg=U.T.card, cursor="hand2")
+        row.pack(fill="x", padx=U.px(6), pady=U.px(1))
+        gl = tk.Label(row, text=glyph, bg=U.T.card, fg=U.T.text_dim,
+                      font=U.FONT_S, bd=0, width=2, anchor="center")
+        gl.pack(side="left", padx=(U.px(4), U.px(2)), pady=U.px(7))
+        lb = tk.Label(row, text=label, bg=U.T.card, fg=U.T.text,
+                      font=U.FONT_S, bd=0, anchor="w")
+        lb.pack(side="left")
+        kids: list[tk.Widget] = [gl, lb]
+        if arrow:
+            ar = tk.Label(row, text="›", bg=U.T.card, fg=U.T.text_mute,
+                          font=U.FONT_S, bd=0)
+            ar.pack(side="right", padx=(0, U.px(4)))
+            kids.append(ar)
+        if hint:
+            hi = tk.Label(row, text=hint, bg=U.T.card, fg=U.T.text_mute,
+                          font=U.FONT_XS, bd=0)
+            hi.pack(side="right", padx=(0, U.px(6)))
+            kids.append(hi)
+
+        def enter(_e=None):
+            for w in kids + [row]:
+                try:
+                    w.configure(bg=U.T.brand_soft)
+                except tk.TclError:
+                    pass
+
+        def leave(_e=None):
+            for w in kids + [row]:
+                try:
+                    w.configure(bg=U.T.card)
+                except tk.TclError:
+                    pass
+
+        for w in kids + [row]:
+            if on_click is not None:
+                w.bind("<Button-1>", on_click)
+            w.bind("<Enter>", enter)
+            w.bind("<Leave>", leave)
+        return row
+
+    def _ai_plus_menu(self) -> None:
+        """底部「＋」：一级分组，带 › 的点开是并排的二级浮层。
+
+        形态照 WorkBuddy：会话窄，常驻 chip 全收进来；每一项右边写着「现在是
+        什么」，右上角一个 › 表示「点开还有一层」。技能与连接器必须分两层 ——
+        把十几个技能直接摊在一级菜单里，那菜单就没法看了。
         """
         holder: dict = {}
 
         def build(host):
-            rows = [
-                ("主机范围", self._ai_scope_label(), self._ai_hosts_menu),
-                ("技能", self._ai_skill_now or "自动", self._ai_skill_menu),
-                ("模型管理", "", self.ai_model_settings),
-                ("清空会话", "", self.ai_dock_clear),
-            ]
-            for name, hint, cmd in rows:
-                row = tk.Frame(host, bg=U.T.card, cursor="hand2")
-                row.pack(fill="x", padx=U.px(6), pady=U.px(1))
-                lb = tk.Label(row, text=name, bg=U.T.card, fg=U.T.text,
-                              font=U.FONT_S, anchor="w", padx=U.px(8),
-                              pady=U.px(7))
-                lb.pack(side="left")
-                if hint:
-                    tk.Label(row, text=hint, bg=U.T.card, fg=U.T.text_mute,
-                             font=U.FONT_XS, bd=0).pack(side="right",
-                                                        padx=U.px(8))
+            def close():
+                try:
+                    holder["top"].destroy()
+                except (KeyError, tk.TclError):
+                    pass
 
-                def act(_e=None, c=cmd):
-                    try:
-                        holder["top"].destroy()
-                    except (KeyError, tk.TclError):
-                        pass
-                    c()
+            def run(fn):
+                def hook(_e=None):
+                    close()
+                    fn()
+                return hook
 
-                for w in (row, lb):
-                    w.bind("<Button-1>", act)
-                for w in (row, lb):
-                    w.bind("<Enter>", lambda e, r0=row, l0=lb: (
-                        r0.configure(bg=U.T.brand_soft),
-                        l0.configure(bg=U.T.brand_soft)))
-                    w.bind("<Leave>", lambda e, r0=row, l0=lb: (
-                        r0.configure(bg=U.T.card), l0.configure(bg=U.T.card)))
+            def sub(kind):
+                return lambda _e=None: self._ai_open_sub(kind)
 
-        top = _popup(self, self.btn_ai_plus, build, width=U.px(240))
+            self._ai_menu_row(host, "＋", "添加文件", "",
+                              run(self._ai_add_files))
+            self._ai_menu_row(host, "@", "引用对话中的文件",
+                              f"{len(self._ai_session_files())} 个",
+                              sub("quote"), arrow=True)
+            U.hsep(host, "card", pady=(U.px(5), U.px(4)))
+            self._ai_menu_row(
+                host, "◑", "模式",
+                MODE_LABEL.get(self.agent_cfg.mode, "").split(" ·")[0],
+                sub("mode"), arrow=True)
+            self._ai_menu_row(host, "◆", "技能", self._ai_skill_now or "自动",
+                              sub("skill"), arrow=True)
+            self._ai_menu_row(host, "⌁", "连接器", self._ai_scope_label(),
+                              sub("conn"), arrow=True)
+            U.hsep(host, "card", pady=(U.px(5), U.px(4)))
+            self._ai_menu_row(host, "⌄", "模型管理", "",
+                              run(self.ai_model_settings))
+            self._ai_menu_row(host, "×", "清空会话", "",
+                              run(self.ai_dock_clear))
+
+        top = _popup(self, self.btn_ai_plus, build, width=U.px(252))
         holder["top"] = top
+        self._ai_plus_top = top
         return top
+
+    def _ai_open_sub(self, kind: str) -> None:
+        """在一级菜单右边开二级浮层。一级已经没了就什么都不做。"""
+        top = getattr(self, "_ai_plus_top", None)
+        try:
+            if top is None or not top.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        spec = {
+            "quote": (self._ai_files_build, 340),
+            "mode": (self._ai_mode_build, 300),
+            "skill": (self._ai_skill_build, 340),
+            "conn": (self._ai_conn_build, 310),
+        }.get(kind)
+        if spec is None:
+            return
+        _submenu(top, spec[0], width=U.px(spec[1]))
+
+    def _ai_close_menu(self) -> None:
+        top = getattr(self, "_ai_plus_top", None)
+        try:
+            if top is not None and top.winfo_exists():
+                _close_chain(top)
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------ 二级：引用文件
+    def _ai_files_build(self, host) -> None:
+        """＋ → 引用对话中的文件。"""
+        files = self._ai_session_files()
+        head = tk.Frame(host, bg=U.T.card)
+        head.pack(fill="x", padx=U.px(10), pady=(U.px(9), 0))
+        tk.Label(head, text="引用对话中的文件", bg=U.T.card, fg=U.T.text,
+                 font=U.FONT_S, bd=0).pack(side="left")
+        tk.Label(head, text=f"{len(files)} 个", bg=U.T.card, fg=U.T.text_mute,
+                 font=U.FONT_XS, bd=0).pack(side="right")
+
+        if not files:
+            tk.Label(host,
+                     text="这次对话里还没出现过本机文件。\n"
+                          "用「添加文件」，或者直接 Ctrl+V 贴一张图。",
+                     bg=U.T.card, fg=U.T.text_mute, font=U.FONT_XS,
+                     justify="left", anchor="w").pack(
+                fill="x", padx=U.px(10), pady=U.px(12))
+            return
+
+        def fill(inner):
+            for p, src in files:
+                row = tk.Frame(inner, bg=U.T.card, cursor="hand2")
+                row.pack(fill="x", pady=U.px(1))
+                ic = tk.Label(row, text="▣" if Path(p).suffix.lower() in IMAGE_EXT
+                              else "▤", bg=U.T.card, fg=U.T.brand,
+                              font=U.FONT_XS, bd=0)
+                ic.pack(side="left", padx=(U.px(8), U.px(5)))
+                cell = tk.Frame(row, bg=U.T.card)
+                cell.pack(side="left", fill="x", expand=True)
+                tk.Label(cell, text=Path(p).name, bg=U.T.card, fg=U.T.text,
+                         font=U.FONT_S, bd=0, anchor="w").pack(fill="x")
+                tk.Label(cell, text=_clip_str(str(Path(p).parent), 36),
+                         bg=U.T.card, fg=U.T.text_mute, font=U.FONT_XS,
+                         bd=0, anchor="w").pack(fill="x")
+                tk.Label(row, text=src, bg=U.T.card, fg=U.T.text_mute,
+                         font=U.FONT_XS, bd=0).pack(side="right",
+                                                    padx=U.px(8))
+
+                def pick(_e=None, path=p):
+                    self._ai_close_menu()
+                    if self._ai_attach_paths([path], source="引用"):
+                        self.toast(f"已引用 {Path(path).name}", "ok")
+                    else:
+                        self.toast("这个文件已经在附件里了", "warn")
+
+                for w in (row, ic, cell) + tuple(cell.winfo_children()):
+                    w.bind("<Button-1>", pick)
+
+        _scroll_list(host, U.T.card, 250, fill)
+
+    # ------------------------------------------------------------ 二级：模式
+    def _ai_mode_build(self, host) -> None:
+        """＋ → 模式：自动 / 逐条确认 / 只读。"""
+        cur = self.agent_cfg.mode
+        head = tk.Frame(host, bg=U.T.card)
+        head.pack(fill="x", padx=U.px(10), pady=(U.px(9), U.px(4)))
+        tk.Label(head, text="执行模式", bg=U.T.card, fg=U.T.text,
+                 font=U.FONT_S, bd=0).pack(side="left")
+        for key, label in MODE_OPTS:
+            title, _, sub = label.partition(" · ")
+            on = key == cur
+            row = tk.Frame(host, bg=U.T.brand_soft if on else U.T.card,
+                           cursor="hand2")
+            row.pack(fill="x", padx=U.px(6), pady=U.px(1))
+            tick = tk.Label(row, text="✓" if on else "", bg=row.cget("bg"),
+                            fg=U.T.brand, font=U.FONT_S, bd=0, width=2)
+            tick.pack(side="left", padx=(U.px(4), 0), pady=U.px(6))
+            cell = tk.Frame(row, bg=row.cget("bg"))
+            cell.pack(side="left", fill="x", expand=True)
+            tk.Label(cell, text=title, bg=row.cget("bg"), fg=U.T.text,
+                     font=U.FONT_S, bd=0, anchor="w").pack(fill="x")
+            tk.Label(cell, text=_clip_str(sub, 30), bg=row.cget("bg"),
+                     fg=U.T.text_mute, font=U.FONT_XS, bd=0,
+                     anchor="w").pack(fill="x")
+
+            def pick(_e=None, k=key, t=title):
+                self._ai_close_menu()
+                self.agent_cfg.data["mode"] = k
+                try:
+                    self.agent_cfg.save()
+                except OSError as e:
+                    self.toast(f"存不下来：{e}", "err")
+                    return
+                self.toast(f"模式：{t}", "ok")
+
+            for w in (row, tick, cell) + tuple(cell.winfo_children()):
+                w.bind("<Button-1>", pick)
+
+    # ------------------------------------------------------------ 二级：技能
+    def _ai_skill_build(self, host) -> None:
+        """＋ → 技能：搜索 + 列表 + 底部两个入口（照 WorkBuddy 那一栏）。"""
+        skills = self._ai_skills()
+        sr = tk.Frame(host, bg=U.T.input_bg, bd=0, highlightthickness=1,
+                      highlightbackground=U.T.input_border)
+        sr.pack(fill="x", padx=U.px(8), pady=(U.px(8), U.px(4)))
+        var = tk.StringVar()
+        ent = tk.Entry(sr, textvariable=var, bd=0, bg=U.T.input_bg,
+                       fg=U.T.text, insertbackground=U.T.text, font=U.FONT_S,
+                       highlightthickness=0)
+        ent.pack(fill="x", padx=(U.px(22), U.px(8)), pady=U.px(5))
+        tk.Label(sr, text="⌕", bg=U.T.input_bg, fg=U.T.text_mute,
+                 font=U.FONT_S, bd=0).place(x=U.px(7), rely=0.5, anchor="w")
+        ph = tk.Label(sr, text="搜索技能", bg=U.T.input_bg, fg=U.T.text_mute,
+                      font=U.FONT_XS, bd=0)
+        ph.place(x=U.px(22), rely=0.5, anchor="w")
+        ph.bind("<Button-1>", lambda e: ent.focus_set())
+
+        def fill(inner):
+            def render(*_a):
+                for w in inner.winfo_children():
+                    w.destroy()
+                q = var.get().strip().lower()
+                items = [("", AUTO_SKILL, "按问题里的关键词挑，没合适的就不套")]
+                for s in skills:
+                    items.append((s.slug, s.name, s.description or s.source))
+                hit = 0
+                for slug, label, desc in items:
+                    if q and q not in f"{label} {desc}".lower():
+                        continue
+                    self._ai_skill_row(inner, slug, label, desc)
+                    hit += 1
+                if not hit:
+                    tk.Label(inner, text="没有匹配的技能", bg=U.T.card,
+                             fg=U.T.text_mute, font=U.FONT_XS,
+                             bd=0).pack(pady=U.px(14))
+
+            def hint_ph(*_a):
+                try:
+                    if var.get():
+                        ph.place_forget()
+                    else:
+                        ph.place(x=U.px(22), rely=0.5, anchor="w")
+                except tk.TclError:
+                    pass
+
+            var.trace_add("write", render)
+            var.trace_add("write", hint_ph)
+            render()
+
+        _scroll_list(host, U.T.card, 232, fill)
+        U.hsep(host, "card", pady=(U.px(4), U.px(2)))
+
+        def open_lib(_e=None):
+            self._ai_close_menu()
+            self._ai_open_skill_lib()
+
+        def add_local(_e=None):
+            self._ai_close_menu()
+            from pages.ai_page import SkillDialog
+            dlg = SkillDialog(self, self)
+            try:
+                dlg.after(150, dlg._import)     # 直接弹导入，少点一次
+            except AttributeError:
+                pass
+
+        self._ai_menu_row(host, "↑", "从本地添加技能", "", add_local)
+        self._ai_menu_row(host, "◎", "管理技能", "", open_lib)
+
+    def _ai_skill_row(self, parent, slug: str, label: str, desc: str) -> None:
+        on = (slug == self._ai_skill_now)
+        bg = U.T.brand_soft if on else U.T.card
+        row = tk.Frame(parent, bg=bg, cursor="hand2")
+        row.pack(fill="x", pady=U.px(1))
+        badge = tk.Label(row, text=(label[:1] or "·").upper(),
+                         bg=U.T.brand_soft if on else U.T.alt,
+                         fg=U.T.brand, font=(U.FONT_FAMILY, 8, "bold"),
+                         bd=0, width=2, pady=U.px(3))
+        badge.pack(side="left", padx=(U.px(8), U.px(6)), pady=U.px(4))
+        cell = tk.Frame(row, bg=bg)
+        cell.pack(side="left", fill="x", expand=True)
+        tk.Label(cell, text=label, bg=bg, fg=U.T.text, font=U.FONT_S,
+                 bd=0, anchor="w").pack(fill="x")
+        tk.Label(cell, text=_clip_str(desc, 40), bg=bg, fg=U.T.text_mute,
+                 font=U.FONT_XS, bd=0, anchor="w").pack(fill="x")
+        if on:
+            tk.Label(row, text="✓", bg=bg, fg=U.T.brand, font=U.FONT_S,
+                     bd=0).pack(side="right", padx=U.px(8))
+
+        def pick(_e=None, v=slug, t=label):
+            self._ai_pick_skill_now(v)
+            self._ai_close_menu()
+            self.toast("技能：" + (t if v else "自动"), "ok")
+
+        for w in (row, badge, cell) + tuple(cell.winfo_children()):
+            w.bind("<Button-1>", pick)
 
     def _ai_scope_label(self) -> str:
         if self._ai_scope_all:
@@ -978,62 +1874,33 @@ class AiDockPage:
     def _ai_model_menu(self) -> None:
         """底部「⌄ 模型」：一列可选模型，点谁用谁。
 
-        形态照抄 Cherry Studio 的输入框右下角 + 宝塔的模型浮层：能搜、当前打勾、
-        底下给一个「模型管理…」的入口。切模型就等于把那条档案写回扁平字段，
-        引擎下一次调用直接用新的 —— 不用重启，也不用回到设置页。
+        形态照 WorkBuddy 的模型浮层：一行一个，左边圆标、名字后面跟徽章、右边
+        是模型名与当前勾，底部一条分隔线 + 「配置自定义模型」。列表长了（>7 个）
+        才出现搜索框 —— 三个模型还摆个搜索框，纯占地方。
+
+        切模型 = 把那条档案写回扁平字段，引擎下一次调用直接用新的：不用重启，
+        也不用回到设置页。
         """
         cfg = self.ai_cfg
         models = cfg.models()
         holder: dict = {}
+        area: dict = {}
 
         def build(host):
             box = tk.Frame(host, bg=U.T.card)
-            box.pack(fill="both", expand=True, padx=U.px(6), pady=U.px(6))
+            box.pack(fill="both", expand=True, padx=U.px(4), pady=U.px(4))
 
-            head = tk.Frame(box, bg=U.T.card)
-            head.pack(fill="x", padx=U.px(2))
-            tk.Label(head, text="选择模型", bg=U.T.card, fg=U.T.text,
-                     font=U.FONT_S, bd=0).pack(side="left")
-            tk.Label(head, text=f"{len(models)} 个", bg=U.T.card,
-                     fg=U.T.text_mute, font=U.FONT_XS, bd=0).pack(side="right")
-
-            sr = tk.Frame(box, bg=U.T.input_bg, bd=0, highlightthickness=1,
-                          highlightbackground=U.T.input_border)
-            sr.pack(fill="x", pady=(U.px(6), U.px(4)))
-            var = tk.StringVar()
-            ent = tk.Entry(sr, textvariable=var, bd=0, bg=U.T.input_bg,
-                           fg=U.T.text, insertbackground=U.T.text,
-                           font=U.FONT_S, highlightthickness=0)
-            ent.pack(fill="x", padx=U.px(8), pady=U.px(5))
-            # 占位提示：Entry 没有原生 placeholder，用一层灰字盖住，输入即消失
-            ph = tk.Label(sr, text="搜索模型", bg=U.T.input_bg,
-                          fg=U.T.text_mute, font=U.FONT_XS, bd=0)
-            ph.place(x=U.px(8), rely=0.5, anchor="w")
-
-            def _ph(*_a):
-                try:
-                    if var.get():
-                        ph.place_forget()
-                    else:
-                        ph.place(x=U.px(8), rely=0.5, anchor="w")
-                except tk.TclError:
-                    pass
-
-            ent.bind("<KeyRelease>", _ph)
-            ph.bind("<Button-1>", lambda e: ent.focus_set())
-
-            holder["ent"] = ent
-            rows = tk.Frame(box, bg=U.T.card)
-            rows.pack(fill="both", expand=True)
-
-            def render(*_a):
+            def render(q: str = "") -> None:
+                rows = area.get("rows")
+                if rows is None:
+                    return
                 for w in rows.winfo_children():
                     w.destroy()
-                q = var.get().strip().lower()
                 hit = 0
                 for m in models:
                     v = aiops.model_view(m, cfg.current_id())
-                    hay = f"{v['name']} {v['model']} {v['provider']}".lower()
+                    hay = (f"{v['name']} {v['model']} {v['provider']}"
+                           .lower())
                     if q and q not in hay:
                         continue
                     self._ai_model_row(rows, v, holder)
@@ -1041,24 +1908,72 @@ class AiDockPage:
                 if not hit:
                     tk.Label(rows, text="没有匹配的模型", bg=U.T.card,
                              fg=U.T.text_mute, font=U.FONT_XS,
-                             bd=0).pack(pady=U.px(12))
+                             bd=0).pack(pady=U.px(14))
+
+            def fill(inner):
+                rows = tk.Frame(inner, bg=U.T.card)
+                rows.pack(fill="x")
+                area["rows"] = rows
+                render()
+
+            if len(models) > 7:
+                sr = tk.Frame(box, bg=U.T.input_bg, bd=0, highlightthickness=1,
+                              highlightbackground=U.T.input_border)
+                sr.pack(fill="x", pady=(0, U.px(4)))
+                var = tk.StringVar()
+                ent = tk.Entry(sr, textvariable=var, bd=0, bg=U.T.input_bg,
+                               fg=U.T.text, insertbackground=U.T.text,
+                               font=U.FONT_S, highlightthickness=0)
+                ent.pack(fill="x", padx=U.px(8), pady=U.px(4))
+                ph = tk.Label(sr, text="搜索模型", bg=U.T.input_bg,
+                              fg=U.T.text_mute, font=U.FONT_XS, bd=0)
+                ph.place(x=U.px(8), rely=0.5, anchor="w")
+
+                def ph_sync(*_a):
+                    try:
+                        if var.get():
+                            ph.place_forget()
+                        else:
+                            ph.place(x=U.px(8), rely=0.5, anchor="w")
+                    except tk.TclError:
+                        pass
+
+                ph.bind("<Button-1>", lambda e: ent.focus_set())
+                var.trace_add(
+                    "write", lambda *a: render(var.get().strip().lower()))
+                var.trace_add("write", ph_sync)
+                holder["ent"] = ent
+
+            if len(models) <= 8:
+                fill(box)
+            else:
+                _scroll_list(box, U.T.card, 300, fill)
+
+            U.hsep(box, "card", pady=(U.px(4), U.px(2)))
+            foot = tk.Frame(box, bg=U.T.card, cursor="hand2")
+            foot.pack(fill="x")
+            tk.Label(foot, text="✎", bg=U.T.card, fg=U.T.text_dim,
+                     font=U.FONT_XS, bd=0, width=2).pack(
+                side="left", padx=(U.px(6), U.px(2)), pady=U.px(7))
+            lb = tk.Label(foot, text="配置自定义模型", bg=U.T.card,
+                          fg=U.T.text, font=U.FONT_S, bd=0)
+            lb.pack(side="left")
+
+            def more(_e=None):
                 try:
-                    holder["top"].geometry("")
+                    holder["top"].destroy()
                 except (KeyError, tk.TclError):
                     pass
+                self.ai_model_settings()
 
-            var.trace_add("write", render)
-            render()
+            for w in (foot, lb) + tuple(foot.winfo_children()):
+                w.bind("<Button-1>", more)
+                w.bind("<Enter>", lambda e: (foot.configure(bg=U.T.brand_soft),
+                                             lb.configure(bg=U.T.brand_soft)))
+                w.bind("<Leave>", lambda e: (foot.configure(bg=U.T.card),
+                                             lb.configure(bg=U.T.card)))
 
-            foot = tk.Frame(box, bg=U.T.card)
-            foot.pack(fill="x", pady=(U.px(2), 0))
-            more = tk.Label(foot, text="模型管理…", bg=U.T.card, fg=U.T.brand,
-                            font=U.FONT_XS, bd=0, cursor="hand2")
-            more.pack(side="right", padx=U.px(2))
-            more.bind("<Button-1>", lambda e: (holder["top"].destroy(),
-                                                self.ai_model_settings()))
-
-        top = _popup(self, self.btn_ai_model, build, width=U.px(300))
+        top = _popup(self, self.btn_ai_model, build, width=U.px(320))
         holder["top"] = top
         try:
             holder["ent"].focus_set()
@@ -1067,36 +1982,57 @@ class AiDockPage:
         return top
 
     def _ai_model_row(self, parent, v: dict, holder: dict) -> None:
-        """浮层里的一行：图标 + 名称 + 服务商/模型名 + 当前打勾。"""
+        """浮层里的一行：圆标 + 名称 + 徽章 + 右侧模型名与当前勾。
+
+        只有「当前」「本地」「缺 Key」这类值得一提的状态才挂徽章 —— 每行都挂个
+        「就绪」等于没信息，还把名字挤窄了。
+        """
         cur = bool(v.get("current"))
-        row = tk.Frame(parent, bg=U.T.brand_soft if cur else U.T.card)
+        bg = U.T.brand_soft if cur else U.T.card
+        row = tk.Frame(parent, bg=bg, cursor="hand2")
         row.pack(fill="x", pady=U.px(1))
 
         icon = tk.Canvas(row, width=U.px(22), height=U.px(22), bd=0,
-                         highlightthickness=0,
-                         bg=U.T.brand_soft if cur else U.T.card)
-        icon.pack(side="left", padx=(U.px(4), U.px(6)), pady=U.px(5))
-        icon.create_oval(0, 0, U.px(22) - 1, U.px(22) - 1, fill=U.T.brand_soft2,
-                         outline="")
-        icon.create_text(U.px(11), U.px(11),
-                         text=(v.get("provider") or "?")[:1],
-                         fill=U.T.brand, font=(U.FONT_FAMILY, 8, "bold"))
+                         highlightthickness=0, bg=bg)
+        icon.pack(side="left", padx=(U.px(6), U.px(7)), pady=U.px(5))
+        icon.create_oval(0, 0, U.px(22) - 1, U.px(22) - 1,
+                         fill=U.T.brand_soft2, outline="")
+        icon.create_text(
+            U.px(11), U.px(11),
+            text=((v.get("provider_key") or v.get("provider") or "?")
+                  [:1].upper()),
+            fill=U.T.brand, font=(U.FONT_FAMILY, 8, "bold"))
 
-        cell = tk.Frame(row, bg=row.cget("bg"))
-        cell.pack(side="left", fill="x", expand=True)
-        tk.Label(cell, text=v.get("name") or "未命名", bg=row.cget("bg"),
-                 fg=U.T.text, font=U.FONT_S, bd=0, anchor="w").pack(fill="x")
-        tk.Label(cell, text=f"{v.get('provider')} · {v.get('model')}",
-                 bg=row.cget("bg"), fg=U.T.text_mute, font=U.FONT_XS,
-                 bd=0, anchor="w").pack(fill="x")
+        name = tk.Label(row, text=v.get("name") or "未命名", bg=bg,
+                        fg=U.T.text, font=U.FONT_S, bd=0, anchor="w")
+        name.pack(side="left")
+        kids: list[tk.Widget] = [icon, name]
 
+        badge = None
         if cur:
-            tk.Label(row, text="✓", bg=row.cget("bg"), fg=U.T.ok,
-                     font=U.FONT_S, bd=0).pack(side="right", padx=U.px(8))
-        elif v.get("tone") == "warn":
-            tk.Label(row, text=v.get("state") or "", bg=row.cget("bg"),
-                     fg=U.T.warn, font=U.FONT_XS, bd=0).pack(
-                side="right", padx=U.px(8))
+            badge = U.Pill(row, "当前", "brand", height=18, radius=9,
+                           padx=7, font=U.FONT_XS)
+        elif v.get("tone") == "ok" and v.get("provider_key") == "dsh":
+            badge = U.Pill(row, "本地", "ok", height=18, radius=9,
+                           padx=7, font=U.FONT_XS)
+        elif v.get("tone") in ("warn", "err"):
+            badge = U.Pill(row, v.get("state") or "异常", "warn", height=18,
+                           radius=9, padx=7, font=U.FONT_XS)
+        if badge is not None:
+            try:
+                badge.configure(cursor="hand2")
+            except tk.TclError:
+                pass
+            badge.pack(side="left", padx=(U.px(7), 0))
+            kids.append(badge)
+
+        tick = tk.Label(row, text="✓" if cur else "", bg=bg, fg=U.T.ok,
+                        font=U.FONT_S, bd=0)
+        tick.pack(side="right", padx=(U.px(4), U.px(8)))
+        mdl = tk.Label(row, text=_clip_str(v.get("model") or "", 16), bg=bg,
+                       fg=U.T.text_mute, font=U.FONT_XS, bd=0)
+        mdl.pack(side="right")
+        kids += [tick, mdl]
 
         def pick(_e=None):
             mid = v.get("_id") or ""
@@ -1114,46 +2050,23 @@ class AiDockPage:
             except (KeyError, tk.TclError):
                 pass
 
-        bg0 = row.cget("bg")
-        for w in (row, cell) + tuple(cell.winfo_children()):
+        def paint(color: str) -> None:
+            for w in kids + [row]:
+                try:
+                    w.configure(bg=color)
+                except tk.TclError:
+                    pass
+
+        for w in kids + [row]:
             w.bind("<Button-1>", pick)
-            w.bind("<Enter>", lambda e, r0=row, c0=cell: (
-                r0.configure(bg=U.T.brand_soft), c0.configure(bg=U.T.brand_soft),
-                [x.configure(bg=U.T.brand_soft) for x in c0.winfo_children()]))
-            w.bind("<Leave>", lambda e, r0=row, c0=cell, b0=bg0: (
-                r0.configure(bg=b0), c0.configure(bg=b0),
-                [x.configure(bg=b0) for x in c0.winfo_children()]))
+            w.bind("<Enter>", lambda e: paint(U.T.brand_soft))
+            w.bind("<Leave>", lambda e: paint(bg))
 
     # ================================================================ 技能
-    def _ai_skill_menu(self) -> None:
-        skills = self._ai_skills()
-
-        def build(host):
-            rows = [("", AUTO_SKILL, "按问题里的关键词挑，没合适的就不套")]
-            for s in skills:
-                rows.append((s.slug, s.name, s.description or s.source))
-            for slug, label, sub in rows:
-                row = tk.Frame(host, bg=U.T.card)
-                row.pack(fill="x", padx=U.px(8), pady=U.px(2))
-                on = (slug == self._ai_skill_now)
-                btn = U.RoundButton(row, "●" if on else "○",
-                                    lambda v=slug: self._ai_pick_skill_now(v),
-                                    variant="ghost", font=U.FONT_XS,
-                                    height=22, padx=6)
-                btn.pack(side="left")
-                cell = tk.Frame(row, bg=U.T.card)
-                cell.pack(side="left", fill="x", expand=True)
-                tk.Label(cell, text=label, bg=U.T.card, fg=U.T.text,
-                         font=U.FONT_S, anchor="w").pack(fill="x")
-                tk.Label(cell, text=sub[:60], bg=U.T.card, fg=U.T.text_mute,
-                         font=U.FONT_XS, anchor="w").pack(fill="x")
-            U.hsep(host, "card", pady=(6, 4))
-            U.RoundButton(host, "打开技能库…", self._ai_open_skill_lib,
-                          variant="ghost", font=U.FONT_XS, height=24,
-                          padx=10).pack(anchor="w", padx=U.px(8),
-                                        pady=(0, U.px(6)))
-
-        _popup(self, self.btn_ai_skill, build, width=U.px(280))
+    def _ai_skill_menu(self) -> tk.Toplevel:
+        """旧「技能」按钮的浮层。内容和 ＋ → 技能 共用一份，不再各写一套。"""
+        return _popup(self, self.btn_ai_skill, self._ai_skill_build,
+                      width=U.px(300))
 
     def _ai_pick_skill_now(self, slug: str) -> None:
         self._ai_skill_now = slug
@@ -1204,8 +2117,12 @@ class AiDockPage:
         if not getattr(self, "ai_dock", None):
             self.ai_dock_open()
         goal = self._ai_input.get("1.0", "end-1c").strip()
-        if not goal:
+        if not goal and not self._ai_attach:
             return
+        if not goal:
+            # 只贴了图/文件没写字：别逼用户再补一句，替他起个头。
+            # 这句话会显示在气泡里，所以说得像人话。
+            goal = "看看我附加的文件，有什么值得注意的地方"
         cfg = self.ai_cfg
         if cfg.preset().get("kind") == "dsh":
             if not aiops.find_dsh():
@@ -1226,7 +2143,7 @@ class AiDockPage:
         self.ai_busy = True
         self._ai_stop.clear()
         self.btn_ai_send.set_text("执行中…")
-        self._ai_bubble(goal)
+        self._ai_bubble(goal, attach=[a["name"] for a in self._ai_attach])
 
         skill, why = self._ai_pick_skill(goal)
         skill_text = ai_skills.render(skill) if skill is not None else ""
@@ -1238,6 +2155,9 @@ class AiDockPage:
             f"任务：{goal}" + (f"（技能 {skill.name}）" if skill is not None else ""),
             tone="ok"), ensure=True)
         ctx = self._ai_context_text()
+        # 上下文已经拼进 ctx，输入框上的附件可以撤了；_ai_files_seen 留着，
+        # 下次还能从「引用对话中的文件」里把它拿回来。
+        self._ai_attach_clear()
         threading.Thread(target=self._ai_worker, args=(goal, ctx, skill_text),
                          daemon=True).start()
 
@@ -1258,7 +2178,43 @@ class AiDockPage:
             lines.append("可用的其它主机（exec 的 device 参数可指定）："
                          + "、".join(others))
         lines.append("可操作的页面：" + A.known_pages_hint(list(PAGE_META)))
+        block = self._ai_attach_text()
+        if block:
+            lines.append(block)
         return "\n".join(lines)
+
+    def _ai_attach_text(self) -> str:
+        """把本轮附件拼进上下文。
+
+        文本类直接内联内容 —— 模型不用再花一步去「读文件」，问一句答一句更快。
+        图片只报路径和尺寸：这一版没接视觉通道，把 PNG 塞进提示词纯属浪费；
+        但它可以用 exec 去处理（比如识别不了也能 tell 用户图在哪）。
+        二进制与超限文件只报存在，让模型自己决定要不要读。
+        """
+        if not self._ai_attach:
+            return ""
+        out = [f"用户附加的文件（本轮 {len(self._ai_attach)} 个）："]
+        for a in self._ai_attach:
+            p = Path(a["path"])
+            head = f"- {p}（{_human_size(a.get('size') or 0)}"
+            if a.get("image"):
+                wh = _png_size(p)
+                dim = f"，{wh[0]}×{wh[1]}" if wh else ""
+                out.append(head + dim + "，图片）")
+                out.append("  需要看图就调用工具处理这条路径；"
+                           "不要假装看过图里的内容。")
+                continue
+            out.append(head + "）")
+            body = _read_small_text(p, ATTACH_INLINE_LIMIT)
+            if body is None:
+                out.append("  内容未内联（二进制或超过 "
+                           f"{ATTACH_INLINE_LIMIT // 1024} KB），需要时用工具读")
+            else:
+                out.append("  内容如下：")
+                out.append("------")
+                out.append(body.rstrip())
+                out.append("------")
+        return "\n".join(out)
 
     def _ai_device(self) -> dict:
         d = self._effective_device()
@@ -1284,16 +2240,35 @@ class AiDockPage:
         if self.ai_busy:
             self.toast("正在执行，先停止再清空", "warn")
             return
-        if not forms.confirm(self, "清空会话", "清空对话与上下文？"
+        if not forms.confirm(self, "清空会话", "清空这次对话与上下文？"
                                                "（已经执行过的动作不会撤销）"):
             return
         self.agent.reset()
         self._ai_scroll.clear()
-        self._ai_flow_labels = []
-        self._ai_md_views = []
-        self._ai_tool_cards = []
+        # 三个列表原地清空：它们和会话状态里的是同一个对象，换新的就脱钩了
+        self._ai_flow_labels[:] = []
+        self._ai_md_views[:] = []
+        self._ai_tool_cards[:] = []
+        self._ai_files_seen.clear()
+        self._ai_attach_clear()
+        # 会话记录一并清掉，并把页签改回「新会话」——
+        # 否则清完了页签上还挂着旧标题，翻「所有会话」还能翻出刚清掉的内容
+        sess = getattr(self, "_ai_sess", None)
+        if sess is not None:
+            sess.transcript = []
+            sess.history = []
+            sess.tokens = 0
+            sess.files = {}
+            sess.title = "新会话"
+            sess.pinned = False
+            self.agent.history = sess.history
+            self._ai_sess_store.save(sess)
+            st = self._ai_open.get(sess.id)
+            if st is not None:
+                st["painted"] = True
         self._ai_paint_welcome()
         self._ai_refresh_dock_state()
+        self._ai_tab_paint()
         self.toast("会话已清空", "ok")
 
     # ================================================================ 工作线程
@@ -1506,6 +2481,8 @@ class AiDockPage:
                 rc, out, err = 1, "", f"{type(e).__name__}: {e}"
             ms = int((time.monotonic() - t0) * 1000)
             body = ((out or "") + (("\n[stderr] " + err) if err else "")).strip()
+            # 输出里提到的本机文件记一笔，供「引用对话中的文件」用
+            self._ai_scan_files(body, "命令输出")
             # 输出原样落到终端（该红的红、该白的白），末行补 rc 与耗时
             shown: list[tuple[str, str]] = []
             if (out or "").strip():
@@ -1672,6 +2649,46 @@ def _is_unix_local() -> bool:
     return not sys.platform.startswith("win")
 
 
+def _clip_str(s: str, n: int) -> str:
+    """按字数截断，超出补省略号。菜单里放不下长描述，也不该让它撑宽浮层。"""
+    s = str(s or "")
+    return s if len(s) <= n else s[:max(1, n - 1)] + "…"
+
+
+def _human_size(n: int) -> str:
+    n = int(n or 0)
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def _read_small_text(path: Path, limit: int) -> str | None:
+    """小文本文件直接读进来内联。二进制或超限返回 None —— 让模型自己去读。"""
+    try:
+        if not path.is_file() or path.stat().st_size > limit:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if not clipfile.looks_text(data):
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def _png_size(path: Path) -> tuple[int, int] | None:
+    """PNG 头里的宽高。只认 PNG —— 从剪贴板存下来的就是 PNG，别的没这保证。"""
+    try:
+        with path.open("rb") as f:
+            head = f.read(24)
+    except OSError:
+        return None
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+
+
 def _popup(app, anchor, builder, width: int = 260) -> tk.Toplevel:
     """贴着按钮弹出的浮层。点外面或按 Esc 就关 —— 不做模态。"""
     top = tk.Toplevel(app)
@@ -1706,11 +2723,102 @@ def _popup(app, anchor, builder, width: int = 260) -> tk.Toplevel:
 
 
 def _close_if_unfocused(top: tk.Toplevel) -> None:
+    # 二级浮层开着的时候，一级失焦是正常的（焦点跑到旁边那个浮层去了）。
+    # 这时候关掉一级，用户刚点开的「技能」会瞬间消失 —— 必须放行。
+    child = getattr(top, "_child", None)
+    try:
+        if child is not None and child.winfo_exists():
+            return
+    except tk.TclError:
+        pass
     try:
         if top.focus_displayof() is None:
             top.destroy()
     except tk.TclError:
         pass
+
+
+def _close_chain(top: tk.Toplevel) -> None:
+    """一级浮层和它挂着的二级浮层一起关掉。"""
+    child = getattr(top, "_child", None)
+    if child is not None:
+        try:
+            child.destroy()
+        except tk.TclError:
+            pass
+        try:
+            top._child = None
+        except tk.TclError:
+            pass
+    try:
+        top.destroy()
+    except tk.TclError:
+        pass
+
+
+def _sub_close_if(top: tk.Toplevel) -> None:
+    """二级浮层失焦 → 整条链收掉。
+
+    例外：焦点还在二级里面（比如刚点了搜索框）就不动 —— 那只是内部换焦点。
+    """
+    child = getattr(top, "_child", None)
+    try:
+        if child is not None and child.focus_displayof() is not None:
+            return
+    except tk.TclError:
+        pass
+    _close_chain(top)
+
+
+def _submenu(top: tk.Toplevel, builder, width: int = 300,
+             max_h: int = 400) -> tk.Toplevel:
+    """在一级浮层右边并排开一个二级浮层（WorkBuddy 那种「技能 ›」）。
+
+    同一时刻只留一个 —— 再点别的分组先把上一个拆掉，否则几个浮层会叠成一片。
+    右边放不下就翻到左边，免得贴着屏幕边被裁掉半截。
+    """
+    old = getattr(top, "_child", None)
+    if old is not None:
+        try:
+            old.destroy()
+        except tk.TclError:
+            pass
+        try:
+            top._child = None
+        except tk.TclError:
+            pass
+
+    sub = tk.Toplevel(top)
+    sub.withdraw()
+    sub.overrideredirect(True)
+    sub.configure(bg=U.T.border)
+    shell = tk.Frame(sub, bg=U.T.card, bd=0)
+    shell.pack(fill="both", expand=True, padx=1, pady=1)
+    builder(shell)
+    sub.update_idletasks()
+    w = max(width, shell.winfo_reqwidth())
+    h = min(shell.winfo_reqheight(), U.px(max_h))
+    x = top.winfo_rootx() + top.winfo_width() - 1
+    if x + w > top.winfo_screenwidth() - 8:
+        x = max(8, top.winfo_rootx() - w + 1)
+    y = max(8, min(top.winfo_rooty(), top.winfo_screenheight() - h - 48))
+    sub.geometry(f"{w}x{h}+{x}+{y}")
+    top._child = sub          # 先登记再显示：紧随其后的 FocusOut 要能看到它
+    sub.deiconify()
+    sub.bind("<Escape>", lambda e: _close_chain(top))
+    sub.bind("<FocusOut>", lambda e: sub.after(150, _sub_close_if, top))
+    return sub
+
+
+def _scroll_list(parent, bg: str, height: int, builder) -> "_Scroll":
+    """浮层里的一段可滚动列表。高度写死，否则浮层会被长列表顶出屏幕。"""
+    wrap = tk.Frame(parent, bg=bg, bd=0, height=U.px(height))
+    wrap.pack(fill="both", expand=True, pady=(U.px(4), 0))
+    wrap.pack_propagate(False)
+    sc = _Scroll(wrap, bg)
+    sc.pack(fill="both", expand=True)
+    builder(sc.inner)
+    return sc
 
 
 class AgentDialog(tk.Toplevel):

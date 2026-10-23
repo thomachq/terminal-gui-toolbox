@@ -193,10 +193,15 @@ class StatusBar(tk.Frame):
         # ---- 右侧动作
         self.btn_close = self._mini_btn("✕", U.T.err, on_disconnect or (lambda: None))
         self.btn_close.pack(side="right", padx=(0, U.px(8)))
-        self.btn_next = self._mini_btn("▶", U.T.text_dim, lambda: self._fold(False))
-        self.btn_next.pack(side="right", padx=U.px(2))
-        self.btn_prev = self._mini_btn("◀", U.T.text_dim, lambda: self._fold(True))
-        self.btn_prev.pack(side="right", padx=(U.px(8), 0))
+        # ◀ ▶ 只给「有侧边栏可折叠」的窗口用。主窗口的命令日志面板撤掉之后
+        # 不再传这两个回调，图标也就不画 —— 留着就是个点了没反应的死按钮。
+        if on_fold or on_unfold:
+            self.btn_next = self._mini_btn("▶", U.T.text_dim,
+                                           lambda: self._fold(False))
+            self.btn_next.pack(side="right", padx=U.px(2))
+            self.btn_prev = self._mini_btn("◀", U.T.text_dim,
+                                           lambda: self._fold(True))
+            self.btn_prev.pack(side="right", padx=(U.px(8), 0))
 
         # ---- 右侧状态字（可伸缩）
         self.lb_state = tk.Label(self, text="就绪", bg=U.T.card, fg=U.T.text_mute,
@@ -239,8 +244,11 @@ class StatusBar(tk.Frame):
         self.cell_up2.paint()
         self.cv_hist.configure(bg=U.T.card)
         self.btn_close.configure(bg=U.T.card)
-        self.btn_prev.configure(bg=U.T.card, fg=U.T.text_dim)
-        self.btn_next.configure(bg=U.T.card, fg=U.T.text_dim)
+        # 折叠按钮只有「有侧边栏」的窗口才画（见 __init__），这里按需处理
+        for btn in (getattr(self, "btn_prev", None),
+                    getattr(self, "btn_next", None)):
+            if btn is not None:
+                btn.configure(bg=U.T.card, fg=U.T.text_dim)
         self.lb_state.configure(bg=U.T.card, fg=U.T.text_mute)
         self._draw_hist()
 
