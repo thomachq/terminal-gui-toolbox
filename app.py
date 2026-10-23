@@ -103,7 +103,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.4"
+APP_VER = "1.0.5"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -2137,12 +2137,19 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         if key == "hosts":
             self.ws_hosts.tkraise()
             return
-        pane = self._term_panes.get(key)
+        pane = self._tab_pane(key)
         if pane is not None:
             try:
                 pane.master.tkraise()
             except tk.TclError:
                 pass
+
+    def _tab_pane(self, key: str):
+        """按页签键找它对应的面板。终端和设置各有一张登记表。"""
+        pane = self._term_panes.get(key)
+        if pane is not None:
+            return pane
+        return getattr(self, "_settings_panes", {}).get(key)
 
     def _tab_new(self) -> None:
         """页签栏的「+」：开一个终端。"""
@@ -2150,15 +2157,18 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
     def _tab_close(self, key: str) -> None:
         """页签关闭回调。返回 False 表示拒绝关闭。"""
-        if key == self.TERM_TAB:
-            pane = self._term_panes.pop(key, None)
-            if pane is not None:
-                holder = pane.master
-                try:
-                    pane.destroy()
-                    holder.destroy()
-                except tk.TclError:
-                    pass
+        # 两张登记表都查一遍：同一个键只会落在其中一张里。
+        for reg in (self._term_panes, getattr(self, "_settings_panes", {})):
+            pane = reg.pop(key, None)
+            if pane is None:
+                continue
+            holder = pane.master
+            try:
+                pane.destroy()
+                holder.destroy()
+            except tk.TclError:
+                pass
+            break
         return None
 
     # ---- 终端要的四个接口

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""打 v1.0.4 的四个交付包。
+"""打 v1.0.5 的四个交付包。
 
 为什么用脚本而不是右键压缩：
   · 排除项（data / .git / build / __pycache__ / *.bak）漏一个就会把 CA 私钥
@@ -19,7 +19,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-VER = "1.0.4"
+VER = "1.0.5"
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "_release" / f"v{VER}"
 STAMP = (2026, 10, 23, 1, 0, 0)
@@ -36,6 +36,8 @@ def skip(rel: Path) -> bool:
     if parts & JUNK_DIRS:
         return True
     if rel.suffix.lower() in JUNK_EXT:
+        return True
+    if ".bak" in rel.name.lower():
         return True
     if rel.name.startswith(JUNK_PREFIX):
         return True
@@ -86,14 +88,25 @@ def make_kb() -> Path:
     ]
     extra_docs = [p for p in (HERE / "docs").glob("*.md")]
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        # 显式清单和 docs/*.md 通配会撞名（改造说明那篇两边都有）。
+        # 记一下已经写进去的路径，重复的跳过 —— 否则 zipfile 会警告，
+        # 而且同一份文档在包里出现两次，用户解开看着也奇怪。
+        done: set[str] = set()
+
+        def once(src: Path, arc: str) -> None:
+            key = arc.replace("\\", "/")
+            if key in done or not add_file(zf, src, key):
+                return
+            done.add(key)
+
         for src, arc in docs:
-            add_file(zf, src, arc)
+            once(src, arc)
         for p in extra_docs:
-            add_file(zf, p, f"docs/{p.name}")
+            once(p, f"docs/{p.name}")
         # 几张关键界面图，纯文档用
         for shot in ("ai_stream.png", "ai_md.png", "model_dialog.png",
                      "model_menu.png", "ai_dock_welcome.png"):
-            add_file(zf, HERE / "screenshots" / shot, f"screenshots/{shot}")
+            once(HERE / "screenshots" / shot, f"screenshots/{shot}")
     return out
 
 
@@ -176,14 +189,28 @@ def make_github_clone() -> Path | None:
 
 
 def main() -> int:
+    """默认四个包全打。带 `--only kb,kit,portable,github` 可以只打其中几个。
+
+    为什么要这个开关：`(github).zip` 是 `git clone` 出来的快照，**必须在推完
+    四端之后**再打，否则包里的 main 还是上一版。发版时先打前三个、提交推送、
+    再用 `--only github` 补最后一个，才不会反复重打。
+    """
+    only = set()
+    for a in sys.argv[1:]:
+        if a.startswith("--only"):
+            only = {s.strip() for s in a.split("=", 1)[-1].split(",") if s.strip()}
     OUT.mkdir(parents=True, exist_ok=True)
     made = []
-    made.append(make_kb())
-    made.append(make_kit())
-    made.append(make_portable())
-    gh = make_github_clone()
-    if gh:
-        made.append(gh)
+    if not only or "kb" in only:
+        made.append(make_kb())
+    if not only or "kit" in only:
+        made.append(make_kit())
+    if not only or "portable" in only:
+        made.append(make_portable())
+    if not only or "github" in only:
+        gh = make_github_clone()
+        if gh:
+            made.append(gh)
     print("\n产物：")
     for p in made:
         print(f"  {p.name}  {p.stat().st_size / 1024 / 1024:.1f} MB")

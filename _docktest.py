@@ -203,19 +203,28 @@ def run():
     sec("11. 设置中心")
     win.open_settings()
     pump(win, 0.4)
-    dlg = win._settings_win
-    chk(dlg is not None and dlg.winfo_exists(), "设置窗打开")
+    # 现在默认落在页签里，不是弹窗（弹窗要按页签上的 ⧉ 才出来）
     from pages import settings_center as SC
+    pane = win._settings_reg().get(win.SETTINGS_TAB)
+    chk(pane is not None and pane.winfo_exists(), "设置嵌成页签")
+    chk(getattr(win, "_settings_win", None) is None, "默认不开弹窗")
     for key, label in SC.SECTIONS:
         try:
-            dlg.show(key)
-            pump(dlg, 0.12)
+            pane.show(key)
+            pump(win, 0.12)
             ok = True
             err = ""
         except Exception as e:  # noqa: BLE001
             ok, err = False, f"{type(e).__name__}: {e}"
         chk(ok, f"分区「{label}」能渲染", err)
-    chk(dlg._nav_btns["safe"].cget("text") == "安全", "安全分区不叫「账号」")
+    chk(pane._nav_btns["safe"].cget("text") == "安全", "安全分区不叫「账号」")
+    win.settings_popout()
+    pump(win, 0.4)
+    dlg = win._settings_win
+    chk(dlg is not None and dlg.winfo_exists(), "设置能拉成独立窗口")
+    win.settings_embed(dlg)
+    pump(win, 0.4)
+    chk(win._settings_win is None, "设置能嵌回主界面")
 
     sec("12. 外观切换")
     base = win._accent_hex()

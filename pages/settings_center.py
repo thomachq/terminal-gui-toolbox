@@ -102,20 +102,130 @@ def system_is_dark() -> bool:
 class SettingsCenter:
     """设置中心（混入主窗口）。"""
 
+    #: 设置页签的键名。跟终端（app.TERM_TAB）一样，一个页签一个键。
+    SETTINGS_TAB = "settings"
+
     # ================================================================ 入口
-    def open_settings(self, section: str = "look") -> None:
+    def _settings_reg(self) -> dict:
+        """设置页签的登记表。和终端一样懒建，不占 app.__init__ 的顺序。"""
+        reg = getattr(self, "_settings_panes", None)
+        if reg is None:
+            reg = {}
+            self._settings_panes = reg
+        return reg
+
+    def open_settings(self, section: str | None = None) -> None:
+        """打开设置。默认嵌成页签 —— 要并排看，点页签上的 ⧉ 拉成独立窗口。
+
+        三种形态按优先级找一遍：已在页签里 → 切过去；已拉成独立窗口 → 抬起来；
+        都没有 → 新开一个页签。反过来（页签被关掉、窗口被关掉）也在各自回调里清理，
+        所以这里只处理「还活着」的情况。
+
+        `section=None` 表示「别动它现在停在哪一页」：从顶栏再点一次「设置」，
+        不该把用户正在看的那一页弹回外观页。
+        """
+        reg = self._settings_reg()
+        pane = reg.get(self.SETTINGS_TAB)
+        if pane is not None:
+            try:
+                if pane.winfo_exists():
+                    self.tabbar.select(self.SETTINGS_TAB)
+                    if section:
+                        pane.show(section)
+                    return
+            except tk.TclError:
+                pass
+            reg.pop(self.SETTINGS_TAB, None)
         win = getattr(self, "_settings_win", None)
-        if win is not None and win.winfo_exists():
-            win.focus_set()
-            win.show(section)
-            return
-        self._settings_win = SettingsWindow(self)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.focus_set()
+                    if section:
+                        win.show(section)
+                    return
+            except tk.TclError:
+                pass
+            self._settings_win = None
+        self._settings_add_tab(section or SECTIONS[0][0])
+
+    def _settings_add_tab(self, section: str = "look"):
+        """在工作区里新建一个设置页签，返回它的 SettingsPane。"""
+        holder = U.wframe(self.workspace, "page")
+        holder.grid(row=0, column=0, sticky="nsew")
+        pane = SettingsPane(holder, self, section=section)
+        pane.pack(fill="both", expand=True)
+        self._settings_reg()[self.SETTINGS_TAB] = pane
+        self.tabbar.add(self.SETTINGS_TAB, "设置", closable=True,
+                        on_popout=self.settings_popout)
+        self.tabbar.select(self.SETTINGS_TAB)
+        return pane
+
+    def settings_popout(self) -> None:
+        """设置页签 → 独立窗口。停在哪一页就跟到哪一页，收回来也一样。"""
+        reg = self._settings_reg()
+        pane = reg.pop(self.SETTINGS_TAB, None)
+        section = SECTIONS[0][0]
+        if pane is not None:
+            try:
+                section = pane.section
+            except AttributeError:
+                pass
+            holder = pane.master
+            try:
+                pane.destroy()
+                holder.destroy()
+            except tk.TclError:
+                pass
+        self.tabbar.remove(self.SETTINGS_TAB)
+        win = SettingsWindow(self, section=section)
+        self._settings_win = win
+        win.lift()
+        win.focus_force()
+        self.status.set_state(
+            "设置已拉出为独立窗口 · 想收回点窗口里的「嵌回主界面」", "ok")
+
+    def settings_embed(self, w=None):
+        """独立窗口 → 页签。"""
+        w = w if w is not None else getattr(self, "_settings_win", None)
+        section = SECTIONS[0][0]
+        if w is not None:
+            try:
+                section = w.section
+            except AttributeError:
+                pass
+        if getattr(self, "_settings_win", None) is w:
+            self._settings_win = None
+        if w is not None:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        if self.SETTINGS_TAB in self.tabbar.tabs:
+            self.tabbar.remove(self.SETTINGS_TAB)
+        pane = self._settings_add_tab(section)
+        self.status.set_state("设置已嵌回主界面", "ok")
+        return pane
+
+    def settings_closed(self, w) -> None:
+        """独立窗口被关掉（点 × 或调 close）。"""
+        if getattr(self, "_settings_win", None) is w:
+            self._settings_win = None
 
     def _settings_sync(self) -> None:
-        """锁状态变了之后回头刷新设置页上的那行字（没开着就什么也不做）。"""
-        win = getattr(self, "_settings_win", None)
-        if win is not None and win.winfo_exists():
-            win.show(win.section)
+        """锁状态变了之后回头刷新设置页上的那行字（没开着就什么也不做）。
+
+        页签和独立窗口都可能开着，两边都刷一遍 —— 但同一个时刻只会有一边。
+        """
+        for w in (self._settings_reg().get(self.SETTINGS_TAB),
+                  getattr(self, "_settings_win", None)):
+            if w is None:
+                continue
+            try:
+                if w.winfo_exists():
+                    w.show(w.section)
+            except tk.TclError:
+                continue
 
     # ================================================================ 外观
     def _set_theme(self, key: str) -> None:
@@ -224,28 +334,29 @@ def _human(n: int) -> str:
     return f"{n:.1f} GB"
 
 
-class SettingsWindow(tk.Toplevel):
-    """左侧分类 + 右侧内容，尺寸对齐桌面设置的常见比例。"""
+class _SettingsShell:
+    """设置的正文与交互，与「宿主容器」无关。
 
-    def __init__(self, app):
-        super().__init__(app)
+    同一套东西要能跑在两种宿主上：
+      · `SettingsPane`   —— 嵌在主页签里（Frame）
+      · `SettingsWindow` —— 独立窗口（Toplevel）
+
+    抽出来的理由跟终端（ui/terminal.py 的 `_TermShell`）一样：拉出去、收回来
+    不该换一套实现，否则两边迟早不一致（一边能改配色、一边不能这种）。
+    这里只用两个宿主都有的能力，Toplevel 专有的（title / geometry / protocol）
+    留在子类里。
+
+    还有一条硬规矩：**智能运维助手永远只做侧边栏，不参与这套页签机制**。
+    助手要的是「一边看终端一边说话」，做成页签反而互相挡住。
+    """
+
+    def _init_settings(self, app, section: str | None = None) -> None:
         self.app = app
-        self.title("设置")
-        self.configure(bg=U.T.page)
-        self.transient(app)
-        self.section = SECTIONS[0][0]
-
+        keys = [k for k, _ in SECTIONS]
+        self.section = section if section in keys else SECTIONS[0][0]
         wrap = U.wframe(self, "page")
         wrap.pack(fill="both", expand=True, padx=U.px(14), pady=U.px(12))
-
-        head = U.wframe(wrap, "page")
-        head.pack(fill="x")
-        U.wlabel(head, "设置", "page", U.FONT_T).pack(side="left")
-        U.wlabel(head, "外观 · 工作区 · 助手 · 安全 · 备份 · 关于", "pagedim",
-                 U.FONT_XS).pack(side="left", padx=(U.px(10), 0))
-        U.RoundButton(head, "关闭", self.destroy, variant="secondary",
-                      height=30, padx=16).pack(side="right")
-
+        self._head(wrap)
         body = U.wframe(wrap, "page")
         body.pack(fill="both", expand=True, pady=(U.px(12), 0))
 
@@ -264,19 +375,35 @@ class SettingsWindow(tk.Toplevel):
         self.panel = tk.Frame(body, bg=U.T.page)
         self.panel.pack(side="left", fill="both", expand=True,
                         padx=(U.px(14), 0))
-
-        self.geometry(f"{U.px(900)}x{U.px(660)}")
-        self.minsize(U.px(760), U.px(520))
-        self.bind("<Escape>", lambda e: self.destroy())
         self.show(self.section)
+
+    # ------------------------------------------------------------ 头部
+    def _head(self, parent) -> None:
+        head = U.wframe(parent, "page")
+        head.pack(fill="x")
+        U.wlabel(head, "设置", "page", U.FONT_T).pack(side="left")
+        U.wlabel(head, "外观 · 工作区 · 助手 · 安全 · 备份 · 关于", "pagedim",
+                 U.FONT_XS).pack(side="left", padx=(U.px(10), 0))
+        # 只有独立窗口才需要这两个按钮：嵌在页签里的那份已经有 × 和 ⧉ 了
+        if isinstance(self, tk.Toplevel):
+            U.RoundButton(head, "关闭", self.close, variant="secondary",
+                          height=30, padx=16).pack(side="right")
+            if callable(getattr(self.app, "settings_embed", None)):
+                U.RoundButton(head, "嵌回主界面",
+                              lambda: self.app.settings_embed(self),
+                              variant="ghost", height=30,
+                              padx=14).pack(side="right", padx=(0, U.px(6)))
 
     # -- 切换
     def show(self, key: str) -> None:
         self.section = key
         for k, lb in self._nav_btns.items():
             on = k == key
-            lb.configure(bg=U.T.brand_soft if on else U.T.page,
-                         fg=U.T.brand_deep if on else U.T.text_dim)
+            try:
+                lb.configure(bg=U.T.brand_soft if on else U.T.page,
+                             fg=U.T.brand_deep if on else U.T.text_dim)
+            except tk.TclError:
+                return
         for w in self.panel.winfo_children():
             w.destroy()
         scroll = _Scroll(self.panel, U.T.page)
@@ -602,3 +729,42 @@ class _Scroll(tk.Frame):
     def _wheel(self, e):
         self.cv.yview_scroll(-3 if e.delta > 0 else 3, "units")
         return "break"
+
+
+class SettingsPane(_SettingsShell, tk.Frame):
+    """嵌在主界面页签里的设置页。除了没有窗口边框，行为与独立窗口一致。"""
+
+    def __init__(self, master, app, section: str | None = None):
+        tk.Frame.__init__(self, master, bg=U.T.page, bd=0)
+        self._init_settings(app, section)
+
+
+class SettingsWindow(_SettingsShell, tk.Toplevel):
+    """拉出来的独立设置窗口，尺寸对齐桌面设置的常见比例。"""
+
+    def __init__(self, app, section: str | None = None,
+                 master=None):
+        tk.Toplevel.__init__(self, master if master is not None else app)
+        self.configure(bg=U.T.page)
+        self.title("设置 · Settings")
+        self.geometry(f"{U.px(900)}x{U.px(660)}")
+        self.minsize(U.px(760), U.px(520))
+        try:
+            self.transient(app)
+        except tk.TclError:
+            pass
+        self._init_settings(app, section)
+        self.bind("<Escape>", lambda e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    def close(self) -> None:
+        """关窗要顺手把主程序手上的引用清掉，否则下次 open_settings 会去抬一个死窗口。"""
+        try:
+            cb = getattr(self.app, "settings_closed", None)
+            if callable(cb):
+                cb(self)
+        finally:
+            try:
+                self.destroy()
+            except tk.TclError:
+                pass
