@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""在真实桌面上创建/替换「Terminal GUI Toolbox」快捷方式。
+"""在真实桌面上创建/替换「终端工具箱」快捷方式。
 
 为什么要自己调 COM：
 
@@ -29,7 +29,7 @@
 跑法：
     python _mkshortcut.py                      # 默认 D:\\Tools\\Terminal-GUI-Toolbox
     python _mkshortcut.py --exe <exe 路径>
-    python _mkshortcut.py --name "别的名字"
+    python _mkshortcut.py --name "别的名字"   # 默认已是「终端工具箱」
     python _mkshortcut.py --dry-run            # 只打印将要做什么
 """
 from __future__ import annotations
@@ -43,7 +43,8 @@ from ctypes import POINTER, byref, c_int, c_ulong, c_ushort, c_void_p, c_wchar_p
 from pathlib import Path
 
 DEFAULT_EXE = r"D:\Tools\Terminal-GUI-Toolbox\TerminalToolbox.exe"
-DEFAULT_NAME = "Terminal GUI Toolbox"
+# 桌面上显示的名字（用户 2026-10-23 明确要中文名）
+DEFAULT_NAME = "终端工具箱"
 
 # CLSID_ShellLink / IID_IShellLinkW / IID_IPersistFile
 CLSID_SHELLLINK = "{00021401-0000-0000-C000-000000000046}"
