@@ -77,12 +77,7 @@ MobaXterm 好用但只有 Windows 且不开源；剩下的要么只管 SSH，要
 
 ## 安装与启动
 
-**方式一：下载现成的 exe**（推荐）
-
-到 [Releases](../../releases) 下载 `TerminalToolbox.exe`，放在任意目录双击。
-首次启动要解压依赖，约 3–5 秒；之后每次 2–3 秒。
-
-**方式二：从源码跑**
+**仓库只放源码，不提供二进制。** Releases 里没有 exe，要可执行文件请照下面自己打包。
 
 ```bash
 pip install -r requirements.txt
@@ -90,6 +85,15 @@ python app.py            # 或双击 run.cmd
 ```
 
 要求 Python 3.9+（开发与打包用的是 3.13）。除 paramiko 和 cryptography 外没有运行时依赖。
+
+**自己打 exe**
+
+```bash
+build.cmd                # 等价于 python -m PyInstaller --noconfirm --clean --distpath . toolbox.spec
+```
+
+约 1–2 分钟，产物是项目根目录下的 `TerminalToolbox.exe`（~19 MB）。
+图标由 `_mkicon.py` 生成（蓝底 + 终端窗口 + `>` 提示符 + 齿轮，16/24px 自动简化版）。
 
 **命令行参数**
 
@@ -105,22 +109,23 @@ TerminalToolbox.exe --page files   直接落到某一页
 onefile 模式下 `__file__` 指向 `%TEMP%\_MEIxxxx`（退出即删），
 数据目录必须锚定 `sys.executable` 的父目录，否则每次启动 CA 都会「消失」。
 
-**重新打包**：双击 `build.cmd`（等价于
-`python -m PyInstaller --noconfirm --clean --distpath . toolbox.spec`）。
-图标由 `_mkicon.py` 生成（蓝底 + 终端窗口 + `>` 提示符 + 齿轮，16/24px 自动简化版）。
-
 ## 四端镜像
 
 同名仓库 `terminal-gui-toolbox` 在四个平台同步，内容一致：
 
 | 平台 | 地址 | 说明 |
 |---|---|---|
-| GitHub | <https://github.com/thomachq/terminal-gui-toolbox> | 主仓库，Issues / Releases |
+| GitHub | <https://github.com/thomachq/terminal-gui-toolbox> | 主仓库，Issues |
 | Gitee | <https://gitee.com/thomachq/terminal-gui-toolbox> | 国内访问加速 |
 | GitCode | <https://gitcode.com/thomachq/terminal-gui-toolbox> | 国内访问加速 |
 | Forgejo（自建） | <https://chromas.synology.me:32443/thomachq/terminal-gui-toolbox> | 私有镜像，SSH 端口 2222 |
 
-四端都只放源码与截图，exe 走 GitHub Releases。
+四端都只放源码与截图，**任何平台都不挂二进制附件**。要用就 checkout tag 自己编译：
+
+```bash
+git clone --branch v1.0.6 https://github.com/thomachq/terminal-gui-toolbox
+cd terminal-gui-toolbox && build.cmd
+```
 
 ## 安全设计
 
@@ -506,7 +511,7 @@ Windows 用一次 CIM 批量取。
 
 ```
 terminal-gui-toolbox/
-├─ TerminalToolbox.exe  打包产物（双击即用，与 data 同级；不入库，走 Releases）
+├─ TerminalToolbox.exe  打包产物（双击即用，与 data 同级；不入库，build.cmd 现打）
 ├─ build.cmd            重新打包（--distpath . 直接输出到本目录）
 ├─ toolbox.spec         PyInstaller 配置（hiddenimports 显式列出运行时才 import 的模块）
 ├─ run.cmd              开发期启动器
