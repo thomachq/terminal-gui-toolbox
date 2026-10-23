@@ -31,9 +31,10 @@ JUNK_EXT = {".pyc", ".pyo", ".bak", ".log", ".spec.bak", ".tmp", ".dbg"}
 JUNK_PREFIX = ("dbg", "err.txt", "out.txt", "build_log")
 
 
-def skip(rel: Path) -> bool:
+def skip(rel: Path, keep_git: bool = False) -> bool:
     parts = set(rel.parts)
-    if parts & JUNK_DIRS:
+    junk = JUNK_DIRS - ({".git"} if keep_git else set())
+    if parts & junk:
         return True
     if rel.suffix.lower() in JUNK_EXT:
         return True
@@ -44,13 +45,14 @@ def skip(rel: Path) -> bool:
     return False
 
 
-def add_tree(zf: zipfile.ZipFile, root: Path, arc_prefix: str = "") -> int:
+def add_tree(zf: zipfile.ZipFile, root: Path, arc_prefix: str = "",
+             keep_git: bool = False) -> int:
     n = 0
     for p in sorted(root.rglob("*")):
         if p.is_dir():
             continue
         rel = p.relative_to(root)
-        if skip(rel):
+        if skip(rel, keep_git=keep_git):
             continue
         arc = (Path(arc_prefix) / rel) if arc_prefix else rel
         info = zipfile.ZipInfo(str(arc).replace("\\", "/"), STAMP)
@@ -169,22 +171,46 @@ def make_portable() -> Path:
 
 
 # ---------------------------------------------------------------- 4. github clone
+GH_URL = "git@github.com:thomachq/terminal-gui-toolbox.git"
+
+
 def make_github_clone() -> Path | None:
-    """GitHub 仓库的 git clone 快照（含 .git，可继续提交）。"""
+    """GitHub 仓库的 `git clone` 快照。
+
+    两个容易踩的坑，都在这函数里处理掉了：
+
+    1. **必须带 `.git`**。用户要的是「github 仓库的 git clone 版本」——没有 .git
+       就只是一份源码拷贝，解压后 `git log` / `git push` 全用不了。所以这里给
+       `add_tree` 传 keep_git=True，把 `.git` 目录一起打进去。
+    2. **别删整个克隆目录**。几百个文件的一次性删除会被安全闸门拦
+       （SAFE_DELETE_BULK_CONFIRM_REQUIRED），脚本会半路失败。所以改成复用：
+       目录已在就 `fetch` + 硬切到 `origin/main`，不在才 clone。留着下次发版接着用。
+    """
     out = OUT / "terminal-gui-toolbox(github).zip"
     tmp = HERE / "_release" / "_clone"
-    if tmp.exists():
-        shutil.rmtree(tmp, ignore_errors=True)
-    try:
-        subprocess.run(["git", "clone", "--quiet",
-                        "git@github.com:thomachq/terminal-gui-toolbox.git",
-                        str(tmp)], check=True, timeout=300)
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] clone 失败：{e}（网络或密钥问题），跳过这个包")
-        return None
+    if (tmp / ".git").is_dir():
+        try:
+            for cmd in (["fetch", "--prune", "--tags", "origin"],
+                        ["checkout", "-B", "main", "origin/main"],
+                        ["reset", "--hard", "origin/main"]):
+                subprocess.run(["git", "-C", str(tmp)] + cmd, check=True,
+                               timeout=300, capture_output=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] 复用已有克隆失败：{e}")
+            return None
+        head = subprocess.run(["git", "-C", str(tmp), "log", "--oneline", "-1"],
+                              capture_output=True, text=True, timeout=60).stdout.strip()
+        print(f"[info] 复用已有克隆，已更新到 {head}")
+    else:
+        try:
+            subprocess.run(["git", "clone", "--quiet", GH_URL, str(tmp)],
+                           check=True, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] clone 失败：{e}（网络或密钥问题），跳过这个包")
+            return None
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        add_tree(zf, tmp, "terminal-gui-toolbox")
-    shutil.rmtree(tmp, ignore_errors=True)
+        n = add_tree(zf, tmp, "terminal-gui-toolbox", keep_git=True)
+    print(f"[info] 快照 {n} 个文件（含 .git），克隆目录留在 {tmp} 供下次复用")
     return out
 
 
