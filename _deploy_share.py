@@ -42,27 +42,31 @@ def files(v: str) -> list[str]:
 
 
 def archive(p: Path, name: str) -> None:
-    """把旧文件挪进 old/。挪不动不算错，最多少一份留档。"""
+    """把旧文件挪进 old/。挪不动不算错，最多少一份留档。
+
+    这个 SMB 共享**不允许删除或覆盖已存在的文件**（unlink / MoveFileEx
+    REPLACE_EXISTING 都返回「拒绝访问」），只允许**新建**和**改名到不冲突的名字**。
+    所以目标名绝不能撞车：`name` → `name.prev` → `name.r2` → `name.r3` …
+    撞了顺延，而不是覆盖 —— v1.0.6 第二轮就是栽在这里（.prev 已存在 → 整个文件写不进去）。
+    """
     if not p.is_file():
         return
-    tgt = OLD / name
-    if tgt.exists():
-        tgt = OLD / (name + ".prev")
-    try:
-        p.replace(tgt)
-        print("  归档 →", tgt.name)
+    cands = [name, name + ".prev"] + [f"{name}.r{i}" for i in range(2, 100)]
+    tgt = next((OLD / c for c in cands if not (OLD / c).exists()), None)
+    if tgt is None:
+        print("  old/ 里同名留档太多，跳过归档")
         return
-    except OSError:
-        pass
-    try:
-        shutil.move(str(p), str(tgt))
-        print("  归档 →", tgt.name, "(move)")
-        return
-    except OSError:
-        pass
+    for how, fn in (("rename", lambda: p.replace(tgt)),
+                    ("move", lambda: shutil.move(str(p), str(tgt)))):
+        try:
+            fn()
+            print(f"  归档 → {tgt.name} ({how})")
+            return
+        except OSError:
+            pass
     try:
         shutil.copyfile(p, tgt)
-        print("  留档 →", tgt.name, "(原文件删不掉，两边都在)")
+        print(f"  留档 → {tgt.name}（原文件删不掉，两边都在）")
     except OSError as e:
         print("  留档也失败（不影响交付）:", e)
 
@@ -93,7 +97,15 @@ def main() -> int:
             continue
         if dst.is_file():
             archive(dst, name)
-        shutil.copyfile(src, dst)
+            if dst.is_file():
+                # 归档没把它挪走 → 现在写进去一定被拒（共享盘不允许覆盖）
+                print("  !! 旧文件挪不走，无法写入：", name)
+                continue
+        try:
+            shutil.copyfile(src, dst)
+        except PermissionError:
+            print("  !! 写入被拒（共享盘不允许覆盖已存在文件）：", name)
+            continue
         print("  已写 %-52s %7.1f MB" % (name, dst.stat().st_size / 1048576))
 
     # 复核：逐个比大小，别把「复制了」当成「复制对了」
