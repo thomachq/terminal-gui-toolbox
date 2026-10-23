@@ -222,9 +222,23 @@ def main() -> int:
     再用 `--only github` 补最后一个，才不会反复重打。
     """
     only = set()
-    for a in sys.argv[1:]:
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
         if a.startswith("--only"):
-            only = {s.strip() for s in a.split("=", 1)[-1].split(",") if s.strip()}
+            if "=" in a:
+                val = a.split("=", 1)[1]
+            else:
+                # 兼容 `--only github` 这种空格写法。以前只认 `--only=github`，
+                # 写成空格时 only 会变成 {"--only github"}，四个 in 全不命中，
+                # 结果**一个包都不打还返回成功** —— 发版时最难查的那种静默失败。
+                val = args[i + 1] if i + 1 < len(args) else ""
+            only = {s.strip() for s in val.split(",") if s.strip()}
+    known = {"kb", "kit", "portable", "github"}
+    bad = only - known
+    if bad:
+        print("[error] --only 不认识这些名字：" + ", ".join(sorted(bad))
+              + "；可选 " + ", ".join(sorted(known)))
+        return 2
     OUT.mkdir(parents=True, exist_ok=True)
     made = []
     if not only or "kb" in only:
