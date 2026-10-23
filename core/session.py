@@ -221,7 +221,16 @@ class LocalSession(BaseSession):
         # 允许外部指定「这次当自己是不是管理员」：自测要模拟普通用户，
         # 界面上「以管理员身份运行」勾选后也可以先假定提权成功再重启。
         self._admin_override: bool | None = None
+        # Windows 本机用哪种外壳："" = 自动（认命令前缀）/ "cmd" / "powershell"
+        self.shell = ""
         self.is_root = self.is_admin
+
+    def set_shell(self, shell: str) -> None:
+        """指定本机 Windows 的执行外壳。cmd 下不能再按 PowerShell 拼引号。"""
+        sh = str(shell or "").strip().lower()
+        self.shell = sh if sh in ("cmd", "powershell") else ""
+        if self.is_windows:
+            self.ps_native = self.shell != "cmd"
 
     @property
     def admin_kind(self) -> str:
@@ -269,8 +278,18 @@ class LocalSession(BaseSession):
             return 126, "", str(e)
 
     def run(self, cmd: str, timeout: int = 30) -> tuple[int, str, str]:
-        args = windows_argv(cmd) if self.is_windows else ["/bin/sh", "-c", cmd]
-        return self._exec(args, timeout)
+        return self._exec(self.argv_for(cmd), timeout)
+
+    def argv_for(self, cmd: str) -> list[str]:
+        """把一条命令变成 argv。抽出来是为了能单独测（不必真起进程）。"""
+        if not self.is_windows:
+            return ["/bin/sh", "-c", cmd]
+        if self.shell == "cmd":
+            return ["cmd", "/c", cmd]
+        if self.shell == "powershell":
+            return ["powershell", "-NoProfile", "-NonInteractive",
+                    "-Command", cmd]
+        return windows_argv(cmd)     # 自动：看命令自己有没有 powershell 前缀
 
     def sudo_ok(self, pw: str) -> bool:
         """在本机类 Unix 上验一次 sudo 密码（sudo -v 只刷时间戳，不执行命令）。"""
@@ -637,6 +656,8 @@ class ConnSpec:
     # 提权：给了密码就连上后自动提权（类 Unix 上是 sudo -i，网络设备是 enable）
     sudo_password: str = ""
     elevate: bool = False
+    # 本机 Windows 的执行外壳："" 自动 / "cmd" / "powershell"
+    shell: str = ""
 
 
 def open_session(spec: ConnSpec) -> BaseSession:
@@ -650,6 +671,8 @@ def open_session(spec: ConnSpec) -> BaseSession:
     """
     if spec.proto == "local":
         s = LocalSession()
+        if spec.shell:
+            s.set_shell(spec.shell)
         if spec.elevate and not s.is_windows and spec.sudo_password:
             s.sudo_ok(spec.sudo_password)
         return s

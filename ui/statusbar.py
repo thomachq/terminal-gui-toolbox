@@ -148,7 +148,8 @@ class Sep(tk.Frame):
 class StatusBar(tk.Frame):
     """底部状态条。未连接时所有指标显示 —。"""
 
-    def __init__(self, master, on_fold=None, on_unfold=None, on_disconnect=None):
+    def __init__(self, master, on_fold=None, on_unfold=None, on_disconnect=None,
+                 on_log=None):
         super().__init__(master, bg=U.T.card, bd=0, highlightthickness=1,
                          highlightbackground=U.T.border, height=U.px(H))
         self.pack_propagate(False)
@@ -158,6 +159,8 @@ class StatusBar(tk.Frame):
         self.on_fold = on_fold
         self.on_unfold = on_unfold
         self.on_disconnect = on_disconnect
+        self.on_log = on_log
+        self._log_on = False
 
         # ---- 设备
         self.cell_dev = Cell(self, self._paint_dev, "未连接")
@@ -191,6 +194,11 @@ class StatusBar(tk.Frame):
         self.cell_up2.pack(side="left")
 
         # ---- 右侧动作
+        # 「日志」放在最右（用户要求）：它开关底部日志面板，压在 ✕ 右边，
+        # 免得跟「断开」挨着，点错就是断线。
+        if self.on_log is not None:
+            self.btn_log = self._mini_btn("日志", U.T.text_dim, self.on_log)
+            self.btn_log.pack(side="right", padx=(0, U.px(4)))
         self.btn_close = self._mini_btn("✕", U.T.err, on_disconnect or (lambda: None))
         self.btn_close.pack(side="right", padx=(0, U.px(8)))
         # ◀ ▶ 只给「有侧边栏可折叠」的窗口用。主窗口的命令日志面板撤掉之后
@@ -212,6 +220,17 @@ class StatusBar(tk.Frame):
         self.clear()
 
     # ---------------- 内部
+    def set_log_on(self, on: bool) -> None:
+        """日志面板开着时把「日志」按钮点亮，一眼能看出状态。"""
+        self._log_on = bool(on)
+        btn = getattr(self, "btn_log", None)
+        if btn is None:
+            return
+        try:
+            btn.configure(fg=U.T.brand if self._log_on else U.T.text_dim)
+        except tk.TclError:
+            pass
+
     def _mini_btn(self, text: str, color: str, cmd) -> tk.Label:
         lb = tk.Label(self, text=text, bg=U.T.card, fg=color,
                       font=(U.FONT_FAMILY, 10, "bold"), bd=0, padx=U.px(7),

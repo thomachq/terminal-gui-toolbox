@@ -125,6 +125,22 @@ class SecurityPage(FirewallPage):
         if key == "fw" and getattr(self, "fw_backend", None) is None:
             self.after(80, self.fw_probe)
 
+    def _sec_fw_maybe_probe(self):
+        """停在防火墙页签时换了设备 —— 必须重探，否则会拿上一台的后端跑命令。"""
+        try:
+            if getattr(self, "seg_sec", None) is None:
+                return
+            if getattr(self.seg_sec, "current", "") != "fw":
+                return
+        except Exception:  # noqa: BLE001
+            return
+        self.fw_backend = None
+        try:
+            self.badge_fw.set("未探测", "mute")
+        except Exception:  # noqa: BLE001
+            pass
+        self.after(120, self.fw_probe)
+
     # ------------------------------------------------------------ 体检
     def sec_scan(self):
         s = self._active_session()

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -78,6 +79,98 @@ PROVIDERS: dict[str, dict] = {
 DEFAULT_PROVIDER = "deepseek"
 
 
+# ------------------------------------------------------------------ 模型能力
+# 这个程序只发 chat/completions，所以模型类型只剩「文本」一种，不给选。
+#
+# 思考档位取 off / low / high / max —— 不是拍脑袋：DeepSeek Harness GUI 的
+# scripts/model-capabilities.json 里 efforts 就是这四个键，那份表是拿 566 个
+# 真实模型逐条校对过的，也是本程序唯一验证过 reasoning_effort 能被网关接受的
+# 取值集合（实测 6 家全 200）。off 表示「不发这个字段」，不是发 "none"。
+THINKING_LEVELS: list[tuple[str, str]] = [
+    ("off", "关"), ("low", "低"), ("high", "高"), ("max", "最高"),
+]
+THINKING_KEYS = tuple(k for k, _ in THINKING_LEVELS)
+THINKING_LABEL = dict(THINKING_LEVELS)
+DEFAULT_THINKING = "high"
+
+# 输入模态只留这两项。视频/文件不做 —— 这个程序只会把文本发出去，
+# 勾了也没地方用。存 "vision"/"audio"（对外），读的时候 "image" 也认。
+MODALITIES: list[tuple[str, str]] = [("vision", "视觉"), ("audio", "音频")]
+MODALITY_KEYS = tuple(k for k, _ in MODALITIES)
+MODALITY_LABEL = dict(MODALITIES)
+_MODALITY_ALIAS = {"image": "vision", "img": "vision", "文本": "", "text": ""}
+
+
+def clean_caps(raw) -> dict:
+    """把外部来源的 caps 洗成固定结构。
+
+    `{"thinking": {"levels":[...], "default":"..."} | None, "tools": bool}`
+    thinking 为 None 表示这个模型不支持思考。默认档位必须属于可用档位 ——
+    不在就退回第一档，宁可显示错的默认值也不要让请求带一个不存在的档位。
+    """
+    src = raw if isinstance(raw, dict) else {}
+    think = src.get("thinking")
+    levels: list[str] = []
+    default = ""
+    if isinstance(think, dict):
+        for lv in (think.get("levels") or []):
+            s = str(lv or "").strip().lower()
+            if s in THINKING_KEYS and s not in levels:
+                levels.append(s)
+        if levels:
+            d = str(think.get("default") or "").strip().lower()
+            default = d if d in levels else levels[0]
+    elif isinstance(think, (list, tuple)):
+        for lv in think:
+            s = str(lv or "").strip().lower()
+            if s in THINKING_KEYS and s not in levels:
+                levels.append(s)
+        if levels:
+            default = levels[0]
+    return {
+        "thinking": ({"levels": levels, "default": default} if levels else None),
+        "tools": bool(src.get("tools")),
+    }
+
+
+def clean_modalities(raw) -> list[str]:
+    out: list[str] = []
+    if isinstance(raw, str):
+        raw = [raw]
+    for m in (raw or []):
+        s = str(m or "").strip().lower()
+        s = _MODALITY_ALIAS.get(s, s)
+        if s in MODALITY_KEYS and s not in out:
+            out.append(s)
+    return out
+
+
+def caps_label(m: dict) -> str:
+    """能力列的一句话摘要：`思考·高 · 工具 · 视觉`。"""
+    caps = m.get("caps") if isinstance(m.get("caps"), dict) else {}
+    parts: list[str] = []
+    th = caps.get("thinking") or {}
+    levels = th.get("levels") or []
+    if levels:
+        d = th.get("default") or levels[0]
+        parts.append(f"思考·{THINKING_LABEL.get(d, d)}")
+    if caps.get("tools"):
+        parts.append("工具")
+    mods = [MODALITY_LABEL.get(x, x) for x in (m.get("modalities") or [])]
+    if mods:
+        parts.append("＋".join(mods))
+    return " · ".join(parts) or "—"
+
+
+def fmt_tokens(n) -> str:
+    """Token 数字显示。空值一律「未知」，绝不显示 0 —— 0 会被当成真值。"""
+    try:
+        v = int(n or 0)
+    except (TypeError, ValueError):
+        return "未知"
+    return f"{v:,}" if v > 0 else "未知"
+
+
 # ------------------------------------------------------------------ 风险分级
 # 只影响界面上的默认勾选与二次确认，不阻止执行——最终决定权在人。
 _DANGER = [
@@ -86,7 +179,19 @@ _DANGER = [
     r"\bmkfs(\.\w+)?\b", r"\bdd\s+.*of=/dev/", r"\bwipefs\b", r"\bshred\b",
     r"\bshutdown\b", r"\breboot\b", r"\bhalt\b", r"\bpoweroff\b", r"\binit\s+0\b",
     r"\buserdel\b", r"\bgroupdel\b", r"\bpasswd\b", r"\bchpasswd\b",
-    r"\biptables\s+-F\b", r"\bnft\s+flush\b", r"\bufw\s+disable\b",
+    r"\biptables\s+(?:-t\s+\S+\s+)?-F\b", r"\bnft\s+flush\b",
+    r"\bufw\s+disable\b",
+    # 网络层的「一刀切」：清空整张表 / 重置全部规则 / 删默认路由 = 立刻失联
+    r"\bip\s+route\s+(?:flush|del|delete)\b.*\bdefault\b",
+    r"\bip\s+route\s+(?:replace|change|append|prepend)\b.*\bdefault\b",
+    r"\bip\s+-6\s+route\s+(?:flush|del|delete)\b",
+    r"\bip\s+route\s+flush\b",
+    r"\broute\s+(?:delete|del|change)\s+(?:0\.0\.0\.0|0\.0\.0\.0/0)\b",
+    r"\bnetsh\s+advfirewall\s+reset\b",
+    r"\bufw\s+reset\b", r"\bfirewall-cmd\s+--panic-on\b",
+    r"\biptables\s+(?:-t\s+\S+\s+)?-[XPFZ]\b",
+    r"\bip6tables\s+(?:-t\s+\S+\s+)?-[XPFZ]\b",
+    r"\bsysctl\s+-w\s+net\.ipv4\.ip_forward",
     r">\s*/etc/", r"\btruncate\b.*-s\s*0", r"\bchmod\s+-R\s+777\b",
     r"\bkill\s+-9\s+1\b", r":\(\)\s*\{", r"\bcurl\b[^|]*\|\s*(ba|z)?sh\b",
     r"\bformat\s+[a-zA-Z]:", r"\bdiskpart\b", r"\bbcdedit\b",
@@ -101,7 +206,15 @@ _WRITE = [
     r"\b(?:sed|perl)\s+-i\b", r"\btee\b", r"\bmv\b", r"\bcp\b", r"\brm\b",
     r"\bmkdir\b", r"\btouch\b", r"\bchmod\b", r"\bchown\b", r"\bln\b",
     r"\buseradd\b", r"\busermod\b", r"\bcrontab\b", r"\bsetfacl\b",
-    r"\biptables\b", r"\bfirewall-cmd\b", r"\bnft\b",
+    r"\biptables\s+(?:-t\s+\S+\s+)?-(?:A|I|D|R|N|E|X|F|Z|P)\b",
+    r"\bip6tables\s+(?:-t\s+\S+\s+)?-(?:A|I|D|R|N|E|X|F|Z|P)\b",
+    r"\bfirewall-cmd\b[^|;]*--(?:add|remove|change|set|new|delete|panic|reload|complete-reload|runtime-to-permanent|permanent)\b",
+    r"\bnft\s+(?:-f\s+\S+\s+)?(?:add|insert|delete|flush|create|destroy|replace|rename)\b",
+    r"\bufw\s+(allow|deny|reject|limit|delete|insert|add|route|enable|disable|default|reload|app)\b",
+    r"\bpfctl\s+-f\b", r"\bipfw\s+(add|delete|flush)\b",
+    r"\bnetsh\s+advfirewall\s+(?:firewall\s+)?(?:add|delete|set|reset)\b",
+    r"\bip\s+route\s+(add|del|delete|replace|change|append|prepend)\b",
+    r"\broute\s+(?:-p\s+|-f\s+)?(add|delete|change)\b",
     r"\bsc\s+(config|start|stop|delete)\b", r"\bnet\s+(start|stop)\b",
     r"\bschtasks\b", r"\breg\s+add\b", r"\bSet-Service\b", r"\bRestart-Service\b",
 ]
@@ -359,7 +472,8 @@ class AIConfig:
     # **当前模型**的镜像。这样引擎、界面、旧配置全都不用改一行；
     # 切换模型 = 把另一条档案写到这几个字段上。
     MODEL_FIELDS = ("provider", "base", "model", "temperature", "max_tokens",
-                    "key_enc", "ctx", "note")
+                    "key_enc", "ctx", "note", "kind", "caps", "modalities",
+                    "context", "max_input", "max_output", "thinking")
 
     def _model_from_flat(self, name: str = "", mid: str = "") -> dict:
         p = self.preset()
@@ -374,6 +488,12 @@ class AIConfig:
             "key_enc": str(self.data.get("key_enc") or ""),
             "ctx": int(self.data.get("ctx") or 0),
             "note": str(self.data.get("note") or ""),
+            "kind": "text",
+            "caps": clean_caps(self.data.get("caps")),
+            "modalities": clean_modalities(self.data.get("modalities")),
+            "context": int(self.data.get("context") or self.data.get("ctx") or 0),
+            "max_input": int(self.data.get("max_input") or 0),
+            "max_output": int(self.data.get("max_output") or 0),
             "created": str(int(time.time())),
         }
 
@@ -412,10 +532,24 @@ class AIConfig:
             mt = max(64, min(32000, int(m.get("max_tokens") or 1200)))
         except (TypeError, ValueError):
             mt = 1200
-        try:
-            ctx = max(0, int(m.get("ctx") or 0))
-        except (TypeError, ValueError):
-            ctx = 0
+        # 三个 token 限制：0 / 缺字段都表示「不知道」，界面显示「未知」。
+        # 不拿默认值填坑 —— 填了用户就会照着那个数字去切会话。
+        def _tok(*keys) -> int:
+            for k in keys:
+                try:
+                    v = int(m.get(k) or 0)
+                except (TypeError, ValueError):
+                    v = 0
+                if v > 0:
+                    return v
+            return 0
+
+        ctx = _tok("context", "ctx")
+        caps = clean_caps(m.get("caps"))
+        # 当前选中的思考档：只有落在「可用档位」里才算数，否则回落成空
+        # （空 = 用模型默认档，见 AIConfig.thinking()）
+        want = str(m.get("thinking") or "").strip().lower()
+        levels = ((caps.get("thinking") or {}).get("levels") or [])
         return {
             "id": str(m.get("id") or new_model_id()),
             "name": str(m.get("name") or "").strip() or "未命名模型",
@@ -425,7 +559,16 @@ class AIConfig:
             "temperature": temp,
             "max_tokens": mt,
             "key_enc": str(m.get("key_enc") or ""),
+            # ctx 是 context 的旧名字，留着给老配置和老测试用，值永远跟 context 走
             "ctx": ctx,
+            "context": ctx,
+            "max_input": _tok("max_input"),
+            "max_output": _tok("max_output"),
+            # 类型固定文本：这个程序只会发 chat/completions
+            "kind": "text",
+            "caps": caps,
+            "thinking": want if want in levels else "",
+            "modalities": clean_modalities(m.get("modalities")),
             "note": str(m.get("note") or ""),
             "created": str(m.get("created") or int(time.time())),
         }
@@ -466,7 +609,14 @@ class AIConfig:
                                          if m["provider"] in PROVIDERS
                                          else DEFAULT_PROVIDER)
             elif k in m:
-                self.data[k] = m[k]
+                v = m[k]
+                # caps / modalities 是可变容器：扁平镜像必须拿副本，
+                # 否则改扁平那份会顺手改掉 models 里的档案
+                if isinstance(v, dict):
+                    v = copy.deepcopy(v)
+                elif isinstance(v, list):
+                    v = list(v)
+                self.data[k] = v
         self.data["base"] = (m.get("base")
                              or PROVIDERS[self.provider]["base"])
         self.data["model"] = (m.get("model")
@@ -506,6 +656,49 @@ class AIConfig:
         else:
             self.save()
         return True, ""
+
+    # ------------------------------------------------------------ 思考档位
+    def thinking_levels(self) -> list[str]:
+        """当前模型支持的思考档位。空列表 = 这个模型不支持思考。"""
+        caps = self.current().get("caps") if isinstance(self.current(), dict) else {}
+        th = (caps or {}).get("thinking") or {}
+        return [str(x) for x in (th.get("levels") or [])]
+
+    def thinking(self) -> str:
+        """这一轮该用哪个档位。
+
+        优先级：用户在输入框旁选的 → 模型配的默认档 → 第一档。
+        模型不支持思考就返回空串，调用方据此不发 `reasoning_effort`。
+        """
+        m = self.current()
+        levels = self.thinking_levels()
+        if not levels:
+            return ""
+        want = str(m.get("thinking") or "")
+        if want in levels:
+            return want
+        th = ((m.get("caps") or {}).get("thinking") or {})
+        dflt = str(th.get("default") or "")
+        return dflt if dflt in levels else levels[0]
+
+    def set_thinking(self, level: str) -> bool:
+        """选一个档位并落盘。不在可用档位里就拒绝（返回 False）。"""
+        m = self.current()
+        levels = self.thinking_levels()
+        lv = str(level or "").strip().lower()
+        if lv and lv not in levels:
+            return False
+        m["thinking"] = lv
+        self.upsert_model(m)
+        return True
+
+    def context_limit(self) -> int:
+        """当前模型的上下文窗口。0 = 未知（界面上显示「未知」，不编数字）。"""
+        m = self.current()
+        try:
+            return max(0, int(m.get("context") or m.get("ctx") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def model_key(self, mid: str = "") -> str:
         """取某条模型的口令（默认当前）。解不开返回空串。"""
@@ -612,13 +805,19 @@ def model_view(m: dict, active_id: str) -> dict:
     else:
         state, tone = "就绪", "ok"
     base = str(m.get("base") or preset.get("base") or "—")
+    ctx = m.get("context") or m.get("ctx") or 0
     return {
         "name": str(m.get("name") or "未命名模型"),
         "provider": preset.get("label") or prov or "—",
         "provider_key": prov,
         "model": str(m.get("model") or preset.get("model") or "—"),
         "base": base,
-        "ctx": f"{int(m.get('ctx') or 0):,}" if m.get("ctx") else "默认",
+        # ctx 保留旧键名（老测试与老配置都在用），值仍是上下文窗口
+        "ctx": fmt_tokens(ctx),
+        "max_in": fmt_tokens(m.get("max_input")),
+        "max_out": fmt_tokens(m.get("max_output")),
+        "caps": caps_label(m),
+        "kind": "文本",
         "temp": f"{float(m.get('temperature') or 0):g}",
         "key": "已存" if has_key else ("不需要" if not need else "未填"),
         "state": state,
@@ -727,11 +926,18 @@ class OpenAIEngine:
             "max_tokens": int(self.cfg.data.get("max_tokens") or 1200),
             "stream": False,
         }
+        # 思考档位。只有模型自己声明了可用档位、且不是"关"才发 ——
+        # 给不认识这个字段的网关乱发参数会直接 400。
+        # "off" 的语义是「不发」，不是发 "none"（对齐 DSH 的 efforts.off = null）。
+        level = self.cfg.thinking()
+        if level and level != "off":
+            payload["reasoning_effort"] = level
         headers = {"Accept": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
         _trace("req", {"base": base, "model": model, "messages": messages,
-                       "provider": str(self.cfg.data.get("provider") or "")})
+                       "provider": str(self.cfg.data.get("provider") or ""),
+                       "thinking": level})
         t0 = time.time()
         try:
             data = _post_json(base + "/chat/completions", payload, headers,

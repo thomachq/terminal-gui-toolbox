@@ -493,7 +493,7 @@ class _SettingsShell:
         card.pack(fill="x")
         b = card.body
 
-        v_tray = tk.BooleanVar(value=bool(getattr(app, "_close_to_tray", True)))
+        v_tray = tk.BooleanVar(value=bool(getattr(app, "_close_to_tray", False)))
 
         def on_tray():
             app._close_to_tray = bool(v_tray.get())
@@ -506,7 +506,8 @@ class _SettingsShell:
         cell = U.wframe(row, "card")
         cell.pack(side="left", fill="x", expand=True, padx=(U.px(4), 0))
         U.wlabel(cell, "关闭窗口时收到托盘", "card", U.FONT_S).pack(anchor="w")
-        U.wlabel(cell, "关掉这个，点 × 就直接退出（终端里的会话会断）", "mute",
+        U.wlabel(cell, "默认关闭：点 × 直接退出。勾上则最小化到右下角托盘"
+                       "（图标可能在「︿」溢出区里）", "mute",
                  U.FONT_XS).pack(anchor="w")
 
         row2 = U.wframe(b, "card")

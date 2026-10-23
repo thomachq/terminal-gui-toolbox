@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 from tkinter import messagebox
 
@@ -29,6 +30,102 @@ HOST_COLS = [
     Column("cred", "凭证", 110),
     Column("last_used", "最近连接", 130),
 ]
+
+
+def host_fields(rec: dict | None = None, cred_opts=None, proxy_opts=None,
+                is_win: bool | None = None) -> list[dict]:
+    """「添加/编辑主机」的字段表。
+
+    做成模块级纯函数是为了能单独测：表单本身是模态窗，测试开它要等用户点。
+    这里只描述「有哪些字段、什么时候显示」，跟界面怎么画无关。
+
+    两条规矩：
+
+      · 协议选「本机」时，地址 / 端口 / 认证 / 私钥 / 凭证 / 代理全部收起来 ——
+        本机连接不需要地址也不需要口令，让用户填这些是纯折磨。
+      · 「本机」要问的是另一套：Linux 是 sudo（+ 口令），Windows 是
+        管理员（UAC）+ 外壳（cmd / powershell）。两边不混。
+    """
+    rec = rec or H.blank_record()
+    cred_opts = cred_opts if cred_opts is not None else [("", "不使用凭证（手填口令）")]
+    proxy_opts = proxy_opts if proxy_opts is not None else [("", "直连（不走代理）")]
+    is_win = sys.platform == "win32" if is_win is None else bool(is_win)
+    remote = ["ssh", "telnet"]
+    local_only = ["local"]
+
+    fields = [
+        {"key": "name", "label": "名称", "kind": "text", "required": True,
+         "default": H.display_name(rec) if rec.get("name") else "",
+         "hint": "清单里显示的名字，同一名称会覆盖原记录"},
+        {"key": "proto", "label": "协议", "kind": "select",
+         "options": [("ssh", "SSH"), ("telnet", "Telnet"), ("local", "本机")],
+         "default": H.proto_of(rec)},
+        {"key": "host", "label": "地址", "kind": "text",
+         "show_if": {"proto": remote},
+         "default": str(rec.get("host") or ""),
+         "hint": "IP 或域名；IPv6 直接写"},
+        {"key": "port", "label": "端口", "kind": "text",
+         "show_if": {"proto": remote},
+         "default": str(rec.get("port") or "22")},
+        {"key": "user", "label": "用户", "kind": "text",
+         "show_if": {"proto": remote},
+         "default": str(rec.get("user") or "")},
+        {"key": "auth", "label": "认证", "kind": "select",
+         "show_if": {"proto": remote},
+         "options": [("key", "私钥"), ("password", "登录密码")],
+         "default": str(rec.get("auth") or "key")},
+        {"key": "key_path", "label": "私钥路径", "kind": "file",
+         "show_if": {"proto": ["ssh"], "auth": ["key"]},
+         "default": str(rec.get("key_path") or ""),
+         "pick_title": "选择 SSH 私钥",
+         "filetypes": [("私钥文件",
+                        "id_rsa* id_ed25519* id_ecdsa* id_dsa* *.pem *.key"),
+                       ("全部文件", "*.*")],
+         "hint": "留空表示用 SSH 默认密钥或已在 agent 里的密钥"},
+        {"key": "password", "label": "登录密码", "kind": "password",
+         "show_if": {"proto": remote},
+         "default": "",
+         "hint": "填了会加密存进档案；多台共用建议改到「凭证管理」"},
+        # ---- 本机专属：Linux 只有 sudo，Windows 只有 UAC + 外壳
+        {"key": "sudo", "label": "使用 sudo 提权（进入后自动 sudo -i）",
+         "kind": "check", "show_if": {"proto": local_only},
+         "default": bool(rec.get("sudo")),
+         "hint": "不勾也能用；需要 root 时程序会弹窗问你要密码"},
+        {"key": "sudo_pass", "label": "sudo 密码", "kind": "password",
+         "show_if": {"proto": local_only, "sudo": [True]},
+         "default": "",
+         "hint": "勾了「保存」才会落盘；留空表示每次现问"},
+        {"key": "elevate", "label": "以管理员权限运行（UAC 提权）",
+         "kind": "check", "show_if": {"proto": local_only},
+         "default": bool(rec.get("elevate")),
+         "hint": "启动会话时会弹 UAC 让你同意；本机 Windows 没有 sudo"},
+        {"key": "shell", "label": "Shell", "kind": "select",
+         "show_if": {"proto": local_only},
+         "options": [("", "自动（认命令前缀）"), ("powershell", "PowerShell"),
+                     ("cmd", "cmd")],
+         "default": str(rec.get("shell") or ""),
+         "hint": "本机 Windows 用哪一种外壳执行命令"},
+        {"key": "group", "label": "分组", "kind": "text",
+         "default": str(rec.get("group") or ""),
+         "hint": "留空归到「未分组」"},
+        {"key": "tags", "label": "标签", "kind": "text",
+         "default": str(rec.get("tags") or ""),
+         "hint": "逗号分隔，例如：web, 生产, 上海"},
+        {"key": "cred_id", "label": "凭证", "kind": "select",
+         "show_if": {"proto": remote},
+         "options": cred_opts,
+         "default": str(rec.get("cred_id") or ""),
+         "hint": "选了凭证就以凭证为准，上面手填的口令不生效"},
+        {"key": "proxy_id", "label": "代理", "kind": "select",
+         "show_if": {"proto": remote},
+         "options": proxy_opts,
+         "default": str(rec.get("proxy_id") or ""),
+         "hint": "从「代理池」里挑一条链路进来"},
+    ]
+    # 本机提权只有一种形态：把另一端那两个字段直接去掉，
+    # 别让人对着一个永远用不上的勾选框发呆。
+    drop = {"elevate", "shell"} if not is_win else {"sudo", "sudo_pass"}
+    return [f for f in fields if f["key"] not in drop]
 
 
 class HostsPage:
@@ -216,49 +313,7 @@ class HostsPage:
             for px in pstore.proxies:
                 proxy_opts.append((str(px.get("id") or ""),
                                    str(px.get("name") or "")))
-
-        fields = [
-            {"key": "name", "label": "名称", "kind": "text", "required": True,
-             "default": H.display_name(rec) if rec.get("name") else "",
-             "hint": "清单里显示的名字，同一名称会覆盖原记录"},
-            {"key": "proto", "label": "协议", "kind": "select",
-             "options": [("ssh", "SSH"), ("telnet", "Telnet"), ("local", "本机")],
-             "default": H.proto_of(rec)},
-            {"key": "host", "label": "地址", "kind": "text",
-             "default": str(rec.get("host") or ""),
-             "hint": "IP 或域名；IPv6 直接写"},
-            {"key": "port", "label": "端口", "kind": "text",
-             "default": str(rec.get("port") or "22")},
-            {"key": "user", "label": "用户", "kind": "text",
-             "default": str(rec.get("user") or "")},
-            {"key": "auth", "label": "认证", "kind": "select",
-             "options": [("key", "私钥"), ("password", "登录密码")],
-             "default": str(rec.get("auth") or "key")},
-            {"key": "key_path", "label": "私钥路径", "kind": "file",
-             "default": str(rec.get("key_path") or ""),
-             "pick_title": "选择 SSH 私钥",
-             "filetypes": [("私钥文件",
-                            "id_rsa* id_ed25519* id_ecdsa* id_dsa* *.pem *.key"),
-                           ("全部文件", "*.*")],
-             "hint": "留空表示用 SSH 默认密钥或已在 agent 里的密钥"},
-            {"key": "password", "label": "登录密码", "kind": "password",
-             "default": "",
-             "hint": "填了会加密存进档案；多台共用建议改到「凭证管理」"},
-            {"key": "group", "label": "分组", "kind": "text",
-             "default": str(rec.get("group") or ""),
-             "hint": "留空归到「未分组」"},
-            {"key": "tags", "label": "标签", "kind": "text",
-             "default": str(rec.get("tags") or ""),
-             "hint": "逗号分隔，例如：web, 生产, 上海"},
-            {"key": "cred_id", "label": "凭证", "kind": "select",
-             "options": cred_opts,
-             "default": str(rec.get("cred_id") or ""),
-             "hint": "选了凭证就以凭证为准，上面手填的口令不生效"},
-            {"key": "proxy_id", "label": "代理", "kind": "select",
-             "options": proxy_opts,
-             "default": str(rec.get("proxy_id") or ""),
-             "hint": "从「代理池」里挑一条链路进来"},
-        ]
+        fields = host_fields(rec, cred_opts, proxy_opts)
         title = "编辑主机" if rec.get("name") else "添加主机"
         data = forms.FormDialog.open(
             self, title, fields,
@@ -266,6 +321,7 @@ class HostsPage:
         if not data:
             return None
         pwd = str(data.pop("password", "") or "").strip()
+        sudo_pw = str(data.pop("sudo_pass", "") or "").strip()
         merged = H.record_from_form(data, base=rec)
         if pwd:
             merged["password"] = pwd
@@ -273,6 +329,14 @@ class HostsPage:
             # 填了密码却没选认证方式，说明用户就是想用密码登 —— 别让他困惑
             if merged.get("auth") == "password" or not merged.get("key_path"):
                 merged["auth"] = "password"
+        if sudo_pw:
+            merged["sudo_password"] = sudo_pw
+            merged["remember"] = True
+        if merged["proto"] != "local":
+            # 切成远程之后，本机那三个字段留着只会误导下一次连接
+            merged["sudo"] = False
+            merged["elevate"] = False
+            merged["shell"] = ""
         errs = H.validate(merged, others=self.profiles.profiles)
         if errs:
             messagebox.showwarning("保存不了", "\n".join(errs), parent=self)

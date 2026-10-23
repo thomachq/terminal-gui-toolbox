@@ -38,6 +38,9 @@ _test_data/
 
 # 构建与提交用的临时文件
 build_out.log
+build_v*.log
+build_vpn*.log
+commit_out.log
 _commitmsg.txt
 _release/
 _tagmsg.txt

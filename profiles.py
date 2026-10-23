@@ -29,6 +29,8 @@ PROFILE_FIELDS = (
     # 这几个字段只描述「这台机器是什么」，不含任何凭据；
     # cred_id / proxy_id 指向别的库，本文件里永远只有 id，没有口令。
     "proto", "group", "tags", "cred_id", "proxy_id",
+    # ---- 本机协议专用（v1.0.7）：Linux 是 sudo，Windows 是 UAC + 外壳
+    "sudo", "elevate", "shell",
     "created", "last_used",
 )
 
@@ -317,7 +319,8 @@ class ProfileStore:
         out: dict = {}
         for k in PROFILE_FIELDS:
             v = p.get(k)
-            out[k] = bool(v) if k == "remember" else ("" if v is None else str(v))
+            out[k] = (bool(v) if k in ("remember", "sudo", "elevate")
+                      else ("" if v is None else str(v)))
         out.setdefault("name", "")
         out.setdefault("auth", "key")
         out["port"] = out.get("port") or "22"

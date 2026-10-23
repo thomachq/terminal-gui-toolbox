@@ -20,6 +20,9 @@
   placeholder
   filetypes file/secret_file 用：[(“私钥”, “*.pem *.key”), ...]
   initialdir 浏览时的起始目录（不给就优先 ~/.ssh）
+  show_if   {源字段: [可接受的值, ...]} 或 lambda 值字典 -> bool
+            不满足就整行收起来（也跳过必填校验）。联动靠它 —— 例如协议选
+            「本机」时，地址 / 端口 / 认证 / 私钥 / 凭证 / 代理全都不该出现。
 """
 from __future__ import annotations
 
@@ -46,6 +49,9 @@ class FormDialog(tk.Toplevel):
         self._getters: dict[str, callable] = {}
         self._checks: dict[str, U.Check] = {}
         self._widgets: dict[str, tk.Widget] = {}
+        # 联动：每个字段那一行有哪些控件 + select/check 的变量
+        self._row_widgets: dict[str, list[tk.Widget]] = {}
+        self._vars: dict[str, tk.Variable] = {}
         values = values or {}
 
         wrap = U.wframe(self, "page")
@@ -89,6 +95,8 @@ class FormDialog(tk.Toplevel):
 
         self.update_idletasks()
         self._center(parent, width)
+        self._bind_show_if()
+        self._apply_show_if()
         self.deiconify()
         self.grab_set()
         first = next((f for f in fields if f.get("kind", "text") in
@@ -117,10 +125,11 @@ class FormDialog(tk.Toplevel):
         return lb
 
     def _row_input(self, body, f, values, r) -> int:
-        self._label(body, f, r)
+        lb = self._label(body, f, r)
         kind = f.get("kind", "text")
         cell = U.wframe(body, "card")
         cell.grid(row=r, column=1, sticky="ew", pady=(U.px(7), U.px(7)))
+        self._row_widgets[f["key"]] = [lb, cell]
         val = values.get(f["key"], f.get("default", ""))
         width = int(f.get("width", 30))
 
@@ -147,6 +156,7 @@ class FormDialog(tk.Toplevel):
 
             self._getters[f["key"]] = _get_sel
             self._widgets[f["key"]] = cb
+            self._vars[f["key"]] = var
         elif kind == "textarea":
             tx = tk.Text(cell, height=int(f.get("lines", 4)), width=width,
                          font=U.MONO_S, bd=0, relief="flat",
@@ -217,20 +227,23 @@ class FormDialog(tk.Toplevel):
         cell = U.wframe(body, "card")
         cell.grid(row=r, column=0, columnspan=2, sticky="w",
                   pady=(U.px(6), U.px(6)))
+        self._row_widgets[f["key"]] = [cell]
         ck = U.Check(cell, f.get("label", f["key"]), bg=None)
         ck.pack(anchor="w")
         ck.set(bool(values.get(f["key"], f.get("default", False))))
         self._checks[f["key"]] = ck
         self._getters[f["key"]] = ck.get
+        self._vars[f["key"]] = ck.var
         if f.get("hint"):
             U.wlabel(cell, f["hint"], "mute", U.FONT_XS).pack(
                 anchor="w", padx=(U.px(26), 0))
         return r + 1
 
     def _row_readonly(self, body, f, values, r) -> int:
-        self._label(body, f, r)
+        lb = self._label(body, f, r)
         cell = U.wframe(body, "card")
         cell.grid(row=r, column=1, sticky="ew", pady=(U.px(6), U.px(6)))
+        self._row_widgets[f["key"]] = [lb, cell]
         txt = str(values.get(f["key"], f.get("default", "")))
         box = tk.Label(cell, text=txt, font=U.MONO_S if f.get("mono") else U.FONT_S,
                        bg=U.T.alt, fg=U.T.text_dim, anchor="w", justify="left",
@@ -238,6 +251,76 @@ class FormDialog(tk.Toplevel):
         box.pack(side="left", fill="x", expand=True)
         self._getters[f["key"]] = lambda v=txt: v
         return r + 1
+
+    # ------------------------------------------------------------ 联动
+    def _visible(self, f) -> bool:
+        spec = f.get("show_if")
+        if not spec:
+            return True
+        vals = self._collect()
+        if callable(spec):
+            try:
+                return bool(spec(vals))
+            except Exception:  # noqa: BLE001  联动写错了不该让窗口打不开
+                return True
+        for key, allow in dict(spec).items():
+            if not isinstance(allow, (list, tuple, set)):
+                allow = (allow,)
+            v = vals.get(key)
+            if not any(str(v).strip().lower() == str(a).strip().lower()
+                       for a in allow):
+                return False
+        return True
+
+    def _bind_show_if(self) -> None:
+        """谁被 show_if 提到，就盯住谁的变量。"""
+        watch: set[str] = set()
+        for f in self.fields:
+            spec = f.get("show_if")
+            if isinstance(spec, dict):
+                watch |= set(spec.keys())
+        for key in watch:
+            var = self._vars.get(key)
+            if var is None:
+                continue
+            try:
+                var.trace_add("write", lambda *_: self._apply_show_if())
+            except tk.TclError:
+                pass
+
+    def _apply_show_if(self) -> None:
+        changed = False
+        for f in self.fields:
+            ws = self._row_widgets.get(f["key"]) or []
+            if not ws:
+                continue
+            vis = self._visible(f)
+            for w in ws:
+                try:
+                    if vis:
+                        w.grid()
+                    else:
+                        w.grid_remove()
+                except tk.TclError:
+                    continue
+            changed = True
+        if changed:
+            self._refit()
+
+    def _refit(self) -> None:
+        """字段增减后重新量高度，宽度与位置不动。
+
+        不重设 geometry 的话，Toplevel 会保留原来的高度 —— 收起几行之后
+        底下留一大片空白，看起来像没生效。
+        """
+        try:
+            self.update_idletasks()
+            w = self.winfo_width() or self.winfo_reqwidth()
+            h = self.winfo_reqheight()
+            x, y = self.winfo_rootx(), self.winfo_rooty()
+            self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------ 动作
     def _center(self, parent, width: int) -> None:
@@ -265,6 +348,9 @@ class FormDialog(tk.Toplevel):
         data = self._collect()
         for f in self.fields:
             key = f["key"]
+            # 被 show_if 收起来的字段不参与校验 —— 用户看不见的东西不能拦住他
+            if not self._visible(f):
+                continue
             v = data.get(key)
             if f.get("required") and (v is None or str(v).strip() == ""):
                 return self._fail(f"{f.get('label', key)} 不能为空")

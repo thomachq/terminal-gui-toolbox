@@ -66,14 +66,24 @@ chk(_lm.LockManager(_lm.Settings(A.DATA_DIR / "settings.json")).enabled() is Fal
 print("== 1. 构建与主题 ==")
 a = A.ToolboxApp()
 pump(a, 0.5)
-chk(len(a._pages) == 16, "十六个页面都已构建", f"{list(a._pages)}")
+# v1.0.7 T1 之后日志不再是一页（挪到状态栏按钮 + 底边栏），所以是 15 页
+chk(len(a._pages) == 15, "十五个页面都已构建（日志已到底边栏）",
+    f"{list(a._pages)}")
 # 连接与设备已并入主机管理（旧键 conn 走别名），AI 运维改成了右侧助手
-for key in ("hosts", "proxy", "cred", "script", "log", "tools", "sys",
+for key in ("hosts", "proxy", "cred", "script", "tools", "sys",
             "files", "routes", "sec", "docker", "web", "db", "cron",
             "vpn", "api"):
     a.nav.select(key)
     pump(a, 0.18)
     chk(a.nav.current == key, f"导航切换到 {key}")
+a.log_dock_open()
+pump(a, 0.35)
+chk(bool(getattr(a, "_log_dock_built", False)) and a.log_dock_host.winfo_ismapped(),
+    "日志底边栏能打开")
+try:
+    a.log_dock_close()
+except Exception:  # noqa: BLE001
+    pass
 
 print("== 2. 表格控件 ==")
 chk(hasattr(a, "tbl_tool") and a.tbl_tool.winfo_exists(), "网络工具表格存在")

@@ -593,7 +593,7 @@ def test_log(app) -> None:
         app.audit.clear_cache()
     except AttributeError:
         pass
-    app.nav.select("log")
+    app.log_dock_open()          # v1.0.7 起日志在底部面板里，不再是页签
     pump(app, 0.5)
     app.audit_reload()
     pump(app, 0.3)
@@ -645,6 +645,57 @@ def test_log(app) -> None:
         chk(False, "输出内容可被搜索命中")
 
 
+def test_send_stop(app) -> None:
+    """发送 / 停止合成一个按钮（WorkBuddy 形态）。
+
+    侧栏就那么窄，并排两个按钮既挤又容易点错 —— 而且「现在按下去是发还是停」
+    本来就该由状态决定，不该让人在两个按钮之间找。
+    """
+    btn = getattr(app, "btn_ai_send", None)
+    chk(btn is not None, "发送按钮存在")
+    if btn is None:
+        return
+    chk(getattr(app, "btn_ai_stop", None) is btn,
+        "停止不是第二个按钮，是同一个对象")
+
+    app.ai_busy = False
+    app._ai_refresh_dock_state()
+    pump(app, 0.1)
+    chk(btn.text == "\u27a4", "空闲时是发送图标", btn.text)
+
+    app.ai_busy = True
+    app._ai_refresh_dock_state()
+    pump(app, 0.1)
+    chk(btn.text == "\u25a0", "忙碌时变停止图标", btn.text)
+
+    calls: list[int] = []
+    old = app.ai_dock_stop
+    app.ai_dock_stop = lambda *a, **k: calls.append(1)
+    try:
+        app._ai_send_or_stop()
+    finally:
+        app.ai_dock_stop = old
+    chk(calls == [1], "忙碌时点一下就是停止（不会又发一轮）", str(calls))
+
+    app.ai_busy = False
+    app._ai_refresh_dock_state()
+    pump(app, 0.1)
+    chk(btn.text == "\u27a4", "停下之后图标回到发送", btn.text)
+
+
+def test_composer(app) -> None:
+    """输入区三件：权限档位 / 思考档位 / 上下文用量，外加历史会话入口。"""
+    for attr, label in (("btn_ai_perm", "权限档位"),
+                        ("btn_ai_think", "思考档位"),
+                        ("lbl_ai_ctx", "上下文用量"),
+                        ("btn_dock_hist", "历史会话按钮")):
+        chk(hasattr(app, attr), f"输入区有{label}")
+    text, tone, tip = app._ai_ctx_usage()
+    chk("/" in text or "未知" in text, "用量文案有形", text)
+    chk(tone in ("mute", "warn", "err"), "用量有色调分档", tone)
+    chk(bool(tip), "用量带一句提示", tip)
+
+
 def main() -> int:
     import tkinter as tk  # noqa: F401  （确认 Tk 可用，报错信息更直白）
 
@@ -684,7 +735,8 @@ def main() -> int:
     chk(getattr(app, "ai_dock", None) is not None, "助手侧栏已打开")
 
     for fn in (test_attach, test_menu, test_model_menu, test_width,
-               test_sessions, test_log, test_clear):
+               test_sessions, test_send_stop, test_composer, test_log,
+               test_clear):
         try:
             fn(app)
         except Exception:  # noqa: BLE001

@@ -225,6 +225,35 @@ def main():
         except Exception:  # noqa: BLE001
             p4.kill()
 
+    # ---- 7. 点 × 必须真退出（2026-10-24 修的那个 bug）
+    # 以前 close_to_tray 默认 True，WM_CLOSE 只 withdraw，进程留在后台；Win11 又把
+    # 托盘图标塞进「︿」溢出区，用户既看不到图标也只能去任务管理器强杀。
+    # 这里直接给主窗口发 WM_CLOSE，等价于点 ×，然后看进程有没有自己走掉。
+    before5 = set(find_titled("Terminal GUI Toolbox"))
+    p5 = subprocess.Popen([str(EXE), "--page", "tools"], cwd=str(HERE))
+    try:
+        hwnd5 = wait_window("Terminal GUI Toolbox", before5)
+        chk(hwnd5 is not None, "退出检查：主窗口起出来了")
+        if hwnd5:
+            time.sleep(1.5)
+            u.PostMessageW(hwnd5, 0x0010, 0, 0)      # WM_CLOSE
+            gone = False
+            end = time.time() + 20.0
+            while time.time() < end:
+                if p5.poll() is not None:
+                    gone = True
+                    break
+                time.sleep(0.3)
+            chk(gone, "点 × 后进程自己退出（不再残留后台）",
+                "等了 20 秒还没退，rc=%r" % p5.poll())
+    finally:
+        if p5.poll() is None:
+            p5.kill()
+            try:
+                p5.wait(timeout=8)
+            except Exception:  # noqa: BLE001
+                pass
+
     npass = sum(1 for ok, _, _ in RESULTS if ok)
     nfail = len(RESULTS) - npass
     print("\n===== %d 项，通过 %d，失败 %d =====" % (len(RESULTS), npass, nfail))

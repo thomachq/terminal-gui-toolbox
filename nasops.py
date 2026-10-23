@@ -143,6 +143,10 @@ class NasSession:
                 pass
         return rc, out, err
 
+    @property
+    def has_sudo(self) -> bool:
+        return bool(self.sudo_pw)
+
     def sudo_ok(self, pw: str) -> bool:
         self.sudo_pw = pw
         try:
@@ -324,3 +328,146 @@ class NasSession:
         time.sleep(wait)
         rc2, out2, _ = self.run("netstat -tln 2>/dev/null | grep ':11094' | head -2")
         return f"{log}\n端口状态: {out2.strip() or '未监听'}"
+
+
+class MainSessionClient:
+    """把主程序当前会话（core.session）包成 NasSession 的样子。
+
+    为什么要这一层：内嵌到主程序里时，「连接」页签跟主机管理重复了
+    （用户的话：前面已经可以连接了）。去掉页签之后，证书控制台不能自己再
+    连一次，只能**借用主程序已经连好的那台设备**。
+
+    页签里的 do_probe / do_deploy / do_reapply 一行都没改 —— 它们调的还是
+    `self.nas.xxx`，这里把同名方法照着 NasSession 的语义接上即可。
+    probe / backup / deploy_material / patch_conf / restart / read_text /
+    write_text 直接复用 NasSession 的实现（那些方法只依赖 run / sftp /
+    sudo_pw / host / port / user，下面都提供了）。
+    """
+
+    # 复用实现：把未绑定函数挂到本类上，self 会是指向本类的实例
+    probe = NasSession.probe
+    backup = NasSession.backup
+    deploy_material = NasSession.deploy_material
+    patch_conf = NasSession.patch_conf
+    restart = NasSession.restart
+    read_text = NasSession.read_text
+    write_text = NasSession.write_text
+
+    def __init__(self, app=None, session=None, tracer=None):
+        self.app = app
+        self._session = session
+        self.tracer = tracer
+        self.sudo_pw: str | None = None
+
+    # ---------- 指向主程序当前会话 ----------
+    def _live(self):
+        s = self._session
+        if s is None and self.app is not None:
+            try:
+                s = self.app.session
+            except Exception:  # noqa: BLE001
+                s = None
+        if s is None:
+            return None
+        try:
+            if not s.alive:
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        return s
+
+    @property
+    def connected(self) -> bool:
+        return self._live() is not None
+
+    @property
+    def has_sudo(self) -> bool:
+        """能不能提权。本页临时填过口令就先用它，否则看主会话自己的提权能力。"""
+        if self.sudo_pw:
+            return True
+        s = self._live()
+        if s is None:
+            return False
+        try:
+            ok, _why = s.can_admin()
+            return bool(ok)
+        except Exception:  # noqa: BLE001
+            return bool(getattr(s, "sudo_pw", None))
+
+    def require(self) -> None:
+        if not self.connected:
+            raise NasError("先在「主机管理」里连接一台设备 —— 本页不再单独连接")
+
+    def close(self) -> None:
+        """会话归主程序管，这里什么都不做。
+
+        以前「断开」按钮会关掉 SSH 连接；内嵌时那样做等于把主程序的会话
+        也弄断，用户在别的页会发现设备没了。只清掉本地 sudo 口令。
+        """
+        self.sudo_pw = None
+
+    # ---------- 与 NasSession 对齐的属性 ----------
+    @property
+    def host(self) -> str:
+        s = self._live()
+        if s is None:
+            return ""
+        for name in ("host", "hostname"):
+            v = getattr(s, name, "")
+            if v:
+                return str(v)
+        return str(getattr(s, "label", "") or "")
+
+    @property
+    def port(self) -> int:
+        s = self._live()
+        try:
+            return int(getattr(s, "port", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def user(self) -> str:
+        s = self._live()
+        return str(getattr(s, "user", "") or "") if s is not None else ""
+
+    def label(self) -> str:
+        s = self._live()
+        if s is None:
+            return "未连接设备"
+        u, h = self.user, self.host
+        if u and h:
+            return f"{u}@{h}"
+        return h or str(getattr(s, "label", "") or "当前设备")
+
+    # ---------- 执行 ----------
+    def run(self, cmd: str, sudo: bool = False, timeout: int = 120):
+        self.require()
+        s = self._live()
+        if sudo:
+            admin = getattr(s, "run_admin", None)
+            if admin is not None:
+                setter = getattr(s, "set_sudo_pw", None)
+                if self.sudo_pw and setter:
+                    try:
+                        setter(self.sudo_pw)
+                    except Exception:  # noqa: BLE001
+                        pass
+                return admin(cmd, timeout=timeout)
+        return s.run(cmd, timeout=timeout)
+
+    def sudo_ok(self, pw: str) -> bool:
+        self.sudo_pw = pw
+        try:
+            rc, _, _ = self.run("id -u", sudo=True, timeout=20)
+            return rc == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def sftp(self):
+        self.require()
+        fn = getattr(self._live(), "sftp", None)
+        if fn is None:
+            raise NasError("当前会话不支持 SFTP 上传（本机 / Telnet 会话），"
+                           "请用 SSH 连接目标设备后再部署")
+        return fn()

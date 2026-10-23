@@ -123,7 +123,7 @@ onefile 模式下 `__file__` 指向 `%TEMP%\_MEIxxxx`（退出即删），
 四端都只放源码与截图，**任何平台都不挂二进制附件**。要用就 checkout tag 自己编译：
 
 ```bash
-git clone --branch v1.0.6 https://github.com/thomachq/terminal-gui-toolbox
+git clone --branch v1.0.7 https://github.com/thomachq/terminal-gui-toolbox
 cd terminal-gui-toolbox && build.cmd
 ```
 

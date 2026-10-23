@@ -65,6 +65,7 @@ EVENTS: dict[str, tuple[str, str]] = {
     "script.save": ("保存脚本", "脚本"),
     "sec.scan": ("执行安全体检", "安全"),
     "fw.change": ("修改防火墙", "安全"),
+    "route.change": ("修改路由表", "安全"),
     "cron.change": ("修改计划任务", "安全"),
     "site.bind": ("绑定站点域名", "Web"),
     "tls.issue": ("签发证书", "证书"),

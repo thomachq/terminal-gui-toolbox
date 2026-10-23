@@ -299,6 +299,36 @@ class DataTable(tk.Frame):
             self.tree.selection_set(kids[0])
             self.tree.focus(kids[0])
 
+    def select_row(self, pred) -> dict | None:
+        """按谓词找第一行并选中它（改完规则后高亮新行用）。
+
+        pred 可以是 dict 里的字段子集（`{"port": "8080"}`），也可以是
+        `lambda r: ...`。找不到返回 None，不抛。
+        """
+        if callable(pred):
+            match = pred
+        else:
+            keys = dict(pred or {})
+
+            def match(r):
+                return all(str(r.get(k, "")).strip() == str(v).strip()
+                           for k, v in keys.items())
+        for i, row in enumerate(self._view):
+            try:
+                if not match(row):
+                    continue
+            except Exception:  # noqa: BLE001  谓词写错了就当没匹配上
+                return None
+            try:
+                iid = str(i)
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.see(iid)
+            except tk.TclError:
+                return None
+            return row
+        return None
+
     # ------------------------------------------------------------ 内部
     @staticmethod
     def _search_blob(row: dict) -> str:

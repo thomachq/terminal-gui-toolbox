@@ -84,11 +84,13 @@ def main():
     chk(w > 600 and h > 400, "控制台有实际尺寸", f"{w}x{h}")
     chk(con.winfo_toplevel() is a, "顶层窗口就是主程序（没有另开窗口）")
 
-    print("\n== 3. 五个子页 ==")
+    print("\n== 3. 四个子页（内嵌没有「连接」页） ==")
     keys = list(con._pages)
-    chk(len(keys) == 5, "子页数量 5", str(keys))
-    for k in ("conn", "cert", "pack", "deploy", "cons"):
+    chk(len(keys) == 4, "子页数量 4", str(keys))
+    for k in ("cert", "pack", "deploy", "cons"):
         chk(k in con._pages, f"子页 {k} 存在")
+    # v1.0.7 T9：连接与主机管理重复，内嵌时不再单独一页
+    chk("conn" not in con._pages, "内嵌模式没有「连接」子页", str(keys))
     chk(con.nav.current is not None, "默认选中了一页", str(con.nav.current))
 
     print("\n== 4. 嵌入模式不重复造锁 / 主题按钮 ==")

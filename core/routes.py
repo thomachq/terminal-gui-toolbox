@@ -306,23 +306,86 @@ def backend_of(device, session) -> RouteBackend:
     return b
 
 
-# ==================================================================== 执行
-def apply(session, backend: RouteBackend, action: str, route: dict,
-          timeout: int = 45) -> tuple[int, str, str]:
-    """action: add / del。返回最后一条命令的结果。"""
+# ==================================================================== 改 / 设为默认
+def edit_cmds(backend: RouteBackend, old: dict, new: dict) -> list[str]:
+    """改一条路由 = 删旧的 + 加新的。
+
+    没有平台通用的「就地改路由」命令（Windows 的 route change 要求目标已存在
+    且不支持改接口），所以统一走 删+加，行为可预期。
+    """
+    err = backend.validate(new)
+    if err:
+        raise RouteError(err)
+    return backend.del_cmds(old) + backend.add_cmds(new)
+
+
+def default_cmds(backend: RouteBackend, r: dict) -> list[str]:
+    """把这条路由变成默认路由（目标网段 0.0.0.0/0）。
+
+    Linux 用 `ip route replace` 一步到位（原来有默认路由会被替换，
+    不会报 File exists）；Windows 只能先删再加，所以两跳。
+    """
+    gw = (r.get("gateway") or "").strip()
+    if not gw:
+        raise RouteError("设为默认路由必须有网关")
+    if isinstance(backend, LinuxRoute):
+        parts = ["ip", "route", "replace", "default", "via", gw]
+        if r.get("dev"):
+            parts += ["dev", r["dev"]]
+        if str(r.get("metric") or "").strip():
+            parts += ["metric", str(r["metric"])]
+        return [" ".join(parts)]
+    if isinstance(backend, WindowsRoute):
+        net, mask = "0.0.0.0", "0.0.0.0"
+        return [f"route delete {net} mask {mask}",
+                f"route -p add {net} mask {mask} {gw}"]
+    if isinstance(backend, BSDRoute):
+        return ["route -n change -default " + gw]
+    raise RouteError(f"{backend.label} 不支持在界面里改默认路由")
+
+
+def plan(backend: RouteBackend, action: str, route: dict,
+         old: dict | None = None) -> list[str]:
     if action == "add":
         err = backend.validate(route)
         if err:
             raise RouteError(err)
-        cmds = backend.add_cmds(route)
-    elif action == "del":
-        cmds = backend.del_cmds(route)
-    else:
-        raise RouteError(f"未知操作 {action}")
+        return backend.add_cmds(route)
+    if action == "del":
+        return backend.del_cmds(route)
+    if action == "edit":
+        return edit_cmds(backend, old or route, route)
+    if action == "default":
+        return default_cmds(backend, route)
+    raise RouteError(f"未知操作 {action}")
 
-    rc, out, err = 0, "", ""
+
+def undo_cmds(backend: RouteBackend, action: str, old: dict,
+              new: dict | None = None) -> tuple[list[str], str]:
+    """撤销上一步。拼不出来就给 ([], 原因)，不猜。"""
+    try:
+        if action == "add" and new:
+            return backend.del_cmds(new), "删掉刚加的那条"
+        if action == "del" and old:
+            return backend.add_cmds(old), "把删掉的那条加回来"
+        if action in ("edit", "default") and old and new:
+            return (backend.del_cmds(new) + backend.add_cmds(old),
+                    "先删改后的，再把原来的加回来")
+    except RouteError as e:
+        return [], str(e)
+    except Exception as e:  # noqa: BLE001
+        return [], f"拼不出撤销命令：{e}"
+    return [], "没有可撤销的上一步"
+
+
+# ==================================================================== 执行
+def apply(session, backend: RouteBackend, action: str, route: dict,
+          timeout: int = 45, old: dict | None = None) -> tuple[int, str, str]:
+    """action: add / del / edit / default。返回最后一条命令的结果。"""
+    cmds = plan(backend, action, route, old=old)
     if isinstance(backend, NetworkRoute):
         return _apply_network(session, backend, cmds, timeout)
+    rc, out, err = 0, "", ""
     for c in cmds:
         rc, o, e = session.run_admin(c, timeout=timeout)
         out += o

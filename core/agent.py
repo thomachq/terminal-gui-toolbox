@@ -397,13 +397,19 @@ class Agent:
     # -- 主循环
     def run(self, goal: str, execute, *, context: str = "", skill_text: str = "",
             confirm=None, on_event=None, should_stop=None,
-            risk_of=None, out_limit: int = 2400) -> dict:
+            risk_of=None, out_limit: int = 2400,
+            poll_inject=None) -> dict:
         """跑一轮任务。
 
         execute(tool_id, args) -> (ok: bool, text: str)   由界面层提供，负责真正落地
         confirm(calls: list[dict]) -> bool                 需要人点头时调用
         on_event(kind, payload)                            见下方 emit
         risk_of(call) -> str                              页面动作的真实风险由界面给
+        poll_inject() -> list[str]                         中途插话：每步开始前取一次
+
+        插话走的是**同一轮**：取到的句子作为一条 user 消息追加到 history，
+        下一步的 messages 里自然就带上了。绝不允许并发跑第二个 run ——
+        transcript 是这一轮的现场，另起一轮等于把它扔掉。
         """
         emit = on_event or (lambda *_a, **_k: None)
         stop = should_stop or (lambda: False)
@@ -412,6 +418,7 @@ class Agent:
         ran: list[str] = []
         refused: list[str] = []
         skipped: list[str] = []
+        injected: list[str] = []
         transcript: list[str] = []
         stopped = False
         answer = ""
@@ -424,6 +431,21 @@ class Agent:
                 stopped = True
                 emit("stopped", {"step": step})
                 break
+            # 用户在这期间补的话：先进 history，再让模型看到
+            if poll_inject is not None:
+                try:
+                    extra = poll_inject() or []
+                except Exception:  # noqa: BLE001  队列坏了不该毁掉这一轮
+                    extra = []
+                for text in extra:
+                    t = str(text or "").strip()
+                    if not t or t in injected:
+                        continue
+                    injected.append(t)
+                    self.history.append(
+                        {"role": "user",
+                         "content": f"（用户在你执行期间补充）{t}"})
+                    emit("inject", {"text": t, "step": step})
             steps = step
             try:
                 text, usage = aiops.make_engine(self.llm).chat(
@@ -432,7 +454,8 @@ class Agent:
                 msg = str(e) if isinstance(e, aiops.AIError) else f"{type(e).__name__}: {e}"
                 emit("error", {"step": step, "msg": msg})
                 return {"ok": False, "error": msg, "steps": step, "ran": ran,
-                        "refused": refused, "skipped": skipped, "answer": answer}
+                        "refused": refused, "skipped": skipped,
+                        "injected": injected, "answer": answer}
             self.tokens += int(usage.get("total") or 0)
             self.last_usage = usage
 
@@ -501,7 +524,8 @@ class Agent:
         self.history.append({"role": "user", "content": goal})
         self.history.append({"role": "assistant", "content": answer[:1200]})
         return {"ok": True, "steps": steps, "ran": ran, "refused": refused,
-                "skipped": skipped, "stopped": stopped, "answer": answer}
+                "skipped": skipped, "stopped": stopped, "injected": injected,
+                "answer": answer}
 
 
 def _call_brief(call: dict) -> str:

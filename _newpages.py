@@ -168,7 +168,8 @@ def make_dev():
 # ------------------------------------------------------------------ 用例
 def test_build(app) -> None:
     print("== 1. 页面构建 ==")
-    chk(len(app._pages) == 16, "十六个页面都已构建", f"{list(app._pages)}")
+    # v1.0.7 起「日志管理」不再是页签（改成底部可开关面板），所以是 15 个
+    chk(len(app._pages) == 15, "十五个页面都已构建", f"{list(app._pages)}")
     for key in ("sec", "db", "cron", "web"):
         chk(key in app._pages, f"页面 {key} 已注册")
     app.nav.select("fw")
@@ -229,8 +230,12 @@ def test_sec(app) -> None:
     # 等级→色调映射
     chk(S.Check("x", "试验", S.BAD, "d").as_row()["_tone"] == "err", "等级映射色调")
     # 页签里确实嵌着防火墙页
-    chk(getattr(app, "tbl_fw", None) is not None and app.fw_backend is None,
-        "防火墙视图已嵌入且未自动探测")
+    chk(getattr(app, "tbl_fw", None) is not None, "防火墙视图已嵌入")
+    # T8 之后行为变了：点进「防火墙」页签会**自动探测**后端（以前要点「探测后端」）。
+    # 所以这里不该再断言 fw_backend is None，而要断言探测确实跑过。
+    _note = str(app.lbl_fw.cget("text") or "")
+    chk(app.fw_backend is not None or "没探到" in _note or "探测失败" in _note,
+        "点进防火墙页签会自动探测后端", _note[:48])
 
 
 def test_db(app) -> None:

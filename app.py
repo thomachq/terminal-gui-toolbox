@@ -51,6 +51,7 @@ from core.sessionmgr import SessionManager
 from core.session import (ConnSpec, LocalSession, NeedElevation, SSHSession,
                           SessionError, open_session)
 from pages.ai_dock import AiDockPage
+from pages.log_dock import LogDock
 from pages.cred_page import CredPage
 from pages.hosts_page import HostsPage
 from pages.log_page import LogPage
@@ -104,7 +105,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.6"
+APP_VER = "1.0.7"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -170,7 +171,7 @@ TOOL_COLS = {
 
 class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                  FilesPage, AiDockPage, ApiPage, WebPage, SettingsCenter,
-                 HostsPage, ProxyPage, CredPage, ScriptPage, LogPage,
+                 HostsPage, ProxyPage, CredPage, ScriptPage, LogPage, LogDock,
                  tk.Tk):
     def __init__(self):
         super().__init__()
@@ -178,6 +179,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.configure(bg=U.T.page)
         # ---- 窗口几何：先按屏幕工作区把默认尺寸压进去，再套上次退出时的样子
         self._win_state = winstate.WinState(DATA_DIR / "window.json")
+        self._win_pref = dict(self._win_state.data)
         self._win_normal: tuple[int, int, int, int] | None = None
         self._apply_win_geometry()
         self.bind("<Configure>", self._on_win_configure)
@@ -204,7 +206,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self._local_dev: DeviceInfo | None = None
         self._toast_job = None
         self._tray: Tray | None = None
-        self._close_to_tray = True
+        self._tray_hint_win: tk.Toplevel | None = None
+        self._close_to_tray = False
         self._dk_probed = False
         self._web_probed = False
         self._routes_loaded = False
@@ -236,6 +239,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
         # ---- 机密与档案
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # 页面（尤其是防火墙/路由备份）要往 data 下写东西，统一从这里取，
+        # 免得各页自己拼 APP_DIR 拼错。
+        self.data_dir = DATA_DIR
         crypto_store.set_key_dir(DATA_DIR)
         self.settings = lockmgr.Settings(DATA_DIR / "settings.json")
         self.lock = lockmgr.LockManager(self.settings)
@@ -251,7 +257,11 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         # 反过来做的话，第一帧会闪一下默认配色。
         self.app_ver = APP_VER
         self.app_name = APP_NAME
-        self._close_to_tray = bool(self.settings.data.get("close_to_tray", True))
+        # 默认 False：点 × 就是退出。以前默认 True，结果图标被 Win11 收进
+        # 右下角「︿」溢出区，用户看到的是「窗口没了、进程还在」，只能去
+        # 任务管理器强杀 —— 用户 2026-10-23 明确说这是 bug。想驻留托盘的人
+        # 自己去设置里打开。
+        self._close_to_tray = bool(self.settings.data.get("close_to_tray", False))
         self._apply_theme_pref()
 
         # ---- 本地 API（智能体接入）
@@ -290,6 +300,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         if self.agent_cfg.data.get("dock_open"):
             self.after(260, self.ai_dock_open)
+        # 上次退出时日志面板是开着的，就还开着（高度也在 window.json 里）
+        if getattr(self, "_log_want_open", False):
+            self.after(500, self.log_dock_open)
         self._maybe_lock_on_start()
         self.after(600, self._boot_api)
 
@@ -409,6 +422,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self._dk_probed = False
         self._web_probed = False
         self.fw_backend = None
+        self._fw_raw = ""
+        self._fw_undo = None
+        self._routes_undo = None
         self._term_cwd_val = ""
         s = self.session
         dev = self.device
@@ -422,7 +438,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             try:
                 self.lbl_tool_os.configure(text="未连接 · 将使用本机命令")
                 self.lbl_route.configure(text="点「刷新」读取设备当前路由表。")
-                self.lbl_fw.configure(text="点「探测后端」判断设备用哪套防火墙。")
+                self.lbl_fw.configure(text="进页面自动探测用的是哪套防火墙。")
+                self.badge_fw.set("未探测", "mute")
             except (AttributeError, tk.TclError):
                 pass
             try:
@@ -470,6 +487,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.paned.pack(side="left", fill="both", expand=True,
                         padx=(U.px(6), U.px(8)), pady=(U.px(2), U.px(8)))
 
+        # 底部日志面板的宿主（先不 pack，状态栏那个「日志」按钮点了才出现）
+        self.log_dock_setup()
+
         # 左半：导航在最左，页签内容占它右边
         self.main = U.wframe(self.paned, "page")
         self.paned.add(self.main, stretch="always", minsize=U.px(620))
@@ -514,11 +534,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 ("vpn", "隧道客户端证书管理"),
                 ("api", "智能体接入"),
             ]),
-            # 日志管理单独放最底下（用户要求）：它是「事后回看」的地方，
-            # 不该混在「对机器做什么」的工具列表里，翻起来也更顺手。
-            ("group", "审计", [
-                ("log", "日志管理"),
-            ]),
+            # 「日志管理」不再占导航位（用户要求）：它改成底部一条可开关的
+            # 面板，入口在状态栏最右那个「日志」按钮上。
         ], on_change=self._show, width=176, alias=NAV_ALIAS)
         # 先 pack 导航、再 pack 内容：两个都是 side="left"，后来的会排在右边。
         # 顺序反了导航就跑到页面中间去了。
@@ -540,7 +557,6 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                              ("proxy", self.build_proxy),
                              ("cred", self.build_cred),
                              ("script", self.build_script),
-                             ("log", self.build_log),
                              ("tools", self._build_tools),
                              ("sys", self._build_sys),
                              ("files", self.build_files),
@@ -579,11 +595,16 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
     def _statusbar(self):
         bar = U.wframe(self, "page")
         bar.pack(fill="x", padx=U.px(10), pady=(0, U.px(8)))
-        self.status = StatusBar(bar, on_disconnect=self._disconnect)
+        self.status = StatusBar(bar, on_disconnect=self._disconnect,
+                                on_log=self.log_dock_toggle)
         self.status.pack(fill="x")
 
     def _show(self, key: str):
         key = NAV_ALIAS.get(key, key)
+        # 日志不再是页签：--page log 或者旧脚本点「日志管理」都走这条
+        if key == "log":
+            self.log_dock_open()
+            return
         # 左侧导航属于「主机资源」页签。人在终端页签时点了导航，要先把工作区切回来，
         # 否则会变成「导航高亮了但画面还是终端」。
         tb = getattr(self, "tabbar", None)
@@ -643,6 +664,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         elif key == "sec" and not self._sec_done:
             self._sec_done = True
             self.after(200, self.sec_scan)
+            self._sec_fw_maybe_probe()
         elif key == "db" and not self._db_probed:
             self._db_probed = True
             self.after(200, self.db_probe)
@@ -674,6 +696,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         elif key == "sec":
             self._sec_done = True
             self.after(150, self.sec_scan)
+            self._sec_fw_maybe_probe()
         elif key == "db":
             self._db_probed = True
             self.after(150, self.db_probe)
@@ -731,14 +754,62 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self._win_state_save()
         if self._tray is None or not self._tray.running:
             self.iconify()
+            self.toast("托盘不可用，已最小化到任务栏", "warn")
             return
         self.withdraw()
+        # 系统气泡在 Win11 上经常被「专注助手」吞掉，用户就以为程序没了。
+        # 所以除了气泡，再自己画一个悬浮提示 —— 这个是自绘窗口，一定看得见。
         try:
-            self._tray.notify(APP_NAME, "已最小化到托盘，双击图标恢复")
+            self._tray.notify(APP_NAME, "已收进托盘，双击图标恢复")
         except Exception:  # noqa: BLE001
             pass
+        self._tray_hint()
+
+    def _tray_hint(self) -> None:
+        """收起后给一个自绘小提示：图标去哪了、怎么彻底退出。
+
+        不能只靠 Shell_NotifyIcon 的气泡：Win11 默认把新图标塞进任务栏右下角
+        的「︿」溢出区，气泡也常被专注助手压掉，用户找不到就以为进程残留。
+        """
+        self._hide_tray_hint()
+        try:
+            area = winstate.work_area()
+            w, h = U.px(376), U.px(92)
+            x = area[0] + area[2] - w - U.px(16)
+            y = area[1] + area[3] - h - U.px(16)
+            win = tk.Toplevel(self)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            body = tk.Frame(win, bg=U.T.card, bd=0,
+                            highlightthickness=1, highlightbackground=U.T.border)
+            body.pack(fill="both", expand=True)
+            U.wlabel(body, "已收进系统托盘", "card",
+                     (U.FONT_FAMILY, 10, "bold")).pack(
+                fill="x", padx=U.px(12), pady=(U.px(10), 0))
+            U.wlabel(body,
+                     "图标在任务栏右下角的「︿」里，双击恢复。\n"
+                     "右键图标 → 退出，才是真正结束进程。",
+                     "mute", U.FONT_XS, justify="left").pack(
+                fill="x", padx=U.px(12), pady=(U.px(2), U.px(10)))
+            win.bind("<Button-1>", lambda _e: self._hide_tray_hint())
+            for child in body.winfo_children():
+                child.bind("<Button-1>", lambda _e: self._hide_tray_hint())
+            self._tray_hint_win = win
+            self.after(9000, self._hide_tray_hint)
+        except Exception:  # noqa: BLE001
+            self._tray_hint_win = None
+
+    def _hide_tray_hint(self) -> None:
+        win, self._tray_hint_win = self._tray_hint_win, None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
 
     def _show_from_tray(self) -> None:
+        self._hide_tray_hint()
         try:
             self.deiconify()
             self.lift()
@@ -876,11 +947,21 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             x, y = self.winfo_x(), self.winfo_y()
         except tk.TclError:
             x, y = nx, ny
+        log_open = bool(getattr(self, "_log_dock_on", False))
+        log_h = 0
+        if getattr(self, "_log_dock_built", False):
+            try:
+                log_h = int(self.log_dock_host.winfo_height())
+            except tk.TclError:
+                log_h = 0
+        if log_h <= 1:
+            log_h = int(getattr(self, "_log_dock_h", 0) or 0)
         self._win_state.save({
             "x": int(x), "y": int(y),
             "w": int(nw), "h": int(nh),
             "nx": int(nx), "ny": int(ny), "nw": int(nw), "nh": int(nh),
             "zoomed": bool(zoomed), "scale": float(U.S),
+            "log_open": log_open, "log_h": log_h,
         })
 
     def _cancel_timers(self) -> None:
@@ -918,6 +999,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
     def _quit_app(self) -> None:
         self._win_state_save()
+        self._hide_tray_hint()
         self._cancel_timers()
         try:
             if self._tray:
@@ -1383,6 +1465,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         # 提权：内容随「协议 + 本机系统」变，见 _rebuild_elevation()
         self.v_elevate = tk.BooleanVar(value=False)
         self.v_admin = tk.BooleanVar(value=False)
+        # 本机 Windows 的执行外壳：auto / powershell / cmd
+        self.v_shell = tk.StringVar(value="")
         self.row_elev = U.wframe(b, "card")
         self.row_elev.pack(fill="x", pady=(9, 0))
         self.elev_holder = self.row_elev
@@ -1531,6 +1615,29 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             U.wlabel(row, "已具备管理员权限" if admin else "当前是普通用户",
                      "ok" if admin else "dim", U.FONT_XS).pack(
                 side="left", padx=(12, 0))
+            # Windows 端还有 cmd / PowerShell 两种情况 —— 用下拉，别让人猜
+            sh = U.wframe(holder, "card")
+            sh.pack(fill="x", pady=(6, 0))
+            U.wlabel(sh, "外壳", "card", U.FONT_S).pack(side="left")
+            cb = ttk.Combobox(sh, textvariable=self.v_shell, state="readonly",
+                              width=14, font=U.FONT_S,
+                              values=["自动（认命令前缀）", "PowerShell", "cmd"])
+            cb.pack(side="left", padx=(8, 0))
+            _SHELL_UI = {"": "自动（认命令前缀）", "powershell": "PowerShell",
+                         "cmd": "cmd"}
+            _SHELL_KEY = {v: k for k, v in _SHELL_UI.items()}
+            try:
+                cb.set(_SHELL_UI.get(self.v_shell.get(), "自动（认命令前缀）"))
+            except tk.TclError:
+                pass
+
+            def _shell_pick(_e=None, c=cb):
+                try:
+                    self.v_shell.set(_SHELL_KEY.get(c.get(), ""))
+                except tk.TclError:
+                    pass
+
+            cb.bind("<<ComboboxSelected>>", _shell_pick)
             U.wlabel(holder,
                      "本机 Windows 没有 sudo：改路由 / 防火墙、终端里的提权命令，"
                      "都要整个程序以管理员身份运行。没勾选时遇到这类操作会提示你。",
@@ -1730,7 +1837,17 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             "auth": self.v_mode.get(),
             "key_path": norm_path(self.v_key.get()),
             "remember": bool(self.v_remember.get()),
+            "proto": self.v_proto.get(),
         }
+        # 本机那三个只在「本机」协议下有意义；远程档案里留着它们，
+        # 下次以本机身份连接时会被误用，所以非本机一律清空。
+        if p["proto"] == "local":
+            p["sudo"] = bool(self.v_elevate.get())
+            p["elevate"] = bool(self.v_admin.get())
+            p["shell"] = str(self.v_shell.get() or "")
+        else:
+            p["sudo"] = p["elevate"] = False
+            p["shell"] = ""
         # 每一项单独决定存不存：勾了私钥口令就只存私钥口令，
         # 别把一个没勾的口令也顺手写进文件。
         if self.v_save_pw.get():
@@ -1759,6 +1876,10 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.v_keypw.set(p.get("key_passphrase", "") or "")
         self.v_pw.set(p.get("password", "") or "")
         self.v_sudopw.set(p.get("sudo_password", "") or "")
+        # 本机档案里的两套提权（Linux sudo / Windows UAC）与外壳
+        self.v_elevate.set(bool(p.get("sudo") or p.get("sudo_password")))
+        self.v_admin.set(bool(p.get("elevate")))
+        self.v_shell.set(str(p.get("shell") or ""))
         # 档案里真存了哪几项，就把对应开关打开，界面上如实反映
         self.v_save_keypw.set(bool(p.get("key_passphrase")))
         self.v_save_pw.set(bool(p.get("password")))
@@ -1902,6 +2023,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                         key_path=norm_path(self.v_key.get()),
                         password=self.v_pw.get(),
                         key_passphrase=self.v_keypw.get(),
+                        # 本机 Windows 的执行外壳（cmd / powershell / 自动）
+                        shell=(self.v_shell.get() if is_local else ""),
                         sudo_password=self.v_sudopw.get().strip() if elevate else "",
                         elevate=elevate)
 

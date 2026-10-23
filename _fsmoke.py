@@ -181,7 +181,9 @@ import app as A
 
 a = A.ToolboxApp()
 pump(a, 0.6)
-chk(len(a._pages) == 16, "十六个页面都已构建", f"{list(a._pages)}")
+# v1.0.7 T1：日志改成底边栏，页面数 16 → 15
+chk(len(a._pages) == 15, "十五个页面都已构建（日志已到底边栏）",
+    f"{list(a._pages)}")
 a.nav.select("files")
 pump(a, 0.4)
 chk(a.nav.current == "files", "导航能切到文件管理")

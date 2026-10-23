@@ -27,7 +27,7 @@ import wbtui as U
 import crypto_store
 import lockmgr
 from core import redact
-from nasops import NasError, NasSession
+from nasops import MainSessionClient, NasError, NasSession
 from pkilib import PLATFORMS, PLATFORM_ORDER, PKI, PKIError
 from profiles import (ProfileStore, chmod_600_warning,
                       discover_keys, inspect_key)
@@ -78,8 +78,12 @@ class App(tk.Frame):
         self._booted = False
 
         self.pki = PKI(DATA_DIR)
-        self.nas = NasSession()
+        # 内嵌进主程序时不再自己连一台（「连接」页签与主机管理重复），
+        # 直接借主程序当前已经连好的会话；独立运行时仍是自己的 SSH 连接。
+        self.host_app = self.winfo_toplevel() if embedded else None
+        self.nas = MainSessionClient(self.host_app) if embedded else NasSession()
         self.nas.tracer = self._trace_cmd
+        self._dev_sig = None
 
         # 机密存储：档案与「记住的密码」都靠它。密钥取 data 目录（便携优先）。
         crypto_store.set_key_dir(DATA_DIR)
@@ -119,6 +123,8 @@ class App(tk.Frame):
         self._booted = True
         self._load_last_profile()
         self.refresh_all()
+        if self.embedded:
+            self._refresh_device()
 
     # ============================================================ 骨架
     def _header(self):
@@ -364,8 +370,11 @@ class App(tk.Frame):
         main.pack(fill="both", expand=True, padx=10)
         main.pack_propagate(False)
 
-        items = [("conn", "连接"), ("cert", "证书"), ("pack", "打包"),
-                 ("deploy", "部署"), ("cons", "命令日志")]
+        # 内嵌时不要「连接」页签 —— 主机管理里已经能连了，两处填同样的参数
+        # 只会让人怀疑是不是要再连一次（用户原话：「这个连接功能重复了」）。
+        items = ([] if self.embedded else [("conn", "连接")]) + [
+            ("cert", "证书"), ("pack", "打包"),
+            ("deploy", "部署"), ("cons", "命令日志")]
 
         if self.embedded:
             # 内嵌时用横向分段：竖导航那 168px 在这一页是纯浪费，
@@ -376,10 +385,18 @@ class App(tk.Frame):
             from ui.table import Segmented
             self.nav = Segmented(bar, items, command=self._show)
             self.nav.pack(side="left")
-            self.pill_nas = U.Pill(bar, "NAS 未连接", "err")
+            # 设备状态跟着主程序当前会话走，不再有自己的「连接」页
+            self.pill_nas = U.Pill(bar, "未连接设备", "err")
             self.pill_nas.pack(side="right", padx=(U.px(6), 0))
             self.pill_ca = U.Pill(bar, "CA 未初始化", "mute")
             self.pill_ca.pack(side="right", padx=U.px(6))
+            self.lbl_dev = U.wlabel(bar, "", "pagemute", U.FONT_XS)
+            self.lbl_dev.pack(side="right", padx=(0, U.px(4)))
+            self.btn_goto_hosts = U.RoundButton(
+                bar, "主机管理", self._goto_hosts, variant="ghost",
+                font=U.FONT_XS, height=24, padx=10)
+            self.btn_goto_hosts.pack(side="right", padx=(0, U.px(4)))
+            self.after(200, self._watch_device)
         else:
             self.nav = U.Nav(main, items, on_change=self._show, width=168)
             self.nav.pack(side="left", fill="y", padx=(6, 0), pady=(2, 8))
@@ -396,20 +413,69 @@ class App(tk.Frame):
         self.stack.rowconfigure(0, weight=1)
         self.stack.columnconfigure(0, weight=1)
 
-        for key, builder in (("conn", self._build_conn), ("cert", self._build_cert),
-                             ("pack", self._build_pack), ("deploy", self._build_deploy),
-                             ("cons", self._build_console)):
+        builders = {"conn": self._build_conn, "cert": self._build_cert,
+                    "pack": self._build_pack, "deploy": self._build_deploy,
+                    "cons": self._build_console}
+        for key, _label in items:
             page = U.wframe(self.stack, "page")
             page.grid(row=0, column=0, sticky="nsew")
             self._pages[key] = page
-            builder(page)
+            builders[key](page)
 
-        self.nav.select("conn")
+        self.nav.select(items[0][0])
 
     def _show(self, key: str):
         pg = self._pages.get(key)
         if pg is not None:
             pg.tkraise()
+        if self.embedded:
+            self._refresh_device()
+
+    # ---------------------------------------------------- 当前设备（内嵌）
+    def _goto_hosts(self):
+        """跳回主机管理页去连接 / 换设备。"""
+        app = self.host_app
+        nav = getattr(app, "nav", None) if app is not None else None
+        if nav is None:
+            return
+        try:
+            nav.select("hosts")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_device(self) -> None:
+        """头部显示「当前设备：root@192.168.3.12」，没会话就说清楚去哪连。"""
+        c = self.nas
+        live = bool(getattr(c, "connected", False))
+        try:
+            sig = (live, c.user, c.host, c.port)
+        except Exception:  # noqa: BLE001
+            sig = (live, "", "", 0)
+        if sig == self._dev_sig:
+            return
+        self._dev_sig = sig
+        try:
+            if live:
+                name = c.user and f"{c.user}@{c.host}" or (c.host or "当前设备")
+                self.pill_nas.set(name, "ok")
+                self.lbl_dev.configure(text=f"当前设备：{name}", fg=U.T.text_dim)
+                self.btn_goto_hosts.pack_forget()
+            else:
+                self.pill_nas.set("未连接设备", "err")
+                self.lbl_dev.configure(text="先在主机管理里连接一台设备",
+                                       fg=U.T.warn)
+                self.btn_goto_hosts.pack(side="right", padx=(0, U.px(4)))
+        except tk.TclError:
+            pass
+
+    def _watch_device(self) -> None:
+        if not self.embedded:
+            return
+        self._refresh_device()
+        try:
+            self.after(1500, self._watch_device)
+        except tk.TclError:
+            pass
 
     def _quit(self):
         if self._on_quit:
@@ -609,18 +675,41 @@ class App(tk.Frame):
         # ---------- 右：服务端现状 ----------
         right = U.wframe(pg, "page")
         right.grid(row=0, column=1, sticky="nsew")
-        card = U.Card(right, title="服务端现状", hint="连接后自动探测")
-        card.pack(fill="both", expand=True)
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        self._build_status(right, expanded=True,
+                           hint="尚未连接。填好左侧参数后点「连接并探测」。")
+
+    def _build_status(self, parent, expanded: bool = False,
+                      hint: str = "") -> None:
+        """「服务端现状 + openvpn.conf 原文」这块。
+
+        独立运行时它挂在连接页右侧；内嵌时连接页没了，就挂到部署页 ——
+        不然 do_probe 拿到的结果没地方显示。
+        """
+        card = U.Card(parent, title="服务端现状",
+                      hint="连接后自动探测" if not self.embedded
+                      else "跟着主机管理的当前设备")
+        if expanded:
+            card.pack(fill="both", expand=True)
+        else:
+            card.pack(fill="x")
         b = card.body
         self.kv_holder = U.wframe(b, "card")
         self.kv_holder.pack(fill="x")
-        U.wlabel(self.kv_holder, "尚未连接。填好左侧参数后点「连接并探测」。",
+        U.wlabel(self.kv_holder,
+                 hint or "还没探测。连上设备后点「探测当前设备」。",
                  "dim", U.FONT_S).pack(anchor="w")
 
-        U.wlabel(b, "openvpn.conf（原始）", "dim", U.FONT_XS).pack(anchor="w", pady=(12, 4))
-        self.box_conf = U.TextBox(b, role="alt", font=U.MONO_S, height=12)
+        U.wlabel(b, "openvpn.conf（原始）", "dim", U.FONT_XS).pack(
+            anchor="w", pady=(12, 4))
+        self.box_conf = U.TextBox(b, role="alt", font=U.MONO_S,
+                                  height=12 if expanded else 7)
         self.box_conf.txt.configure(width=1)
-        self.box_conf.pack(fill="both", expand=True)
+        if expanded:
+            self.box_conf.pack(fill="both", expand=True)
+        else:
+            self.box_conf.pack(fill="x")
 
     # ---- 认证行切换
     def _mode_changed(self):
@@ -742,6 +831,8 @@ class App(tk.Frame):
 
     # ---- 档案
     def _collect_profile(self) -> dict:
+        if not hasattr(self, "v_host"):     # 内嵌：没有连接页，就没有档案
+            return {}
         p = {
             "name": self.v_prof.get().strip(),
             "host": self.v_host.get().strip(),
@@ -759,12 +850,16 @@ class App(tk.Frame):
         return p
 
     def _refresh_profile_list(self):
+        if not hasattr(self, "cb_prof"):
+            return
         names = self.profiles.names()
         self.cb_prof["values"] = names
         if self.v_prof.get() not in names:
             self.v_prof.set("")
 
     def _apply_profile(self, p: dict):
+        if not hasattr(self, "v_host"):     # 内嵌：连接参数由主机管理负责
+            return
         self.v_prof.set(p.get("name", ""))
         self.v_host.set(p.get("host", ""))
         self.v_port.set(p.get("port", "22") or "22")
@@ -898,6 +993,25 @@ class App(tk.Frame):
         self.bg(work, ok=self._on_connected,
                 err=lambda m: self.btn_connect.set_enabled(True))
 
+    def do_probe(self):
+        """只读探测当前设备的隧道服务现状 —— 不连新的，不弹连接框。"""
+        if not self.nas.connected:
+            if self.embedded:
+                messagebox.showwarning(
+                    "未连接设备",
+                    "先在「主机管理」里连接一台设备（连上后会自动跟上）。",
+                    parent=self)
+                self._goto_hosts()
+            else:
+                messagebox.showwarning("未连接", "请先在「连接」页连上 NAS",
+                                       parent=self)
+            return
+        self.status.set("正在读取当前设备的隧道服务…")
+        btn = getattr(self, "btn_connect", None)
+        if btn is not None:
+            btn.set_enabled(False)
+        self.bg(lambda: (None, self.nas.probe()), ok=self._on_connected)
+
     def _kv_clear(self):
         for w in self.kv_holder.winfo_children():
             w.destroy()
@@ -913,13 +1027,20 @@ class App(tk.Frame):
 
     def _on_connected(self, res):
         sudo_ok, info = res
-        self.btn_connect.set_enabled(True)
+        btn = getattr(self, "btn_connect", None)
+        if btn is not None:
+            btn.set_enabled(True)
         p = info.get("params", {})
 
         self._kv_clear()
-        self._kv("连接", f"{self.nas.user}@{self.nas.host}:{self.nas.port}")
+        label = "设备" if self.embedded else "连接"
+        port = f":{self.nas.port}" if self.nas.port else ""
+        self._kv(label, f"{self.nas.user}@{self.nas.host}{port}")
         # 明确写出「到底用了哪把钥匙」，避免出现「以为在用 A，其实用的是 B」
-        if self.v_mode.get() == "key":
+        if getattr(self, "v_mode", None) is None:
+            # 内嵌：认证方式由主机管理决定，这里只说清「用的是当前会话」
+            self._kv("认证方式", "主程序当前会话", "dim")
+        elif self.v_mode.get() == "key":
             kp = self.v_key.get().strip()
             ki = inspect_key(kp, self.v_keypw.get() or None)
             if ki.get("ok"):
@@ -950,7 +1071,10 @@ class App(tk.Frame):
         self.box_conf.set_text(info.get("conf", "") or "(空)")
 
         self.pill_nas.set(f"{self.nas.user}@{self.nas.host}", "ok")
-        self.status.set("连接成功")
+        self._dev_sig = None
+        if self.embedded:
+            self._refresh_device()
+        self.status.set("已读取当前设备的隧道服务" if self.embedded else "连接成功")
         if info.get("ta_key_ok"):
             self.box_ta.txt.delete("1.0", "end")
             self.box_ta.txt.insert("1.0", info.get("ta_key", ""))
@@ -964,7 +1088,13 @@ class App(tk.Frame):
     def do_disconnect(self):
         self.nas.close()
         self.nas.sudo_pw = None
-        self.pill_nas.set("NAS 未连接", "err")
+        self.pill_nas.set("未连接设备", "err")
+        self._dev_sig = None
+        if self.embedded:
+            # 会话是主程序的，这里只清掉本页的 sudo 口令
+            self.status.set("已清掉 sudo 口令（设备连接仍在主机管理里）")
+            self._refresh_device()
+            return
         self.status.set("已断开")
 
     # ============================================================ 2 · 证书
@@ -1319,9 +1449,20 @@ class App(tk.Frame):
                       height=34, padx=18).pack(side="left")
         U.RoundButton(r, "仅重新应用配置", self.do_reapply, variant="secondary",
                       height=34, padx=16).pack(side="left", padx=8)
+        if self.embedded:
+            # 连接页没了，探测入口挪到这儿：不连新的，只读当前设备
+            U.RoundButton(r, "探测当前设备", self.do_probe, variant="ghost",
+                          height=34, padx=14).pack(side="left", padx=(2, 0))
+
+        if self.embedded:
+            # 连接页没了，「服务端现状」挪到这里（do_probe 的输出落到这儿）
+            status_box = U.wframe(pg, "page")
+            status_box.grid(row=1, column=0, sticky="we", pady=(10, 0))
+            self._build_status(status_box, expanded=False)
 
         warn = U.Card(pg, pad=12)
-        warn.grid(row=1, column=0, sticky="we", pady=(10, 0))
+        warn.grid(row=2 if self.embedded else 1, column=0, sticky="we",
+                  pady=(10, 0))
         w1 = U.wlabel(warn.body,
                       "⚠ 替换服务端证书后，所有旧客户端配置会立即失效。"
                       "请先签好证书、分发新配置文件，最后才部署。",
@@ -1345,11 +1486,29 @@ class App(tk.Frame):
 
     def _need_root(self) -> bool:
         if not self.nas.connected:
-            messagebox.showwarning("未连接", "请先在「连接」页连上 NAS", parent=self)
+            if self.embedded:
+                messagebox.showwarning(
+                    "未连接设备",
+                    "先在「主机管理」里连接一台设备（连上后这一页会自动跟上）。",
+                    parent=self)
+                self._goto_hosts()
+            else:
+                messagebox.showwarning("未连接", "请先在「连接」页连上 NAS",
+                                       parent=self)
             return False
-        if not self.nas.sudo_pw:
-            messagebox.showwarning("缺少 sudo", "该操作需要 root，请在连接页填写 sudo 密码并重新连接",
-                                   parent=self)
+        if not getattr(self.nas, "has_sudo", bool(self.nas.sudo_pw)):
+            if self.embedded:
+                messagebox.showwarning(
+                    "没有提权",
+                    "该操作需要 root。\n"
+                    "内嵌模式下提权跟着「主机管理」里的这台设备走 ——\n"
+                    "去那里给它配上 sudo 密码（Linux）或以管理员身份连接（Windows），"
+                    "再回来重试。", parent=self)
+                self._goto_hosts()
+            else:
+                messagebox.showwarning(
+                    "缺少 sudo",
+                    "该操作需要 root，请先在连接页填写 sudo 密码。", parent=self)
             return False
         return True
 

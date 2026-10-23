@@ -265,13 +265,20 @@ def validate(rec: dict, others: list[dict] | None = None) -> list[str]:
 
 
 def blank_record(proto: str = "ssh") -> dict:
-    """新建主机的空记录。默认值都放这儿，别散在界面代码里。"""
+    """新建主机的空记录。默认值都放这儿，别散在界面代码里。
+
+    `sudo` / `elevate` / `shell` 只有「本机」协议用得上：
+      · Linux 本机 —— `sudo` 勾上后连上就 sudo -i（口令存 sudo_password）；
+      · Windows 本机 —— 没有 sudo，`elevate` 表示「以管理员权限运行」（UAC），
+        再选一个 `shell`（cmd / powershell）。
+    """
     return {
         "name": "", "host": "", "port": "22" if proto != "telnet" else "23",
         "user": "", "auth": "key", "key_path": "", "proto": proto,
         "group": "", "tags": "", "note": "", "cred_id": "", "proxy_id": "",
         "remember": False, "password": "", "key_passphrase": "",
-        "sudo_password": "", "created": str(now_ts()), "last_used": "",
+        "sudo_password": "", "sudo": False, "elevate": False, "shell": "",
+        "created": str(now_ts()), "last_used": "",
     }
 
 
@@ -279,9 +286,12 @@ def record_from_form(data: dict, base: dict | None = None) -> dict:
     """表单值 → 档案记录。保留 base 里的口令等不可见字段。"""
     out = dict(base or blank_record())
     for k in ("name", "host", "port", "user", "auth", "key_path", "proto",
-              "group", "note", "cred_id", "proxy_id"):
+              "group", "note", "cred_id", "proxy_id", "shell"):
         if k in data:
             out[k] = str(data.get(k) or "").strip()
+    for k in ("sudo", "elevate"):
+        if k in data:
+            out[k] = bool(data.get(k))
     if "tags" in data:
         out["tags"] = join_tags(data.get("tags"))
     if not out.get("created"):
