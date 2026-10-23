@@ -43,6 +43,7 @@ from core import hosts as hosts_core
 from core import proxies as proxies_core
 from core import scripts as scripts_core
 from core import redact
+from core import winstate
 from core.detect import DeviceInfo, capabilities, detect, dialect_for
 from core.metrics import (Sampler, human_bytes, human_gb, human_rate,
                           human_uptime)
@@ -174,9 +175,12 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry(f"{U.px(1360)}x{U.px(880)}")
-        self.minsize(U.px(1150), U.px(720))
         self.configure(bg=U.T.page)
+        # ---- 窗口几何：先按屏幕工作区把默认尺寸压进去，再套上次退出时的样子
+        self._win_state = winstate.WinState(DATA_DIR / "window.json")
+        self._win_normal: tuple[int, int, int, int] | None = None
+        self._apply_win_geometry()
+        self.bind("<Configure>", self._on_win_configure)
 
         # ---- 状态
         # 多设备：一次能连好几台，session / device / dialect / sampler
@@ -552,6 +556,12 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             page.grid(row=0, column=0, sticky="nsew")
             self._pages[key] = page
             builder(page)
+            # 建完立刻从布局里摘掉，只留当前页在场。
+            # 16 个页面全 grid 在同一格里时，它们**都**处于 mapped 状态，
+            # 拖动窗口边缘每改一像素就要重画 1100 多个控件 —— 实测一步
+            # 1.5 秒，拖起来像卡死。摘掉之后其他页仍然存在（状态、滚动
+            # 位置、输入框内容都不丢），只是不参与布局与重绘。
+            page.grid_remove()
 
         # 右侧「命令日志」面板已撤（v1.0.6）：它和「日志管理」页记的是同一件事，
         # 两份记录只会让人纠结去哪查。命令与输出现在统一进「日志管理」，
@@ -581,7 +591,19 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             tb.select("hosts")
         for k, page in self._pages.items():
             if k == key:
+                # 只把当前页放回布局（其余页在创建时已 grid_remove）。
+                # 曾经所有页都 grid 在同一格、靠 tkraise 分先后 —— 那样
+                # 被盖住的页照样参与重绘，缩放窗口会明显卡顿。
+                try:
+                    page.grid()
+                except tk.TclError:
+                    pass
                 page.tkraise()
+            elif page.winfo_manager() == "grid":
+                try:
+                    page.grid_remove()
+                except tk.TclError:
+                    pass
         # --no-probe：只画界面、不主动跑探测。截图与打包验收用得上 ——
         # 那几个探测会去调系统的 reg / schtasks，在某些受限环境里会卡住。
         if self._no_probe:
@@ -705,6 +727,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         return "未连接"
 
     def _hide_to_tray(self) -> None:
+        # 先记几何再收起来：withdraw 之后 winfo_x/y 就不可信了
+        self._win_state_save()
         if self._tray is None or not self._tray.running:
             self.iconify()
             return
@@ -727,6 +751,137 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             self._hide_to_tray()
             return
         self._quit_app()
+
+    # ============================================================ 窗口几何
+    def _apply_win_geometry(self) -> None:
+        """开窗尺寸：先按工作区自适应，再套上次退出时的位置/大小/最大化。
+
+        默认 1360×880 是**逻辑**像素，在 150% 缩放的笔记本上会算成
+        2040×1320 物理像素 —— 比整块屏幕还高，一启动就被任务栏截掉、
+        标题栏跑出屏幕。所以一律先压进 SPI_GETWORKAREA。
+        """
+        try:
+            screen = (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
+        except tk.TclError:
+            screen = (0, 0, 1280, 720)
+        area = winstate.work_area(screen)
+        box = winstate.restore_box(
+            self._win_state.data, area, float(U.S),
+            U.px(1360), U.px(880), U.px(900), U.px(560))
+        self.geometry(box.geometry())
+        self._win_normal = (box.x, box.y, box.w, box.h)
+        # minsize 也得让位：屏幕比 minsize 还小时硬按 minsize 开，
+        # 就是一个必然超屏的窗口 —— 跟默认高度过高是同一个坑。
+        aw, ah = area[2], area[3]
+        self.minsize(
+            min(U.px(1150), max(U.px(760), aw - U.px(16))),
+            min(U.px(720), max(U.px(460), ah - U.px(16))))
+        if box.zoomed:
+            # 最大化要等窗口真映射出来再设，太早会被 WM 忽略
+            self.after(120, self._win_zoom)
+        else:
+            # 先按客户区摆一次，再按外框实测夹一次：Tk 的 geometry() 只说
+            # 客户区，标题栏那三四十像素不在里面，光按客户区算窗口整体
+            # 还是会把底部压到任务栏底下。
+            self._win_fit_sync()
+
+    def _win_fit_sync(self) -> None:
+        """按 Win32 实测的**外框**把窗口重新夹进工作区。
+
+        只在启动时做一次 —— 用户后面手动拉窗口/移动，那是他的事，
+        再插一脚会变成跟用户抢方向盘。
+        """
+        try:
+            if self.state() == "zoomed":
+                return
+            self.update_idletasks()
+            hwnd = int(str(self.wm_frame()), 16)
+            cw, ch = self.winfo_width(), self.winfo_height()
+        except (tk.TclError, ValueError):
+            return
+        rect = winstate.window_rect(hwnd)
+        if rect is None or cw <= 1 or ch <= 1:
+            return
+        try:
+            screen = (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
+        except tk.TclError:
+            screen = (0, 0, 1280, 720)
+        ax, ay, aw, ah = winstate.work_area(screen)
+        ox, oy, ow, oh = rect
+        dw, dh = max(0, ow - cw), max(0, oh - ch)   # 标题栏 + 边框
+        m = winstate.DEFAULT_MARGIN
+        nw = min(cw, max(240, aw - m * 2 - dw))
+        nh = min(ch, max(160, ah - m * 2 - dh))
+        nx = min(max(ox, ax), ax + max(0, aw - (nw + dw)))
+        ny = min(max(oy, ay), ay + max(0, ah - (nh + dh)))
+        if (nw, nh, nx, ny) == (cw, ch, ox, oy):
+            self._win_normal = (nx, ny, nw, nh)
+            return
+        try:
+            self.geometry(f"{nw}x{nh}+{nx}+{ny}")
+            self.update_idletasks()
+        except tk.TclError:
+            return
+        self._win_normal = (nx, ny, nw, nh)
+
+    def _win_zoom(self) -> None:
+        try:
+            self.state("zoomed")            # Windows / 部分 WM
+        except tk.TclError:
+            try:
+                self.attributes("-zoomed", True)   # X11
+            except tk.TclError:
+                pass
+
+    def _on_win_configure(self, event) -> None:
+        """记住「普通状态」下的矩形（最大化时不算，否则恢复回来是个满屏窗口）。"""
+        # 子控件的 Configure 也会落到 toplevel 的 bindtags 上，不筛的话
+        # 每动一下分隔条都在记窗口位置
+        if event.widget is not self:
+            return
+        try:
+            if self.state() == "zoomed":
+                return
+        except tk.TclError:
+            return
+        if event.width < U.px(240) or event.height < U.px(160):
+            return
+        try:
+            self._win_normal = (self.winfo_x(), self.winfo_y(),
+                                event.width, event.height)
+        except tk.TclError:
+            pass
+
+    def _win_state_save(self) -> None:
+        """退出前记下窗口的样子。最小化时坐标是 -32000，绝不落盘。"""
+        try:
+            st = self.state()
+        except tk.TclError:
+            return
+        if st == "iconic":
+            return
+        zoomed = (st == "zoomed")
+        nx, ny, nw, nh = self._win_normal or (0, 0, 0, 0)
+        if not zoomed:
+            # 非最大化时以当前实际矩形为准：用户可能刚拖过窗口，
+            # Configure 里那份还没跟上
+            try:
+                nx, ny = self.winfo_x(), self.winfo_y()
+                nw, nh = self.winfo_width(), self.winfo_height()
+            except tk.TclError:
+                return
+        if nw <= 0 or nh <= 0:
+            return
+        try:
+            x, y = self.winfo_x(), self.winfo_y()
+        except tk.TclError:
+            x, y = nx, ny
+        self._win_state.save({
+            "x": int(x), "y": int(y),
+            "w": int(nw), "h": int(nh),
+            "nx": int(nx), "ny": int(ny), "nw": int(nw), "nh": int(nh),
+            "zoomed": bool(zoomed), "scale": float(U.S),
+        })
 
     def _cancel_timers(self) -> None:
         """撤掉所有自我续期的定时器，否则窗口销毁后 Tcl 会反复报
@@ -762,6 +917,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         super().destroy()
 
     def _quit_app(self) -> None:
+        self._win_state_save()
         self._cancel_timers()
         try:
             if self._tray:

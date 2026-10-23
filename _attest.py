@@ -369,6 +369,33 @@ def test_menu(app) -> None:
     app._ai_close_menu()
     app.update()
 
+    # ---- 点别处要收：靠主窗口的 Button-1 全局绑定，不靠 FocusOut
+    top3 = app._ai_plus_menu()
+    app.update()
+    chk(top3 is not None and top3.winfo_exists(), "再开一次一级菜单")
+    app.event_generate("<Button-1>", x=5, y=5)
+    app.update()
+    closed = True
+    try:
+        closed = not top3.winfo_exists()
+    except Exception:  # noqa: BLE001
+        closed = True
+    chk(closed, "点主窗口别处，菜单收起")
+
+    # ---- 再点一次 ＋ 要收起（不是「点了没反应」）
+    top4 = app._ai_plus_menu()
+    app.update()
+    chk(top4 is not None and top4.winfo_exists(), "＋ 能再打开")
+    again = app._ai_plus_menu()
+    app.update()
+    chk(again is None, "第二次点 ＋ 不开新的")
+    still = True
+    try:
+        still = not top4.winfo_exists()
+    except Exception:  # noqa: BLE001
+        still = True
+    chk(still, "第二次点 ＋ 把菜单收起来")
+
 
 def test_model_menu(app) -> None:
     top = app._ai_model_menu()

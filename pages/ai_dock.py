@@ -1632,6 +1632,19 @@ class AiDockPage:
             self._ai_menu_row(host, "×", "清空会话", "",
                               run(self.ai_dock_clear))
 
+        # 再点一次 ＋ 就是收起。点 ＋ 时主窗口的全局点击处理已经把菜单关了，
+        # 所以这里还得看「刚刚是不是刚被那次点击关掉」—— 否则表现为「点两次没反应」。
+        old = getattr(self, "_ai_plus_top", None)
+        try:
+            still_open = old is not None and old.winfo_exists()
+        except tk.TclError:
+            still_open = False
+        if still_open:
+            self._ai_close_menu()
+            return None
+        if time.time() - float(getattr(self, "_menu_closed_at", 0) or 0) < 0.30:
+            return None
+
         top = _popup(self, self.btn_ai_plus, build, width=U.px(252))
         holder["top"] = top
         self._ai_plus_top = top
@@ -2718,8 +2731,49 @@ def _popup(app, anchor, builder, width: int = 260) -> tk.Toplevel:
     top.transient(app.winfo_toplevel())
     top.bind("<Escape>", lambda e: top.destroy())
     top.bind("<FocusOut>", lambda e: top.after(120, _close_if_unfocused, top))
+    _bind_outside_click(app, top, anchor)
     top.focus_set()
     return top
+
+
+def _bind_outside_click(app, top: tk.Toplevel, anchor=None) -> None:
+    """点主窗口任何地方就收起（点浮层自己身上不算）。
+
+    为什么非这样不可：`overrideredirect` 的 Toplevel 不参与焦点管理，
+    而 Tk 的 Frame / Canvas 又根本不抢焦点 —— 于是 `<FocusOut>` 基本不会
+    触发，用户「点别处」菜单纹丝不动。这是「＋ 菜单点别处不收」的真正原因。
+
+    绑定挂在主窗口上而不是 `bind_all`：主窗口是所有子控件的 bindtag 之一，
+    点在子控件上照样能收到；用 `bind_all` 会把别的模块的绑定一起冲掉。
+    """
+    root = app.winfo_toplevel()
+
+    def _on_click(event=None) -> None:
+        # 只有「点的是锚点按钮（＋）自己」才算收起动作 —— 否则点别处关掉之后
+        # 用户马上再点 ＋ 会被误判成「刚关过」，表现为点了没反应。
+        hit = getattr(event, "widget", None)
+        inside = False
+        while hit is not None:
+            if hit is anchor:
+                inside = True
+                break
+            hit = getattr(hit, "master", None)
+        if inside:
+            try:
+                app._menu_closed_at = time.time()
+            except Exception:  # noqa: BLE001
+                pass
+        _close_chain(top)
+
+    funcid = root.bind("<Button-1>", _on_click, add="+")
+
+    def _cleanup(_e=None) -> None:
+        try:
+            root.unbind("<Button-1>", funcid)
+        except tk.TclError:
+            pass
+
+    top.bind("<Destroy>", _cleanup)
 
 
 def _close_if_unfocused(top: tk.Toplevel) -> None:

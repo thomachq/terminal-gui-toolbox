@@ -792,6 +792,13 @@ class Nav(tk.Frame):
 
     分组不是纯装饰：资产类（主机 / 凭证 / 脚本）和操作类（防火墙 / 数据库）
     混在一列里时，找东西全靠记顺序。分两组之后一眼能扫到。
+
+    为什么套一层 Canvas：
+
+      导航项是纵向堆叠的，窗口一拉矮（或者笔记本屏幕本来就矮），靠下的
+      「日志管理」会被直接切掉，连点都点不到。这里把条目放进 Canvas，
+      装不下时自动出竖向滚动条，装得下就把滚动条收起来 —— 常态下不该
+      多一条灰条占地方。
     """
 
     def __init__(self, master, items, on_change, width: int = 170,
@@ -803,7 +810,24 @@ class Nav(tk.Frame):
         self.alias = dict(alias or {})
         self.items: dict[str, _NavItem] = {}
         self.current = None
-        top = tk.Frame(self, bg=T.page, bd=0, height=px(8))
+
+        self._canvas = tk.Canvas(self, bg=T.page, bd=0, highlightthickness=0,
+                                 yscrollincrement=px(20))
+        self._sb = ttk.Scrollbar(self, orient="vertical",
+                                 command=self._canvas.yview,
+                                 style="Card.Vertical.TScrollbar")
+        self._sb_visible = False
+        self._canvas.configure(yscrollcommand=self._on_scroll_set)
+
+        self._inner = tk.Frame(self._canvas, bg=T.page, bd=0)
+        self._win = self._canvas.create_window((0, 0), window=self._inner,
+                                               anchor="nw")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._inner.bind("<Configure>", self._sync)
+        self._canvas.bind("<Configure>", self._sync)
+        self._bind_wheel(self._canvas)
+
+        top = tk.Frame(self._inner, bg=T.page, bd=0, height=px(8))
         top.pack(fill="x")
         for it in items:
             if it and it[0] == "group":
@@ -811,25 +835,123 @@ class Nav(tk.Frame):
             else:
                 self._add_item(it[0], it[1], 0)
         register(self, lambda: self.configure(bg=T.page))
+        register(self._canvas, lambda: self._canvas.configure(bg=T.page))
+        register(self._inner, lambda: self._inner.configure(bg=T.page))
 
+    # ---------------------------------------------------------- 滚动
+    def _sync(self, _e=None) -> None:
+        """内容高度或可视高度变了：更新滚动区域，顺手决定滚动条去留。
+
+        拖动窗口时会连续来几十次 Configure，每次都去 configure(scrollregion)
+        会带着内层 Frame 再重排一遍 —— 一次几十毫秒，累积起来就是肉眼可见
+        的卡顿。所以这里先比尺寸，真变了才动，并且合并到空闲时执行。
+        """
+        if getattr(self, "_sync_pending", False):
+            return
+        self._sync_pending = True
+        try:
+            self.after_idle(self._sync_apply)
+        except tk.TclError:
+            self._sync_pending = False
+
+    def _sync_apply(self) -> None:
+        self._sync_pending = False
+        try:
+            cw = self._canvas.winfo_width()
+            ch = self._canvas.winfo_height()
+            ih = self._inner.winfo_reqheight()
+        except tk.TclError:
+            return
+        if (cw, ch, ih) == getattr(self, "_sync_seen", None):
+            return
+        self._sync_seen = (cw, ch, ih)
+        try:
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+            # 内容宽度跟着可视宽度走，否则条目只占一半
+            self._canvas.itemconfigure(self._win, width=cw)
+        except tk.TclError:
+            return
+        need = ih > ch + 1
+        if need and not self._sb_visible:
+            self._sb.pack(side="right", fill="y")
+            self._sb_visible = True
+        elif not need and self._sb_visible:
+            self._sb.pack_forget()
+            self._sb_visible = False
+            try:
+                self._canvas.yview_moveto(0)
+            except tk.TclError:
+                pass
+
+    def _on_scroll_set(self, first, last) -> None:
+        """Canvas 的 yscrollcommand：把比例转给滚动条。
+
+        Canvas 自己不会去 call 滚动条，必须手动转发；漏了它滚动条就是死的。
+        """
+        try:
+            self._sb.set(first, last)
+        except tk.TclError:
+            pass
+
+    def _bind_wheel(self, w) -> None:
+        w.bind("<MouseWheel>", self._wheel)
+        w.bind("<Button-4>", self._wheel)     # X11 上滚
+        w.bind("<Button-5>", self._wheel)     # X11 下滚
+        for c in w.winfo_children():
+            self._bind_wheel(c)
+
+    def _wheel(self, event):
+        try:
+            if self._inner.winfo_reqheight() <= self._canvas.winfo_height() + 1:
+                return None
+        except tk.TclError:
+            return None
+        # event.num 在 Windows 的 MouseWheel 上是占位符 '??'，int() 会炸，
+        # 所以先按 delta 判，X11 的 Button-4/5 才看 num
+        try:
+            num = int(getattr(event, "num", 0) or 0)
+        except (TypeError, ValueError):
+            num = 0
+        if num == 4:
+            step = -3
+        elif num == 5:
+            step = 3
+        else:
+            try:
+                delta = int(getattr(event, "delta", 0) or 0)
+            except (TypeError, ValueError):
+                delta = 0
+            if delta == 0:
+                return None
+            step = -3 if delta > 0 else 3
+        try:
+            self._canvas.yview_scroll(step, "units")
+        except tk.TclError:
+            return None
+        return "break"
+
+    # ---------------------------------------------------------- 条目
     def _add_group(self, title: str, subs) -> None:
         # 标题为空表示「这组就是当前模块本身」，不画小标题 ——
         # 顶部页签已经写着模块名，侧栏再来一行是重复噪音。
         if title:
-            lb = tk.Label(self, text=title, bg=T.page, fg=T.text_mute,
+            lb = tk.Label(self._inner, text=title, bg=T.page, fg=T.text_mute,
                           font=FONT_XS, anchor="w", bd=0, padx=px(15),
                           pady=px(1))
             lb.pack(fill="x", pady=(px(11), px(1)))
             register(lb, lambda: lb.configure(bg=T.page, fg=T.text_mute))
+            self._bind_wheel(lb)
         else:
-            tk.Frame(self, bg=T.page, height=px(2), bd=0).pack(fill="x")
+            tk.Frame(self._inner, bg=T.page, height=px(2), bd=0).pack(fill="x")
         for key, label in subs:
             self._add_item(key, label, 11)
 
     def _add_item(self, key: str, label: str, indent: int) -> None:
-        it = _NavItem(self, label, lambda k=key: self.select(k), indent=indent)
+        it = _NavItem(self._inner, label, lambda k=key: self.select(k),
+                      indent=indent)
         it.pack(fill="x", pady=px(1), padx=(px(2), px(8)))
         self.items[key] = it
+        self._bind_wheel(it)
 
     def select(self, key: str) -> None:
         key = self.alias.get(key, key)
