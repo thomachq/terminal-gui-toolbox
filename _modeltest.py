@@ -298,6 +298,56 @@ chk("kind" not in keys, "清单里没有模型类型列（都是文本，没必�
 rows = dlg.tbl_model.all_rows()
 chk(len(rows) >= 1, "清单有行", len(rows))
 chk(all(r.get("kind") == "文本" for r in rows), "每一行都是文本模型")
+
+# ---- 5. 供应商 / 模型 两级
+sec("5. 供应商这一级")
+pids = list(dlg.plist._rows.keys())
+chk(len(pids) >= 4, "左侧列出各家供应商", pids)
+chk(dlg.sel_pid in pids, "默认选中当前模型所属的供应商", dlg.sel_pid)
+eq(len(dlg.tbl_model.all_rows()),
+   len(win.ai_cfg.provider_models(dlg.sel_pid)),
+   "右侧表只显示选中供应商下的模型")
+
+dlg.provider_pick("ollama")
+pump(win, 0.3)
+eq(len(dlg.tbl_model.all_rows()),
+   len(win.ai_cfg.provider_models("ollama")),
+   "切到 Ollama 后只剩它下面的模型")
+eq(dlg.lbl_prov.cget("text"), aiops.PROVIDERS["ollama"]["label"],
+   "右上标题跟着供应商变")
+eq(dlg.v_base.get(), win.ai_cfg.provider_base("ollama"),
+   "接口地址跟着供应商变")
+chk(dlg.plist.current == "ollama", "左栏高亮跟着走", dlg.plist.current)
+
+# 用临时配置验证「供应商设置下发到它下面的模型」
+tmpcfg = aiops.AIConfig(Path(TD) / "ai_prov.json")
+tmpcfg.upsert_model({"name": "a", "provider": "custom", "model": "m1"})
+tmpcfg.upsert_model({"name": "b", "provider": "custom", "model": "m2"})
+tmpcfg.upsert_model({"name": "c", "provider": "deepseek", "model": "d1"})
+deep_before = [m["base"] for m in tmpcfg.provider_models("deepseek")]
+tmpcfg.set_provider("custom", base="http://gw.local/v1", key="sk-test")
+
+bases = [m["base"] for m in tmpcfg.provider_models("custom")]
+eq(set(bases), {"http://gw.local/v1"}, "供应商地址下发到它下面每条模型")
+chk(all(m["key_enc"] for m in tmpcfg.provider_models("custom")),
+    "Key 一并下发到每条模型")
+eq([m["base"] for m in tmpcfg.provider_models("deepseek")], deep_before,
+   "不碰别家供应商的模型")
+eq(tmpcfg.provider_base("custom"), "http://gw.local/v1", "供应商地址记得住")
+chk(bool(tmpcfg.provider_key("custom")), "供应商 Key 能解回来")
+
+newm = tmpcfg.upsert_model({"name": "d", "provider": "custom", "model": "m3"})
+eq(newm["base"], "http://gw.local/v1", "新增模型不填地址就继承供应商的")
+chk(bool(newm["key_enc"]), "新增模型继承供应商 Key")
+
+tmpcfg.upsert_model({"name": "e", "provider": "custom", "model": "m4",
+                     "base": "http://other/v1"})
+tmpcfg.set_provider("custom", base="http://gw2.local/v1")
+own = [m for m in tmpcfg.provider_models("custom") if m["model"] == "m4"][0]
+eq(own["base"], "http://other/v1", "自己填过地址的模型不被覆盖")
+eq(tmpcfg.provider_models("custom")[0]["base"], "http://gw2.local/v1",
+   "没单独填过的跟着改")
+
 try:
     dlg._close()
 except tkinter.TclError:

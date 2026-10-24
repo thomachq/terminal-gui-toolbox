@@ -467,6 +467,98 @@ class AIConfig:
         model = str(self.data.get("model") or p["model"] or "—")
         return f"{p['label']} · {model} · {base}"
 
+    # ------------------------------------------------------------ 供应商
+    # 「供应商」是模型上面的一层：一个供应商一套接口地址与 Key，下面挂若干模型。
+    # 老配置没有 providers 这个键，就从该供应商下第一条模型推一个初值 ——
+    # 打开界面就有内容，不用用户重填一遍。
+    def provider_meta(self) -> dict:
+        meta = self.data.get("providers")
+        if not isinstance(meta, dict):
+            meta = {}
+        models = self.models()
+        out = {}
+        for pid in PROVIDERS:
+            row = meta.get(pid) if isinstance(meta.get(pid), dict) else {}
+            base = str(row.get("base") or "").strip()
+            key_enc = str(row.get("key_enc") or "").strip()
+            if not base or not key_enc:
+                for m in models:
+                    if str(m.get("provider") or "") != pid:
+                        continue
+                    base = base or str(m.get("base") or "").strip()
+                    key_enc = key_enc or str(m.get("key_enc") or "").strip()
+                    if base and key_enc:
+                        break
+            out[pid] = {"base": base, "key_enc": key_enc}
+        return out
+
+    def provider_base(self, pid: str) -> str:
+        row = self.provider_meta().get(pid) or {}
+        return str(row.get("base") or PROVIDERS.get(pid, {}).get("base") or "")
+
+    def provider_key_enc(self, pid: str) -> str:
+        return str((self.provider_meta().get(pid) or {}).get("key_enc") or "")
+
+    def provider_key(self, pid: str) -> str:
+        enc = self.provider_key_enc(pid)
+        if not enc or crypto_store is None:
+            return ""
+        try:
+            return crypto_store.unprotect(enc) or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def provider_models(self, pid: str) -> list[dict]:
+        # 走 models() 而不是直接读 data["models"]：老配置第一次打开时
+        # 列表还没归一化（甚至还没有 models 这个键），直接读会得到空表，
+        # 界面上就是「这家供应商下没有模型」—— 明明有。
+        return [m for m in self.models()
+                if str(m.get("provider") or "") == pid]
+
+    def set_provider(self, pid: str, base: str | None = None,
+                     key: str | None = None) -> None:
+        """改供应商的地址 / Key，并下发到它下面的每条模型。
+
+        `base` / `key` 传 None 表示「这一项不改」，传空串表示清空。
+        模型自己单独填过的地址不覆盖 —— 同一个供应商下挂两个网关是常见用法。
+        """
+        if pid not in PROVIDERS:
+            return
+        old = self.provider_meta().get(pid) or {}
+        old_base = str(old.get("base") or "")
+        row = {"base": old_base, "key_enc": str(old.get("key_enc") or "")}
+        if base is not None:
+            row["base"] = str(base).strip()
+        if key is not None:
+            if key:
+                row["key_enc"] = ((crypto_store.protect(key) or "")
+                                  if crypto_store is not None else key)
+            else:
+                row["key_enc"] = ""
+        store = self.data.get("providers")
+        if not isinstance(store, dict):
+            store = {}
+        store[pid] = row
+        self.data["providers"] = store
+
+        cur_id = self.current_id()
+        for m in (self.data.get("models") or []):
+            if not isinstance(m, dict) or str(m.get("provider")) != pid:
+                continue
+            cur = str(m.get("base") or "").strip()
+            if base is not None and (not cur or cur == old_base):
+                m["base"] = row["base"]
+            if key is not None:
+                m["key_enc"] = row["key_enc"]
+            if str(m.get("id")) == cur_id:
+                flat = str(self.data.get("base") or "").strip()
+                if base is not None and (not flat or flat == old_base):
+                    self.data["base"] = row["base"]
+                if key is not None:
+                    self.data["key_enc"] = row["key_enc"]
+        self.save()
+
+
     # ------------------------------------------------------------ 多模型
     # 扁平字段（provider / base / model / key_enc / temperature）永远是
     # **当前模型**的镜像。这样引擎、界面、旧配置全都不用改一行；
@@ -625,6 +717,15 @@ class AIConfig:
         return True
 
     def upsert_model(self, rec: dict) -> dict:
+        # 模型没单独填地址 / Key 时，继承它所属供应商那一份 ——
+        # 「供应商一层填一次，下面所有模型共用」就是这么落地的。
+        rec = dict(rec or {})
+        pid = str(rec.get("provider") or DEFAULT_PROVIDER)
+        if pid in PROVIDERS:
+            if not str(rec.get("base") or "").strip():
+                rec["base"] = self.provider_base(pid)
+            if not str(rec.get("key_enc") or "").strip():
+                rec["key_enc"] = self.provider_key_enc(pid)
         m = self._clean_model(rec)
         models = self.models()
         for i, old in enumerate(models):

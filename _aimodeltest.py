@@ -140,16 +140,30 @@ pump(win, 1.0)
 dlg = ModelDialog(win, win)
 pump(win, 0.5)
 chk(dlg.winfo_exists(), "对话框起来了")
-eq(len(dlg.tbl_model.all_rows()), len(win.ai_cfg.models()), "行数等于模型条数")
+pid = dlg.sel_pid
+eq(len(dlg.tbl_model.all_rows()), len(win.ai_cfg.provider_models(pid)),
+   "只显示选中供应商下的模型")
 chk("共 " in dlg.lbl_sum.cget("text"), "汇总行有内容", dlg.lbl_sum.cget("text"))
 
-# 再加一条，列表要跟着长
+# 左侧每一家都能点，切过去表格跟着换（供应商 / 模型 两个维度）
+pids = list(dlg.plist._rows.keys())
+chk(len(pids) >= 4, "左侧列出多家供应商", pids)
+dlg.provider_pick("ollama")
+pump(win, 0.2)
+eq(len(dlg.tbl_model.all_rows()), len(win.ai_cfg.provider_models("ollama")),
+   "切到 Ollama 后只剩它下面的模型")
+eq(dlg.lbl_prov.cget("text"), aiops.PROVIDERS["ollama"]["label"],
+   "右上供应商标题跟着切换")
+eq(dlg.v_base.get(), win.ai_cfg.provider_base("ollama"), "接口地址跟着切换")
+
+# 在这个供应商下新增一条，列表要长一行
+n_oll = len(dlg.tbl_model.all_rows())
 rec = win.ai_cfg.upsert_model({"provider": "ollama", "name": "第二条",
                                "model": "qwen2.5:14b"})
 dlg.model_reload()
-eq(len(dlg.tbl_model.all_rows()), 2, "新增后列表变两行")
+eq(len(dlg.tbl_model.all_rows()), n_oll + 1, "新增后列表长一行")
 
-# 选中第二行 → 设为当前
+# 选中新增那条 → 设为当前
 rows = dlg.tbl_model.all_rows()
 idx = [i for i, r in enumerate(rows) if r["_id"] == rec["id"]][0]
 dlg.tbl_model.tree.selection_set(dlg.tbl_model.tree.get_children()[idx])
@@ -160,15 +174,13 @@ eq(win.ai_cfg.current_id(), rec["id"], "点『设为当前』真的切过去了"
 cur = [r for r in dlg.tbl_model.all_rows() if r["current"]][0]
 eq(cur["_id"], rec["id"], "表格里的当前标记跟着动")
 
-# 删到只剩一条时，删除被拒
-dlg.tbl_model.tree.selection_set(dlg.tbl_model.tree.get_children()[0])
+# 删到全局只剩一条时，删除被拒
+for m in win.ai_cfg.models()[1:]:
+    win.ai_cfg.remove_model(m["id"])
+dlg.provider_pick("ollama")
 pump(win, 0.1)
-first_id = dlg.tbl_model.selected()["_id"]
-win.ai_cfg.remove_model(first_id)
-dlg.model_reload()
-eq(len(dlg.tbl_model.all_rows()), 1, "手动删到一条")
 ok, why = win.ai_cfg.remove_model(win.ai_cfg.current_id())
-chk(ok is False, "界面背后的删除也被拦住", why)
+chk(ok is False, "最后一条删不掉（删空助手就没模型可用）", why)
 
 # 试连：没 Key 的官方线路要给出人话
 bad = win.ai_cfg.upsert_model({"provider": "deepseek", "model": "deepseek-chat",

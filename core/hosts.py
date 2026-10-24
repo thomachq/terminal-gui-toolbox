@@ -65,8 +65,14 @@ def proto_of(p: dict) -> str:
 
 # ------------------------------------------------------------------ 地址
 def addr_of(p: dict) -> str:
-    """`user@host:port` —— 缺哪段就少哪段，不留 `@:22` 这种残句。"""
+    """`user@host:port` —— 缺哪段就少哪段，不留 `@:22` 这种残句。
+
+    本机档案没有 host（连的就是自己），列表里显示 `localhost` 比「—」清楚：
+    用户一眼能看出这条不是没填完，而是本来就没有远端地址。
+    """
     p = p or {}
+    if proto_of(p) == "local":
+        return "localhost"
     host = str(p.get("host") or "").strip()
     user = str(p.get("user") or "").strip()
     port = str(p.get("port") or "").strip()

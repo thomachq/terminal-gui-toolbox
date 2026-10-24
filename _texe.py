@@ -245,7 +245,7 @@ def main():
                     break
                 time.sleep(0.3)
             chk(gone, "点 × 后进程自己退出（不再残留后台）",
-                "等了 20 秒还没退，rc=%r" % p5.poll())
+                "rc=%r" % p5.poll())
     finally:
         if p5.poll() is None:
             p5.kill()

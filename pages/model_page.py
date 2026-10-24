@@ -35,21 +35,23 @@ from core import aiops, modelsync
 from ui import forms
 from ui.table import Column, DataTable
 
-# 列宽加起来要能塞进 1080 的对话框，否则最右的「状态」被挤出去 ——
-# 那恰是最该看的一列（缺 Key / 缺 Harness / 就绪）。
+# 左边已经按供应商分好组，表里就不再重复一列「服务商」——
+# 省出来的宽度给模型名和接口地址（这两个才是真要看的）。
 MODEL_COLS = [
-    Column("current", "", 52),
-    Column("name", "名称", 116, stretch=True),
-    Column("provider", "服务商", 92),
-    Column("model", "模型名", 136, stretch=True),
-    Column("base", "接口地址", 146, stretch=True),
-    Column("ctx", "上下文", 64, anchor="e"),
-    Column("max_in", "最大输入", 64, anchor="e"),
-    Column("max_out", "最大输出", 64, anchor="e"),
-    Column("caps", "能力", 104),
-    Column("key", "Key", 48),
-    Column("state", "状态", 74),
+    Column("current", "", 46),
+    Column("name", "名称", 112, stretch=True),
+    Column("model", "模型名", 132, stretch=True),
+    Column("base", "接口地址", 160, stretch=True),
+    Column("ctx", "上下文", 60, anchor="e"),
+    Column("max_in", "最大输入", 62, anchor="e"),
+    Column("max_out", "最大输出", 62, anchor="e"),
+    Column("caps", "能力", 90),
+    Column("key", "Key", 42),
+    Column("state", "状态", 62),
 ]
+
+# 左侧供应商列表的顺序：常用的排前面，「自定义」永远在最后当兜底
+PROVIDER_ORDER = ("deepseek", "ollama", "lmstudio", "dsh", "custom")
 
 # Token 限制的预设胶囊。1024 进制 —— 主流模型窗口基本都是 2 的幂
 # （131072 / 262144 / 1048576）。点一下只是把值填进输入框，手填的值优先。
@@ -66,8 +68,75 @@ def _preset_value(k: int) -> int:
     return k * 1024
 
 
+class _ProviderList(tk.Frame):
+    """左栏供应商列表。
+
+    没用 Listbox：要两行（名字 + 「N 个模型」）并且要跟着主题换色，
+    Listbox 做不到单元格级别的自绘。
+    """
+
+    def __init__(self, master, on_pick):
+        super().__init__(master, bg=U.T.card, bd=0)
+        self.on_pick = on_pick
+        self._rows: dict[str, tuple[list, tk.Label, tk.Label]] = {}
+        self.current = ""
+        U.register(self, self._paint)
+
+    def set_items(self, items: list[tuple]) -> None:
+        """items: [(pid, 标题, 副标题, 是否当前)]"""
+        for w in self.winfo_children():
+            w.destroy()
+        self._rows.clear()
+        for pid, label, sub, is_cur in items:
+            row = tk.Frame(self, bg=U.T.card, bd=0, cursor="hand2")
+            row.pack(fill="x", padx=U.px(6), pady=U.px(1))
+            top = tk.Frame(row, bg=U.T.card)
+            top.pack(fill="x", padx=U.px(8), pady=(U.px(7), 0))
+            dot = tk.Label(top, text="●" if is_cur else "", bg=U.T.card,
+                           fg=U.T.brand, font=U.FONT_XS)
+            dot.pack(side="left")
+            lb = tk.Label(top, text=label, bg=U.T.card, fg=U.T.text,
+                          font=U.FONT_S, anchor="w")
+            lb.pack(side="left", padx=(U.px(4), 0))
+            sb = tk.Label(row, text=sub, bg=U.T.card, fg=U.T.text_mute,
+                          font=U.FONT_XS, anchor="w")
+            sb.pack(fill="x", padx=(U.px(20), U.px(8)), pady=(0, U.px(7)))
+            for w in (row, top, dot, lb, sb):
+                w.bind("<Button-1>", lambda _e, p=pid: self.select(p))
+            self._rows[pid] = ([row, top, dot], lb, sb)
+        self._paint()
+
+    def select(self, pid: str, fire: bool = True) -> None:
+        if pid not in self._rows:
+            return
+        self.current = pid
+        self._paint()
+        if fire and self.on_pick:
+            self.on_pick(pid)
+
+    def _paint(self) -> None:
+        for pid, (frames, lb, sb) in self._rows.items():
+            on = pid == self.current
+            bg = U.T.brand_soft if on else U.T.card
+            for f in frames:
+                try:
+                    f.configure(bg=bg)
+                except tk.TclError:
+                    pass
+            lb.configure(bg=bg, fg=U.T.text if on else U.T.text_dim,
+                         font=((U.FONT_S[0], U.FONT_S[1], "bold") if on
+                               else U.FONT_S))
+            sb.configure(bg=bg, fg=U.T.text_mute)
+
+
 class ModelDialog(tk.Toplevel):
-    """模型清单。非模态 —— 开着也能回主界面看助手现在到底用哪条。"""
+    """模型清单：左边供应商，右边该供应商下的模型与设置。
+
+    为什么分两层（对齐 Cherry Studio 的「模型服务」）：
+      同一个供应商下一般会挂好几个模型（快 / 便宜 / 会写代码），
+      接口地址和 Key 是这几个模型**共用**的。扁平一张表就得给每条模型
+      重复填一遍地址和 Key，改网关要改 N 行，填漏一行就是一条废配置。
+    """
 
     def __init__(self, app, parent=None):
         tk.Toplevel.__init__(self, app)
@@ -76,55 +145,138 @@ class ModelDialog(tk.Toplevel):
         self.withdraw()
         self.title("模型管理 — 智能运维助手")
         self.configure(bg=U.T.page)
-        self.geometry(f"{U.px(1080)}x{U.px(580)}+{U.px(150)}+{U.px(110)}")
-        self.minsize(U.px(820), U.px(440))
+        self.geometry(f"{U.px(1100)}x{U.px(600)}+{U.px(150)}+{U.px(100)}")
+        self.minsize(U.px(900), U.px(470))
         self.transient(app)
 
+        self.sel_pid = self.cfg.provider
+        if self.sel_pid not in aiops.PROVIDERS:
+            self.sel_pid = aiops.DEFAULT_PROVIDER
+        self.v_base = tk.StringVar()
+        self.v_key = tk.StringVar()
+
         wrap = U.wframe(self, "page")
-        wrap.pack(fill="both", expand=True, padx=U.px(18), pady=U.px(16))
+        wrap.pack(fill="both", expand=True, padx=U.px(18), pady=U.px(14))
         wrap.columnconfigure(0, weight=1)
-        wrap.rowconfigure(2, weight=1)
+        wrap.rowconfigure(1, weight=1)
 
         # ---- 标题
         head = U.wframe(wrap, "page")
         head.grid(row=0, column=0, sticky="we")
         U.wlabel(head, "模型管理", "page", U.FONT_T).pack(side="left")
-        U.wlabel(head, "只收文本模型，一条配置一个模型，随时切换当前", "pagedim",
+        U.wlabel(head, "只收文本模型。先选供应商，再管它下面的模型", "pagedim",
                  U.FONT_S).pack(side="left", padx=(U.px(10), 0))
         U.RoundButton(head, "关闭", self._close, variant="ghost",
                       font=U.FONT_S, height=28, padx=12).pack(side="right")
-        U.RoundButton(head, "试连", self.model_probe, variant="ghost",
-                      font=U.FONT_S, height=28, padx=10).pack(
-            side="right", padx=(0, U.px(6)))
 
-        # ---- 动作条
-        bar = U.wframe(wrap, "page")
-        bar.grid(row=1, column=0, sticky="we", pady=(U.px(12), U.px(8)))
-        U.RoundButton(bar, "＋ 新增模型", self.model_add, variant="primary",
-                      font=U.FONT_S, height=30, padx=13).pack(side="left")
-        U.RoundButton(bar, "同步模型", self.model_sync, variant="ghost",
-                      font=U.FONT_S, height=30, padx=10).pack(
-            side="left", padx=(U.px(6), 0))
-        U.RoundButton(bar, "设为当前", self.model_activate, variant="ghost",
-                      font=U.FONT_S, height=30, padx=10).pack(
-            side="left", padx=(U.px(6), 0))
-        U.RoundButton(bar, "编辑", lambda: self.model_edit(self._pick()),
-                      variant="ghost", font=U.FONT_S, height=30,
-                      padx=10).pack(side="left", padx=(U.px(6), 0))
-        U.RoundButton(bar, "删除", self.model_delete, variant="ghost",
-                      font=U.FONT_S, height=30, padx=10).pack(
-            side="left", padx=(U.px(6), 0))
-        self.lbl_sum = U.wlabel(bar, "", "pagedim", U.FONT_XS)
-        self.lbl_sum.pack(side="right")
+        # ---- 主体：左供应商 / 右模型
+        body = U.wframe(wrap, "page")
+        body.grid(row=1, column=0, sticky="nsew", pady=(U.px(12), 0))
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
 
-        # ---- 表格
+        left = tk.Frame(body, bg=U.T.card, bd=0, width=U.px(196),
+                        highlightthickness=1, highlightbackground=U.T.border)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, U.px(12)))
+        left.grid_propagate(False)
+        U.wlabel(left, "供应商", "card", U.FONT_XS).pack(
+            anchor="w", padx=U.px(14), pady=(U.px(10), U.px(2)))
+        self.plist = _ProviderList(left, self.provider_pick)
+        self.plist.pack(fill="both", expand=True, pady=(0, U.px(6)))
+
+        right = U.wframe(body, "page")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        self._build_provider_card(right)
+        self._build_model_area(right)
+
+        # ---- 底部提示
+        self.lbl_hint = U.wlabel(
+            wrap, "切换只影响「当前模型」；助手下次调用就用新的那条。",
+            "pagedim", U.FONT_XS)
+        self.lbl_hint.grid(row=2, column=0, sticky="w", pady=(U.px(8), 0))
+        self.lbl_sum = U.wlabel(wrap, "", "pagedim", U.FONT_XS)
+        self.lbl_sum.grid(row=2, column=0, sticky="e")
+
+        self.provider_pick(self.sel_pid)
+        self.deiconify()
+
+    # ------------------------------------------------------------ 供应商卡
+    def _entry(self, parent, var: tk.StringVar, show: str = "") -> tk.Entry:
+        e = tk.Entry(parent, textvariable=var, bd=0, relief="flat", show=show,
+                     bg=U.T.input_bg, fg=U.T.text, insertbackground=U.T.text,
+                     font=U.FONT_S, highlightthickness=1,
+                     highlightbackground=U.T.input_border,
+                     highlightcolor=U.T.brand)
+        U.register(e, lambda: e.configure(
+            bg=U.T.input_bg, fg=U.T.text, insertbackground=U.T.text,
+            highlightbackground=U.T.input_border, highlightcolor=U.T.brand))
+        return e
+
+    def _build_provider_card(self, parent) -> None:
+        card = tk.Frame(parent, bg=U.T.card, bd=0,
+                        highlightthickness=1, highlightbackground=U.T.border)
+        card.grid(row=0, column=0, sticky="we", pady=(0, U.px(10)))
+        body = tk.Frame(card, bg=U.T.card)
+        body.pack(fill="x", padx=U.px(14), pady=U.px(12))
+        body.columnconfigure(1, weight=1)
+
+        self.lbl_prov = tk.Label(body, text="", bg=U.T.card, fg=U.T.text,
+                                 font=U.FONT_B, anchor="w")
+        self.lbl_prov.grid(row=0, column=0, sticky="w")
+        self.lbl_prov_sub = tk.Label(body, text="", bg=U.T.card,
+                                     fg=U.T.text_mute, font=U.FONT_XS, anchor="w")
+        self.lbl_prov_sub.grid(row=0, column=1, sticky="w", padx=(U.px(10), 0))
+
+        btns = tk.Frame(body, bg=U.T.card)
+        btns.grid(row=0, column=2, sticky="e", rowspan=3)
+        self.btn_prov_save = U.RoundButton(
+            btns, "保存设置", self.provider_save, variant="primary",
+            font=U.FONT_S, height=28, padx=12)
+        self.btn_prov_save.pack(side="right")
+        self.btn_prov_probe = U.RoundButton(
+            btns, "试连", self.provider_probe, variant="ghost",
+            font=U.FONT_S, height=28, padx=10)
+        self.btn_prov_probe.pack(side="right", padx=(0, U.px(6)))
+        self.btn_key_clear = U.RoundButton(
+            btns, "清除 Key", self.provider_clear_key, variant="ghost",
+            font=U.FONT_S, height=28, padx=10)
+        # 默认收起来：没存过 Key 的时候「清除」是纯噪声
+        self.btn_key_clear.pack(side="right", padx=(0, U.px(6)))
+        self.btn_key_clear.pack_forget()
+
+        lab = dict(bg=U.T.card, fg=U.T.text_dim, font=U.FONT_S)
+        tk.Label(body, text="接口地址", **lab).grid(
+            row=1, column=0, sticky="w", pady=(U.px(10), 0))
+        self.ent_base = self._entry(body, self.v_base)
+        self.ent_base.grid(row=1, column=1, sticky="we", padx=(U.px(10), U.px(10)),
+                           pady=(U.px(10), 0), ipady=U.px(3))
+
+        tk.Label(body, text="API Key", **lab).grid(
+            row=2, column=0, sticky="w", pady=(U.px(8), 0))
+        self.ent_key = self._entry(body, self.v_key, show="•")
+        self.ent_key.grid(row=2, column=1, sticky="we", padx=(U.px(10), U.px(10)),
+                          pady=(U.px(8), 0), ipady=U.px(3))
+
+        self.lbl_key_hint = tk.Label(body, text="", bg=U.T.card,
+                                     fg=U.T.text_mute, font=U.FONT_XS, anchor="w")
+        self.lbl_key_hint.grid(row=3, column=1, columnspan=2, sticky="w",
+                                padx=(U.px(10), 0), pady=(U.px(3), 0))
+        self.lbl_base_hint = tk.Label(body, text="", bg=U.T.card,
+                                      fg=U.T.text_mute, font=U.FONT_XS, anchor="w")
+        self.lbl_base_hint.grid(row=3, column=0, sticky="w", pady=(U.px(3), 0))
+
+    # ------------------------------------------------------------ 模型区
+    def _build_model_area(self, parent) -> None:
         self.tbl_model = DataTable(
-            wrap, MODEL_COLS, height=11,
-            search_hint="搜索名称、服务商、模型名",
-            empty_title="还没有模型",
-            empty_hint="点「＋ 新增模型」填一条；只有一条时会自动设为当前。",
+            parent, MODEL_COLS, height=9,
+            search_hint="搜索名称、模型名、接口",
+            empty_title="这个供应商下还没有模型",
+            empty_hint="点右上「＋ 新增模型」填一条，或用「同步模型」从接口拉一份。",
             on_activate=lambda r: self.model_edit((r or {}).get("_raw") or {}))
-        self.tbl_model.grid(row=2, column=0, sticky="nsew")
+        self.tbl_model.grid(row=1, column=0, sticky="nsew")
         self.tbl_model.set_menu([
             ("设为当前", self.model_activate, None),
             ("编辑", lambda: self.model_edit(self._pick()), None),
@@ -133,14 +285,114 @@ class ModelDialog(tk.Toplevel):
             ("删除", self.model_delete, None),
         ])
 
-        # ---- 底部提示
-        self.lbl_hint = U.wlabel(
-            wrap, "切换只影响「当前模型」；助手下次调用就用新的那条。",
-            "pagedim", U.FONT_XS)
-        self.lbl_hint.grid(row=3, column=0, sticky="w", pady=(U.px(8), 0))
+        act = self.tbl_model.actions
+        U.RoundButton(act, "＋ 新增模型", self.model_add, variant="primary",
+                      font=U.FONT_S, height=28, padx=12).pack(side="right")
+        for text, cmd in (("删除", self.model_delete),
+                          ("编辑", lambda: self.model_edit(self._pick())),
+                          ("设为当前", self.model_activate),
+                          ("同步模型", self.model_sync)):
+            U.RoundButton(act, text, cmd, variant="ghost", font=U.FONT_S,
+                          height=28, padx=9).pack(side="right", padx=(0, U.px(5)))
 
+    # ------------------------------------------------------------ 供应商维度
+    def _provider_items(self) -> list[tuple]:
+        cur = self.cfg.current_id()
+        out = []
+        for pid in PROVIDER_ORDER:
+            p = aiops.PROVIDERS.get(pid)
+            if not p:
+                continue
+            ms = self.cfg.provider_models(pid)
+            is_cur = any(str(m.get("id")) == cur for m in ms)
+            sub = f"{len(ms)} 个模型" + ("　·　当前" if is_cur else "")
+            out.append((pid, p["label"], sub, is_cur))
+        return out
+
+    def provider_pick(self, pid: str) -> None:
+        if pid not in aiops.PROVIDERS:
+            pid = aiops.DEFAULT_PROVIDER
+        self.sel_pid = pid
+        preset = aiops.PROVIDERS[pid]
+        self.v_base.set(self.cfg.provider_base(pid))
+        self.v_key.set("")
+        n = len(self.cfg.provider_models(pid))
+        self.lbl_prov.configure(text=preset["label"])
+        self.lbl_prov_sub.configure(
+            text=f"{n} 个模型　·　{preset['kind']} 接口")
+        self.lbl_base_hint.configure(
+            text=preset.get("hint") or "")
+        has = bool(self.cfg.provider_key_enc(pid))
+        if has:
+            self.lbl_key_hint.configure(text="已存，留空表示不修改")
+            if not self.btn_key_clear.winfo_manager():
+                self.btn_key_clear.pack(side="right", padx=(0, U.px(6)))
+        else:
+            self.lbl_key_hint.configure(
+                text="未填" if preset.get("need_key")
+                else "这条线路一般不需要 Key")
+            if self.btn_key_clear.winfo_manager():
+                self.btn_key_clear.pack_forget()
+        self.plist.select(pid, fire=False)
         self.model_reload()
-        self.deiconify()
+
+    def provider_save(self) -> None:
+        pid = self.sel_pid
+        base = self.v_base.get().strip()
+        typed = self.v_key.get()
+        self.cfg.set_provider(pid, base=base,
+                              key=(typed if typed.strip() else None))
+        self.v_key.set("")
+        self.provider_pick(pid)
+        self.app.toast("供应商设置已保存，下面的模型跟着更新了", "ok")
+        try:
+            self.app._ai_refresh_dock_state()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def provider_clear_key(self) -> None:
+        pid = self.sel_pid
+        label = aiops.PROVIDERS[pid]["label"]
+        if not forms.confirm(self, "清除 Key",
+                             f"清掉「{label}」保存的 API Key？\n"
+                             "下面的模型会一起变成「缺 Key」。",
+                             danger=True, ok_text="清除"):
+            return
+        self.cfg.set_provider(pid, key="")
+        self.provider_pick(pid)
+        self.app.toast("已清除 Key", "ok")
+
+    def provider_probe(self) -> None:
+        """试连整个供应商：地址 + Key 对不对，不用挑某一条模型。"""
+        pid = self.sel_pid
+        base = self.v_base.get().strip() or self.cfg.provider_base(pid)
+        ms = self.cfg.provider_models(pid)
+        model = str((ms[0].get("model") if ms else "")
+                    or aiops.PROVIDERS[pid].get("model") or "")
+        enc = self.cfg.provider_key_enc(pid)
+        typed = self.v_key.get().strip()
+        if typed:
+            try:
+                import crypto_store
+                enc = crypto_store.protect(typed) or ""
+            except Exception:  # noqa: BLE001
+                enc = ""
+        rec = {"provider": pid, "base": base, "model": model, "key_enc": enc}
+        label = aiops.PROVIDERS[pid]["label"]
+        self.lbl_hint.configure(text=f"正在试连「{label}」…（最多 20 秒）")
+        self.app.toast(f"正在试连「{label}」…", "warn")
+
+        def work():
+            try:
+                ok, msg = aiops.probe_model(rec, timeout=20)
+            except Exception as e:  # noqa: BLE001
+                ok, msg = False, f"{type(e).__name__}: {e}"
+            try:
+                self.after(0, lambda: self._probe_done(label, ok, msg))
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _close(self) -> None:
         try:
@@ -151,18 +403,26 @@ class ModelDialog(tk.Toplevel):
     # ================================================================ 数据
     def model_reload(self) -> None:
         cfg = self.cfg
+        pid = getattr(self, "sel_pid", cfg.provider)
+        preset = aiops.PROVIDERS.get(pid) or aiops.PROVIDERS[aiops.DEFAULT_PROVIDER]
         active = cfg.current_id()
         rows = []
-        for m in cfg.models():
+        for m in cfg.provider_models(pid):
             v = aiops.model_view(m, active)
             v["_tone"] = v.get("tone") or ""
             rows.append(v)
         self.tbl_model.set_rows(rows)
+        self.tbl_model.set_empty(
+            f"「{preset['label']}」下还没有模型",
+            "点右上「＋ 新增模型」填一条，或用「同步模型」从接口拉一份。")
+
+        self.plist.set_items(self._provider_items())
+        all_models = cfg.models()
         cur = cfg.current()
-        unknown = sum(1 for m in cfg.models()
+        unknown = sum(1 for m in all_models
                       if not (m.get("context") or m.get("ctx")))
         self.lbl_sum.configure(
-            text=f"共 {len(rows)} 个模型 · 当前：{cur.get('name') or '未命名'}")
+            text=f"共 {len(all_models)} 个模型 · 当前：{cur.get('name') or '未命名'}")
         tip = ("切换只影响「当前模型」；助手下次调用就用新的那条。"
                f"现在用的是 {cur.get('model') or '（未填模型名）'}")
         if unknown:
@@ -200,7 +460,7 @@ class ModelDialog(tk.Toplevel):
             pass
 
     def model_add(self) -> None:
-        rec = self._form(None)
+        rec = self._form(None, provider=self.sel_pid)
         if not rec:
             return
         saved = self.cfg.upsert_model(rec)
@@ -272,16 +532,19 @@ class ModelDialog(tk.Toplevel):
         顺手抓上下文/最大输入/最大输出 —— 抓不到就是「未知」，不猜。
         """
         rec = self._pick() or self.cfg.current()
-        prov = str(rec.get("provider") or self.cfg.provider)
+        prov = str(rec.get("provider") or getattr(self, "sel_pid", "")
+                   or self.cfg.provider)
         preset = aiops.PROVIDERS.get(prov) or aiops.PROVIDERS[aiops.DEFAULT_PROVIDER]
         if preset.get("kind") == "dsh":
             self.app.toast("Harness 线路没有模型列表；换一条 OpenAI 兼容线路再同步", "warn")
             return
-        base = str(rec.get("base") or preset.get("base") or "")
+        base = str(rec.get("base") or self.cfg.provider_base(prov)
+                   or preset.get("base") or "")
         if not base:
-            self.app.toast("这条模型还没填接口地址，先编辑填上", "warn")
+            self.app.toast("这家供应商还没填接口地址，先在上面填上", "warn")
             return
-        key = self.cfg.model_key(str(rec.get("id") or "")) or self.cfg.get_key()
+        key = (self.cfg.model_key(str(rec.get("id") or ""))
+               or self.cfg.provider_key(prov) or self.cfg.get_key())
         self.lbl_hint.configure(text=f"正在从 {base} 同步模型列表…（最多 20 秒）")
         self.app.toast("正在同步模型列表…", "warn")
 
@@ -343,7 +606,7 @@ class ModelDialog(tk.Toplevel):
             }
             self.cfg.upsert_model(rec)
             added += 1
-        self.model_reload()
+        self.provider_pick(prov)          # 同步完自动切到那家供应商看结果
         self.app.toast(f"同步完成，新增 {added} 个文本模型", "ok")
         try:
             self.lbl_hint.configure(
@@ -352,9 +615,13 @@ class ModelDialog(tk.Toplevel):
             pass
 
     # ================================================================ 表单
-    def _form(self, rec: dict | None) -> dict | None:
-        """新增 / 编辑共用一张表单。rec 为空就是新增。"""
-        dlg = _ModelForm(self, rec, self.cfg)
+    def _form(self, rec: dict | None, provider: str = "") -> dict | None:
+        """新增 / 编辑共用一张表单。rec 为空就是新增。
+
+        `provider` 是新增时的默认供应商 —— 左边点了哪一家，新增就落在哪一家，
+        省得每次都要在表单里再选一遍。
+        """
+        dlg = _ModelForm(self, rec, self.cfg, default_provider=provider)
         try:
             self.wait_window(dlg)
         except tk.TclError:
@@ -418,7 +685,7 @@ class _ModelForm(tk.Toplevel):
       · 字段多到一屏放不下，要能滚
     """
 
-    def __init__(self, parent, rec: dict | None, cfg):
+    def __init__(self, parent, rec: dict | None, cfg, default_provider: str = ""):
         super().__init__(parent)
         self.withdraw()
         self.rec = dict(rec or {})
@@ -430,7 +697,8 @@ class _ModelForm(tk.Toplevel):
         self.transient(parent)
         self.resizable(False, True)
 
-        prov = str(self.rec.get("provider") or aiops.DEFAULT_PROVIDER)
+        prov = str(self.rec.get("provider") or default_provider
+                   or aiops.DEFAULT_PROVIDER)
         if prov not in aiops.PROVIDERS:
             prov = aiops.DEFAULT_PROVIDER
         self._prov = prov

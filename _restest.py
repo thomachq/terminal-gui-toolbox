@@ -58,6 +58,9 @@ eq(H.addr_of({"host": "10.0.0.1", "user": "root", "port": "2222"}),
 eq(H.addr_of({"host": "10.0.0.1", "port": "23", "proto": "telnet"}),
    "10.0.0.1:23", "telnet 显式端口")
 eq(H.addr_of({}), "—", "无地址给破折号")
+eq(H.addr_of({"proto": "local"}), "localhost", "本机显示 localhost 而不是破折号")
+eq(H.addr_of({"proto": "local", "host": "127.0.0.1"}), "localhost",
+   "本机即使存了 host 也统一写 localhost")
 eq(H.display_name({"name": "", "host": "h1"}), "h1", "无名字回落主机名")
 eq(H.display_name({}), "未命名主机", "全空兜底")
 

@@ -36,11 +36,9 @@ desktop.ini
 # ── 自测产生的 PKI 样本（里面有 CA 私钥，绝不入库）──
 _test_data/
 
-# 构建与提交用的临时文件
-build_out.log
-build_v*.log
-build_vpn*.log
-commit_out.log
+# 构建与提交用的临时文件。日志一律不进库 —— 仓库里没有需要跟踪的 .log，
+# 而构建 / 提交 / 打 tag 每次都往根目录丢一个，逐个列名字总有漏的。
+*.log
 _commitmsg.txt
 _release/
 _tagmsg.txt

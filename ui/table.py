@@ -125,6 +125,14 @@ class DataTable(tk.Frame):
         self._empty_title = empty_title
         self._empty_hint = empty_hint
         self._search_var = tk.StringVar()
+        # 用户拖出来的列宽（物理像素）。Tk 的 stretch 自动布局不能用 ——
+        # 内容比可视宽的时候，它会把带 stretch 的列压回 minwidth，
+        # 用户拖完一松手就弹回去（实测 255 → 72）。所以全部 stretch=False，
+        # 余量由 _refit_columns() 自己补给「填充列」，且只增不减。
+        self._user_w: dict[str, int] = {}
+        self._fit_job = None
+        self._sbx_job = None
+        self._sbx_need = False
 
         # ---- 工具条
         self.toolbar = U.wframe(self, bg_role)
@@ -160,11 +168,7 @@ class DataTable(tk.Frame):
         keys = [c.key for c in self.columns]
         self.tree = ttk.Treeview(self.table_wrap, columns=keys, show="headings",
                                  height=height, selectmode="browse")
-        for c in self.columns:
-            self.tree.heading(c.key, text=c.title,
-                              command=lambda k=c.key: self._sort_by(k))
-            self.tree.column(c.key, width=U.px(c.width), minwidth=U.px(48),
-                             anchor=c.anchor, stretch=c.stretch)
+        self._apply_columns()
         self.sb = ttk.Scrollbar(self.table_wrap, orient="vertical",
                                 command=self.tree.yview,
                                 style="Card.Vertical.TScrollbar")
@@ -186,17 +190,94 @@ class DataTable(tk.Frame):
         self.tree.bind("<Double-1>", self._dbl)
         self.tree.bind("<<TreeviewSelect>>", self._sel)
         self.tree.bind("<Button-3>", self._popup)
-        # 面板拉伸 / 分栏拖动后空态要跟着重新居中
+        # 面板拉伸 / 分栏拖动后空态要跟着重新居中，列宽也要重新分配余量
+        self.tree.bind("<Configure>", self._on_tree_configure, add="+")
         self.tree.bind("<Configure>", lambda _e: self._place_empty(), add="+")
+        # 松手才算「用户设定的宽度」：拖动过程中读到的中间值不能记
+        self.tree.bind("<ButtonRelease-1>", self._remember_widths, add="+")
         self._menu = tk.Menu(self, tearoff=0)
 
         U.register(self, self._paint)
         self._paint()
         self._refresh_empty()
 
+    # ------------------------------------------------------------ 列宽
+    def _filler_key(self) -> str:
+        """窗口变宽时把余量补给哪一列：优先 Column(stretch=True)，否则最后一列。"""
+        for c in self.columns:
+            if c.stretch:
+                return c.key
+        return self.columns[-1].key if self.columns else ""
+
+    def _width_of(self, key: str) -> int:
+        for c in self.columns:
+            if c.key == key:
+                return int(self._user_w.get(key, U.px(c.width)))
+        return 0
+
+    def _apply_columns(self) -> None:
+        """按定义把列建出来。stretch 一律 False —— 拉伸自己算（见 _refit_columns）。"""
+        for c in self.columns:
+            self.tree.heading(c.key, text=c.title,
+                              command=lambda k=c.key: self._sort_by(k))
+            self.tree.column(c.key, width=self._width_of(c.key),
+                             minwidth=U.px(48), anchor=c.anchor, stretch=False)
+        self.after_idle(self._refit_columns)
+
+    def _refit_columns(self) -> None:
+        """把「比总宽多出来的那点」补给填充列；内容超宽就一个字都不动。
+
+        关键是**只增不减**：一旦内容比可视宽（要靠横向滚动条），任何收缩都会
+        把用户刚拖好的列挤回去。窗口变窄时填充列退回用户设定的宽度，
+        超出部分交给横向滚动条。
+        """
+        self._fit_job = None
+        try:
+            avail = self.tree.winfo_width()
+        except tk.TclError:
+            return
+        if avail <= 1 or not self.columns:
+            return
+        key = self._filler_key()
+        want = {c.key: self._width_of(c.key) for c in self.columns}
+        total = sum(want.values())
+        if key and total < avail:
+            want[key] += avail - total
+        for c in self.columns:
+            try:
+                if int(self.tree.column(c.key, "width")) != want[c.key]:
+                    self.tree.column(c.key, width=want[c.key])
+            except tk.TclError:
+                return
+
+    def _on_tree_configure(self, _e=None) -> None:
+        """窗口/面板尺寸变了才重排。拖动过程中 Tk 也会发 <Configure>，
+        这里 debounce 一下，避免每一像素都重算列宽跟手打架。"""
+        if self._fit_job:
+            try:
+                self.after_cancel(self._fit_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._fit_job = self.after(40, self._refit_columns)
+
+    def _remember_widths(self, _e=None) -> None:
+        """松手时把当前宽度记成「用户设定值」，后面 resize 就以它为准。"""
+        for c in self.columns:
+            try:
+                self._user_w[c.key] = int(self.tree.column(c.key, "width"))
+            except tk.TclError:
+                return
+        # 拖完之后余量要重新分配（可能拖窄了，空出一截）
+        self._on_tree_configure()
+
     # ------------------------------------------------------------ 主题
     def _xscroll_set(self, first, last) -> None:
-        """横向滚动条按需显隐：只有列宽总和超出可视宽度才出现。"""
+        """横向滚动条按需显隐。
+
+        回调在拖动列宽时**每像素**都会触发，这里只记状态、不立刻动布局：
+        同步 grid()/grid_remove() 会让 Treeview 的高度变化 → <Configure> →
+        再触发列宽重排，于是拖动变得一顿一顿的。
+        """
         try:
             self.sb_x.set(first, last)
         except tk.TclError:
@@ -205,11 +286,23 @@ class DataTable(tk.Frame):
             need = bool(self._view) and (float(first) > 0.001 or float(last) < 0.999)
         except (TypeError, ValueError):
             need = bool(self._view)
+        if need == self._sbx_need:
+            return
+        self._sbx_need = need
+        if self._sbx_job:
+            try:
+                self.after_cancel(self._sbx_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._sbx_job = self.after(80, self._apply_sb_x)
+
+    def _apply_sb_x(self) -> None:
+        self._sbx_job = None
         try:
             shown = bool(self.sb_x.winfo_manager())
-            if need and not shown:
+            if self._sbx_need and not shown:
                 self.sb_x.grid()
-            elif not need and shown:
+            elif not self._sbx_need and shown:
                 self.sb_x.grid_remove()
         except tk.TclError:
             pass
@@ -257,15 +350,13 @@ class DataTable(tk.Frame):
         """换一套列（不同工具输出结构不一样，共用一个表格控件）。"""
         self.columns = list(columns)
         keys = [c.key for c in self.columns]
+        # 只保留仍然存在的列的拖动记录，否则同一 key 换了定义还沿用老宽度
+        self._user_w = {k: v for k, v in self._user_w.items() if k in keys}
         try:
             self.tree.configure(columns=keys, displaycolumns=keys)
-            for c in self.columns:
-                self.tree.heading(c.key, text=c.title,
-                                  command=lambda k=c.key: self._sort_by(k))
-                self.tree.column(c.key, width=U.px(c.width), minwidth=U.px(48),
-                                 anchor=c.anchor, stretch=c.stretch)
         except tk.TclError:
             return
+        self._apply_columns()
         self._render()
 
     def set_rows(self, rows: list[dict]) -> None:
@@ -412,6 +503,7 @@ class DataTable(tk.Frame):
                 self.empty.place_forget()
             else:
                 # 空表没有内容可滚，竖/横滚动条一起收起来，别在空态上画两条轨道
+                self._sbx_need = False
                 self.sb.grid_remove()
                 self.sb_x.grid_remove()
                 self._place_empty()
