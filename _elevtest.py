@@ -320,6 +320,9 @@ ok_shell = ScriptedCLI([
 ])
 chk(ok_shell.sudo_i("secret") is True, "密码对、id -u 是 0：成功")
 chk(ok_shell.sent[0] == "sudo -i\r\n", "第一步发的确实是 sudo -i")
+chk(any("secret" in x for x in ok_shell.sent),
+    "口令真的发出去了（`[sudo] password for ops:` 这种带用户名的提示也得认）",
+    str(ok_shell.sent))
 chk(any("id -u" in x for x in ok_shell.sent),
     "进完 shell 会跑 id -u 落锤（不靠提示符猜）")
 
@@ -336,6 +339,107 @@ no_root = ScriptedCLI([
 ])
 chk(no_root.sudo_i("secret") is False,
     "密码对了但 id -u 还是 1000：判失败，不假装提权成功")
+
+
+# ---------------------------------------------------------------- 8
+sec("8. 失败必须说清楚原因（不是只有 True/False）")
+
+# 用户在群晖上碰到的就是这类：提权没成，界面只说「未生效」，猜不到为什么。
+bad_pw2 = ScriptedCLI([
+    ("sudo -i", b"[sudo] password for ops: "),
+    ("wrong", b"Sorry, try again.\r\n[sudo] password for ops: "),
+])
+bad_pw2.sudo_i("wrong")
+chk("Sorry" in bad_pw2.last_error,
+    "密码错：last_error 里有原文", repr(bad_pw2.last_error))
+
+nosudo = ScriptedCLI([
+    ("sudo -i", b"ops is not in the sudoers file.  This incident will be reported.\r\n"),
+])
+nosudo.sudo_i("secret")
+chk("not in the sudoers" in nosudo.last_error,
+    "不在 sudoers：原因照抄回显", repr(nosudo.last_error))
+
+still_user = ScriptedCLI([
+    ("sudo -i", b"[sudo] password for ops: "),
+    ("secret", b"ops@h:~$ "),
+    ("id -u", b"id -u\r\n1000\r\nops@h:~$ "),
+])
+still_user.sudo_i("secret")
+chk("1000" in still_user.last_error,
+    "sudo -i 后仍不是 root：原因里带上 id -u", repr(still_user.last_error))
+
+ok2 = ScriptedCLI([
+    ("sudo -i", b"[sudo] password for ops: "),
+    ("secret", b"root@h:~# "),
+    ("id -u", b"id -u\r\n0\r\nroot@h:~# "),
+])
+ok2.sudo_i("secret")
+chk(ok2.last_error == "", "成功时不留下陈旧的失败原因", repr(ok2.last_error))
+
+
+# ---------------------------------------------------------------- 9
+sec("9. sudo -i 进不去时退回逐条 sudo")
+
+FakeShell.ok = False
+FakeShell.made.clear()
+fb = mk_ssh("unix", user="ops")
+# 逐条 sudo 能过（exec 通道里 sudo -S 是另一条路）
+fb.run = lambda cmd, timeout=30, sudo=False: (0, "0\n", "")
+chk(fb.elevate_root("secret") is True, "sudo -i 失败但逐条 sudo 可用：算提权成功")
+chk(fb.elevated is True and fb.elev_method == "percmd",
+    "提权方式记成 percmd（终端会走 run_admin）", fb.elev_method)
+chk(fb._root_shell is None, "percmd 模式不留 root shell")
+
+FakeShell.ok = False
+bad2 = mk_ssh("unix", user="ops")
+bad2.run = lambda cmd, timeout=30, sudo=False: (1, "", "sudo: a password is required")
+chk(bad2.elevate_root("secret") is False, "两条路都不通：判失败")
+chk(bool(bad2.elev_msg), "两条路都不通：留下失败原因", repr(bad2.elev_msg))
+
+FakeShell.ok = True
+chk(mk_ssh("unix", user="ops").elevate_root("s") is True, "恢复：sudo -i 又能用了")
+
+
+# ---------------------------------------------------------------- 10
+sec("10. verify_root：连接后实测 id -u，不听提权函数的自述")
+v1 = mk_ssh("unix", user="ops")
+v1.elevated = True
+v1.elev_method = "percmd"
+v1.sudo_pw = "secret"             # 真实流程里 sudo_ok 一定会留下密码
+v1.run = lambda cmd, timeout=30, sudo=False: (0, "0\n", "")
+ok, detail = v1.verify_root()
+chk(ok is True and detail == "0", "id -u = 0：核实通过", f"{ok} {detail!r}")
+
+v2 = mk_ssh("unix", user="ops")
+v2.elevated = True
+v2.sudo_pw = "secret"
+v2.run = lambda cmd, timeout=30, sudo=False: (0, "1000\n", "")
+ok, detail = v2.verify_root()
+chk(ok is False and "1000" in detail,
+    "id -u = 1000：核实不通过，且说明里带上真实 uid", detail)
+
+v3 = mk_ssh("network", user="admin")
+v3.enabled = True
+chk(v3.verify_root()[0] is True, "交换机：进了 enable 就算核实通过")
+
+
+# ---------------------------------------------------------------- 11
+sec("11. 口令提示的写法（这一条就是 v1.0.16 提权失败的根因）")
+from core.cli_channel import _PASSWORD  # noqa: E402
+
+for sample, want in (
+    ("Password: ", True),
+    ("[sudo] password for ops: ", True),      # sudo 默认就是这么打印的
+    ("password for cloudadmin:", True),
+    ("[sudo] password: ", True),
+    ("密码：", True),
+    ("ops@h:~$ ", False),
+    ("SW1#", False),
+):
+    got = bool(_PASSWORD.search(sample))
+    chk(got == want, f"提示 {sample!r} → {'认' if want else '不认'}",
+        f"认成了 {got}")
 
 
 print(f"\n{'=' * 52}")

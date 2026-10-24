@@ -159,6 +159,24 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * Fixed: "auto-elevate on connect" could not work at all, because the
+    password prompt was never recognised. sudo prints
+    "[sudo] password for <user>: " and the matcher required "password"
+    immediately followed by a colon, so the password was never sent: sudo
+    waited for it, we waited for output, and the follow-up "id -u" ended up
+    being typed into the password prompt. The pattern now accepts the
+    "for <user>" form.
+  * The terminal prompt now reflects elevation (`root@host ... #`). It used
+    to be drawn from `is_root` alone, so an elevated session still showed
+    `$` and looked like a failure.
+  * Elevation is verified by really running `id -u` after connecting, and
+    the true uid or the failure reason (wrong password / not in sudoers)
+    goes to the log and the status bar.
+  * When `sudo -i` is disabled by policy but `sudo <cmd>` is allowed
+    (Synology DSM and some hardened distributions), commands now fall back
+    to per-command sudo instead of giving up.
+  * An empty sudo password falls back to the login password on servers
+    (not on switches, where the enable password is a separate secret).
   * Fixed: the mouse pointer turned into a horizontal resize arrow over the
     whole data table, not just over the column separators. ttk::treeview
     handles <Motion> as a *class* binding, so any handler bound to the widget

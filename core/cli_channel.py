@@ -24,7 +24,14 @@ import time
 _MORE = re.compile(r"(?:<---\s*More\s*--->|--\s*More\s*--|----\s*More\s*----"
                    r"|--More--|more\s*--\s*|\(q\)uit)", re.I)
 
-_PASSWORD = re.compile(r"(?:password|passwd|密码)\s*[:：]", re.I)
+_PASSWORD = re.compile(
+    # 口令提示的几种写法：`Password:`、`[sudo] password for ops:`、
+    # `密码：`。**中间那个「for 用户名」必须吃掉** —— sudo 默认就是这么打印的
+    # （`[sudo] password for cloudadmin: `），早先的正则只认 password 紧跟冒号，
+    # 于是密码永远发不出去：sudo 干等你、我们干等回显，最后把 `id -u`
+    # 当密码喂了进去，表现为「勾了自动提权、终端还是普通用户」。
+    r"(?:(?:password|passwd)\s*(?:for\s+[^\s:：]+)?|密码)\s*[:：]", re.I)
+
 _PROMPT_TAIL = re.compile(r"[#>\]$]\s*$")
 
 # sudo 拒绝的几种回显：密码错、不在 sudoers、需要终端
@@ -34,6 +41,23 @@ _SUDO_BAD = re.compile(
     r"a terminal is required)", re.I)
 
 DEFAULT_ENCODINGS = ("utf-8", "gbk", "latin-1")
+
+
+def _tail(text: str, limit: int = 180) -> str:
+    """把回显压成一句能塞进日志的话（只留最后两行非空内容）。
+
+    失败原因必须**原文**报给用户：`not in the sudoers file` 和
+    `Sorry, try again` 是两件完全不同的事，笼统说「提权失败」等于没说。
+    """
+    lines = [x.strip() for x in re.split(r"[\r\n]+", text or "") if x.strip()]
+    s = " ／ ".join(lines[-2:]) if lines else ""
+    return s[-limit:]
+
+
+def _last_int(text: str) -> str:
+    """回显里最后一个「整行只有数字」的内容（`id -u` 的结果）。"""
+    got = re.findall(r"(?m)^\s*(\d+)\s*$", text or "")
+    return got[-1] if got else ""
 
 
 class CLIError(Exception):
@@ -49,6 +73,10 @@ class CLIClient:
         self.encoding = "utf-8"
         self.buf = ""
         self.last_prompt = ""
+        # 上一次提权失败的原因（原文）。空字符串表示没失败过 / 最后一次成功。
+        # 上层连接流程会把它写进日志与状态栏 —— 只返回 True/False 的话，
+        # 用户永远只能看到「提权未生效」，猜不到是密码错还是没权限。
+        self.last_error = ""
 
     # ------------------------------------------------------------ 子类实现
     def _send(self, text: str) -> None:
@@ -140,8 +168,11 @@ class CLIClient:
 
         判定标准是最后的提示符里出现 `#` —— Cisco / H3C / 华为的特权模式
         全都是 `#`，用户模式是 `>`。这比解析回显文字可靠。
+        失败原因同样落到 `self.last_error`。
         """
+        self.last_error = ""
         if not self.alive():
+            self.last_error = "连接已断开"
             return False
         self._send("enable\r\n")
         out = self._drain(time.time() + 6, quiet=0.5)
@@ -149,7 +180,10 @@ class CLIClient:
             self._send(password + "\r\n")
             out += self._drain(time.time() + 8, quiet=0.6)
         self._remember_prompt(out)
-        return "#" in (self.last_prompt or "")
+        if "#" in (self.last_prompt or ""):
+            return True
+        self.last_error = _tail(out) or "提示符没有变成 #（密码不对或权限不足）"
+        return False
 
     def disable_paging(self, vendor: str = "") -> None:
         """关掉分页。不关的话 `display current-configuration` 会一直翻页。"""
@@ -202,12 +236,18 @@ class CLIClient:
         密码提示；这个是**一次性进入 root**，和在终端里手敲 `sudo -i` 同义 ——
         提示符变成 `#`，之后不再重复提权。
 
-        判定不靠提示符：有的发行版 root 也用 `$`，看走眼就把普通用户当 root。
+        判定不靠提示符：有的发行版 root 也用 `$`（群晖的 `sudo -i` 之后就是
+        `root@xx:~#`，但别家不一定），看走眼就把普通用户当 root。
         进完跑一次 `id -u`，输出是 0 才算数。
+
+        失败原因写进 `self.last_error`，供上层原样报给用户。
         """
+        self.last_error = ""
         if not self.alive():
+            self.last_error = "连接已断开，开不了 root shell"
             return False
         if not password:
+            self.last_error = "没有可用的 sudo 密码"
             return False
         self._send("sudo -i\r\n")
         head = self._drain(time.time() + 5, quiet=0.45)
@@ -216,9 +256,17 @@ class CLIClient:
             head += self._drain(time.time() + max(timeout - 5, 6), quiet=0.6)
         # 密码错 / 不在 sudoers / 要 tty：这三种都不能假装成功
         if _SUDO_BAD.search(head):
+            self.last_error = _tail(head) or "sudo 拒绝了这次提权"
             return False
         # 密码对了也可能仍停在原 shell（sudoers 只放行了部分命令），落一锤
         self._send("id -u\r\n")
         out = self._drain(time.time() + 8, quiet=0.5)
         self._remember_prompt(out)
-        return bool(re.search(r"(?m)^\s*0\s*$", out))
+        uid = _last_int(out)
+        if uid == "0":
+            return True
+        # 到这里说明 sudo -i 的回显没问题，但人没变成 root。
+        # 常见两种情况：sudoers 只放行了部分命令、或者 ^C 打断了登录 shell。
+        self.last_error = (f"sudo -i 之后 id -u = {uid or '读不到'}"
+                           f"（没真的变成 root）")
+        return False

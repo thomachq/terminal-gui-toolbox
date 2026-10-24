@@ -114,7 +114,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.16"
+APP_VER = "1.0.17"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -1916,7 +1916,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             pw_label = "sudo 密码"
             hint = ("勾选后在连上时真的执行一次 sudo -i 进 root，"
                     "之后终端里敲的命令都是 root；不勾选也能用，"
-                    "需要提权时会弹窗问你要密码。密码留空则不提权。")
+                    "需要提权时会弹窗问你要密码。"
+                    "sudo 密码留空则先试登录密码；sudo -i 被禁用时"
+                    "自动退回「每条命令套 sudo」。")
         U.Check(row, title, self.v_elevate,
                 command=self._elev_toggled).pack(side="left")
         U.wlabel(row, pw_label, "card", U.FONT_S).pack(side="left", padx=(14, 8))
@@ -2326,26 +2328,52 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             except Exception:  # noqa: BLE001
                 pass
             elev = ""
-            if spec.elevate and spec.sudo_password:
+            elev_why = ""
+            used_login_pw = False
+            if spec.elevate:
+                # 提权密码留空时用登录密码兜底 —— 服务器上两者绝大多数是同一个。
+                # 不兜底的话，用户勾了框、填了登录密码，就被判成「缺密码、没提权」，
+                # 界面上只留一句警告，很容易被当成「已经提权了但没生效」。
+                # 交换机不兜底：enable 密码和登录密码是两回事，试错还会锁账号。
+                pw = (spec.sudo_password or "").strip()
+                if not pw and spec.password and \
+                        getattr(dev, "os_family", "") != "network":
+                    pw = spec.password
+                    used_login_pw = True
                 okadm = False
-                try:
-                    # 真的进去：类 Unix 开一条持久 shell 执行 sudo -i，
-                    # 交换机 / 路由器走 enable。不是只验一下密码就算数 ——
-                    # 光验密码的话终端里手敲的命令仍然不带提权。
-                    okadm = bool(s.elevate_root(spec.sudo_password))
-                except Exception:  # noqa: BLE001
-                    okadm = False
-                # 连上之后核实一次：密码错了不能装作生效
+                if pw:
+                    try:
+                        # 真的进去：类 Unix 开一条持久 shell 执行 sudo -i，
+                        # 交换机 / 路由器走 enable。不是只验一下密码就算数 ——
+                        # 光验密码的话终端里手敲的命令仍然不带提权。
+                        okadm = bool(s.elevate_root(pw))
+                    except Exception:  # noqa: BLE001
+                        okadm = False
+                # 提权那步返回 True 还不算完：终端里真正跑的通道是另一条
+                # （root shell / 逐条 sudo），通不通得实测。这一步把
+                # 「提示符已经是 # 了、敲命令却还是普通用户」彻底堵死。
                 if okadm:
-                    elev = "enable" if s.admin_kind == "enable" else "sudo -i"
+                    try:
+                        okadm, detail = s.verify_root()
+                    except Exception as e:  # noqa: BLE001
+                        okadm, detail = False, str(e)
+                    if okadm:
+                        elev = {"sudo-i": "sudo -i", "percmd": "逐条 sudo",
+                                "enable": "enable", "root": "root 登录"
+                                }.get(getattr(s, "elev_method", ""), "root 权限")
+                        if used_login_pw:
+                            elev += "（用的是登录密码）"
+                    else:
+                        elev, elev_why = "failed", detail
                 else:
                     elev = "failed"
-            elif spec.elevate:
-                elev = "nopw"
-            return s, dev, elev
+                    elev_why = (getattr(s, "elev_msg", "") or "").strip()
+                if not pw:
+                    elev = "nopw"
+            return s, dev, elev, elev_why
 
         def ok(res):
-            s, dev, elev = res
+            s, dev, elev, elev_why = res
             # 多设备：连上就加一个槽位，顶部标签栏多一个；同一台重连则替换
             slot = self.sessions.add(s, dev)
             slot.elev = elev
@@ -2371,20 +2399,29 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 self._log_raw("meta", f"[厂商] {dev.vendor or '未知'} · "
                                       f"{dev.device_type} · 命令按厂商 CLI 生成\n")
             if elev == "failed":
-                self._log_raw("bad", "[提权] 密码没通过，需要时再问你要一次\n")
-                self.status.set_state("已连接（提权未生效）", "warn")
+                # 原因原文照抄：密码错、不在 sudoers、sudo -i 被关掉……
+                # 只写「提权未生效」等于让用户去猜。
+                self._log_raw("bad", f"[提权] 没成功：{elev_why or '原因不明'}\n")
+                self.status.set_state(
+                    f"已连接（提权未生效：{elev_why[:40]}）" if elev_why
+                    else "已连接（提权未生效）", "warn")
             elif elev == "nopw":
-                self._log_raw("warn", "[提权] 勾了「连接后自动提权」但没填 "
-                                      "sudo / enable 密码，这次没有提权\n")
+                self._log_raw("warn", "[提权] 勾了「连接后自动提权」但既没填 "
+                                      "sudo / enable 密码，也没有登录密码可用，"
+                                      "这次没有提权\n")
                 self.status.set_state("已连接（未提权：缺密码）", "warn")
             elif elev:
-                self._log_raw("ok", f"[提权] 已进入 {elev}，终端里敲的命令"
-                                     f"与页面操作都以 root / 特权身份执行\n")
+                self._log_raw("ok", f"[提权] 已生效（{elev}），并已实测 "
+                                     f"`id -u` = 0 —— 终端里敲的命令与页面操作"
+                                     f"都以 root / 特权身份执行\n")
+                self.status.set_state(f"已连接（root · {elev}）", "ok")
             # 勾了「记住凭据」就顺手把档案落盘 —— 口令要真的进文件，
             # 不能指望用户连通之后还想起来点一次「保存」。
             if self.v_remember.get() and self.v_prof.get().strip():
                 self._autosave_creds()
             self._refresh_current_page()
+            # 终端已经开着的话，把新会话的提权状态补一行进去（否则还显示旧提示符）
+            self._term_elev_note()
 
         def err(msg):
             self.btn_connect.set_enabled(True)
@@ -2521,6 +2558,26 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             return
         self._term_add_tab()
         self.status.set_state("终端已打开 · 命令跑在当前会话上", "ok")
+
+    def _term_elev_note(self) -> None:
+        """连上 / 重连之后，让已经开着的终端立刻反映新的提权状态。
+
+        终端是「每次执行时重画提示符」的，所以重连之后老的 `$` 提示符会一直
+        挂在屏幕上，直到用户敲下一条命令才更新 —— 这中间的空档正好是最容易
+        被当成「没提权」的时候。这里主动重画一次。
+        用户正在输入时不打断（会把人家敲的字一起换掉）。
+        """
+        pane = self._term_live()
+        if pane is None:
+            return
+        try:
+            if getattr(pane, "mode", "") == "inline":
+                typed = pane.text.get("input_start", "end-1c")
+                if typed.strip():
+                    return
+            pane._refresh_head()
+        except Exception:  # noqa: BLE001
+            pass
 
     def term_popout(self) -> None:
         """页签 → 独立窗口。正文与命令历史一起搬过去，不丢上下文。"""
@@ -2778,7 +2835,10 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             return "未连接"
         dev = self._effective_device()
         name = dev.hostname or dev.os_name or s.label or "设备"
-        return f"{name} · {s.kind.upper()}"
+        desc = f"{name} · {s.kind.upper()}"
+        if bool(getattr(s, "is_root", False)) or bool(getattr(s, "elevated", False)):
+            desc += " · root"
+        return desc
 
     def term_cwd(self) -> str:
         return self._term_cwd_val or self._term_probe_cwd()
@@ -2799,6 +2859,14 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         return self._term_cwd_val
 
     def term_prompt(self) -> str:
+        """终端提示符。**必须反映真实身份**，否则用户没法判断提权到底成没成。
+
+        以前只用 `is_root`（= 登录用户本身就是 root），而 `sudo -i` 之后
+        我们刻意不动 `is_root`（exec 通道还是原用户，run_admin 仍要套 sudo）。
+        结果是：明明已经提权、命令确实是 root 跑的，提示符却还顶着 `$`，
+        用户一看就断定「没提权成功」—— 这条提示符本身就是错的。
+        现在按 `is_root or elevated` 判，提权后显示 `root@host …#`。
+        """
         s = self.session
         if s is None:
             return "$ "
@@ -2808,8 +2876,13 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 else f"{cwd}$ "
         user = getattr(s, "user", "") or "user"
         host = getattr(s, "host", "") or self._effective_device().hostname or "host"
-        mark = "#" if getattr(s, "is_root", False) else "$"
-        return f"{user}@{host} {cwd}{mark} "
+        rooted = bool(getattr(s, "is_root", False)) or \
+            bool(getattr(s, "elevated", False))
+        mark = "#" if rooted else "$"
+        # 提权后命令确实以 root 身份跑，就照实写 root@host；
+        # 藏着原用户名会让人以为 sudo 没生效。
+        who = "root" if rooted else user
+        return f"{who}@{host} {cwd}{mark} "
 
     def term_chdir(self, path: str) -> tuple[bool, str]:
         s = self.session

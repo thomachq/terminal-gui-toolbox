@@ -305,6 +305,56 @@ chk(not hit, "没映射时没真去探测（不瞎扫）", f"hit={len(hit)}")
 win2.destroy()
 
 
+# ================================================================== 6. 提示符
+sec("6. 终端提示符必须反映真实身份（提权后就是 root@…#）")
+
+
+class _FakeSess:
+    """只喂 term_prompt 会读的字段。"""
+    kind = "ssh"
+    user = "cloudadmin"
+    host = "192.168.3.12"
+    is_root = False
+    elevated = False
+    elev_method = ""
+    elev_msg = ""
+    alive = True
+
+
+_keep_sess = win.session
+fs = _FakeSess()
+win.session = fs
+win._term_cwd_val = "/volume1/homes/cloudadmin"      # 别去真跑 pwd
+
+eq(win.term_prompt(), "cloudadmin@192.168.3.12 /volume1/homes/cloudadmin$ ",
+   "没提权：普通用户 + $")
+
+# 这一条就是用户报的 bug：提权明明生效了，提示符还顶着 $，
+# 于是被判定「没提权成功」。
+fs.elevated = True
+fs.elev_method = "sudo-i"
+eq(win.term_prompt(), "root@192.168.3.12 /volume1/homes/cloudadmin# ",
+   "sudo -i 之后：root@host + #")
+
+fs.elev_method = "percmd"
+eq(win.term_prompt(), "root@192.168.3.12 /volume1/homes/cloudadmin# ",
+   "逐条 sudo 也算提权：同样显示 root 与 #")
+
+fs.elevated = False
+fs.is_root = True
+eq(win.term_prompt(), "root@192.168.3.12 /volume1/homes/cloudadmin# ",
+   "本来就是 root 登录：一样是 root 与 #")
+
+chk("root" in win.term_describe(), "终端标题里也标出 root",
+    win.term_describe())
+fs.is_root = False
+chk("root" not in win.term_describe(), "没提权时标题不带 root",
+    win.term_describe())
+
+win.session = _keep_sess
+win._term_cwd_val = ""
+
+
 # ================================================================== 汇总
 print(f"\n===== 结果：{PASS} 通过 / {FAIL} 失败 =====")
 if FAILS:

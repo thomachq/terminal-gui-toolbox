@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -127,6 +128,12 @@ class BaseSession:
         # 提权是否**已经生效**（不是「有密码」，是「验过并且真的进去了」）。
         # 终端靠它决定命令走不提权通道还是 root 通道。
         self.elevated = False
+        # 提权是怎么生效的：sudo-i（进了 root shell）/ percmd（每条命令 sudo）
+        # / enable（交换机特权模式）/ root（本来就是 root）。界面文案要用它，
+        # 否则「已提权」三个字看不出到底走哪条路。
+        self.elev_method = ""
+        # 提权失败的原因原文（给日志用）。空 = 没失败过。
+        self.elev_msg = ""
 
     # ---------------- 由子类实现
     def run(self, cmd: str, timeout: int = 30) -> tuple[int, str, str]:
@@ -306,6 +313,8 @@ class LocalSession(BaseSession):
         self.sudo_pw = pw
         rc, _, _ = self._exec(["sudo", "-S", "-p", "", "-v"], 20, pw + "\n")
         self.elevated = rc == 0
+        self.elev_method = "percmd" if rc == 0 else ""
+        self.elev_msg = "" if rc == 0 else "本机 sudo 密码没通过"
         return rc == 0
 
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
@@ -404,6 +413,8 @@ class SSHSession(BaseSession):
             pass
         self._root_shell = None
         self.elevated = False
+        self.elev_method = ""
+        self.elev_msg = ""
         try:
             if self._cli:
                 self._cli.close()
@@ -515,6 +526,7 @@ class SSHSession(BaseSession):
         if self.host_kind == "network":
             cli = self.cli()
             if cli is None:
+                self.elev_msg = "开不了设备 CLI（连不上或不是网络设备）"
                 return False
             ok = bool(cli.enable(pw))
             self.enabled = ok
@@ -522,13 +534,23 @@ class SSHSession(BaseSession):
                 self.sudo_pw = pw
                 self.is_root = True
                 self.elevated = True
+                self.elev_method = "enable"
+                self.elev_msg = ""
+            else:
+                self.elev_msg = getattr(cli, "last_error", "") or "enable 没成功"
             return ok
         self.sudo_pw = pw
         try:
             rc, _, _ = self.run("id -u", sudo=True, timeout=20)
             self.elevated = rc == 0
+            if rc == 0:
+                self.elev_method = "percmd"
+                self.elev_msg = ""
+            else:
+                self.elev_msg = "sudo 逐条执行时返回非 0"
             return rc == 0
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            self.elev_msg = str(e) or "sudo 逐条执行失败"
             return False
 
     def elevate_root(self, pw: str) -> bool:
@@ -541,39 +563,83 @@ class SSHSession(BaseSession):
         为什么必须开持久 shell：`exec_command` 每条都是新通道，`sudo -i`
         进去就退出来了，状态带不过去。而终端里手敲的命令走的正是这条 shell，
         所以进去之后敲 `id` 就是 0，不是每条命令重新过一遍密码。
+
+        `sudo -i` 进不去时**不直接认输**：有些机器（群晖 DSM、部分加固过的
+        发行版）把 `sudo -i` 关掉但放行 `sudo <cmd>`。这种情况退回「逐条 sudo」
+        —— 终端里敲的命令照样是 root 跑的，只是每条多一次 sudo，慢一点。
         """
+        self.elev_msg = ""
+        self.elev_method = ""
         if self.host_kind == "network":
             return self.sudo_ok(pw)
         if self.is_root or self.user == "root":
             self.elevated = True
+            self.elev_method = "root"
             return True
         if not pw:
+            self.elev_msg = "没有可用的 sudo 密码"
             return False
         if self._root_shell is not None and self._root_shell.alive():
             self.elevated = True
+            self.elev_method = "sudo-i"
             return True
+        why = ""
         try:
             from core.ssh_shell import SSHShellClient
             sh = SSHShellClient(self.client)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            self.elev_msg = f"开不了交互式 shell：{e}"
             return False
         try:
             ok = bool(sh.sudo_i(pw))
+            why = getattr(sh, "last_error", "") or ""
+        except Exception as e:  # noqa: BLE001
+            ok, why = False, str(e)
+        if ok:
+            self._root_shell = sh
+            self.sudo_pw = pw
+            self.elevated = True
+            self.elev_method = "sudo-i"
+            # 刻意**不动 is_root**：它表示「登录用户本身就是 root」。
+            # 这里只是多了一条 root shell，exec 通道还是原用户，
+            # 所以 run_admin() 仍然要靠 sudo 而不是直接跑。
+            return True
+        try:
+            sh.close()
         except Exception:  # noqa: BLE001
-            ok = False
-        if not ok:
-            try:
-                sh.close()
-            except Exception:  # noqa: BLE001
-                pass
-            return False
-        self._root_shell = sh
-        self.sudo_pw = pw
-        self.elevated = True
-        # 刻意**不动 is_root**：它表示「登录用户本身就是 root」。
-        # 这里只是多了一条 root shell，exec 通道还是原用户，
-        # run_admin 该走 sudo 的还得走 sudo。
-        return True
+            pass
+        # 退一步：逐条 sudo 还通不通？
+        if self.sudo_ok(pw):
+            self.elev_method = "percmd"
+            self.elev_msg = ""
+            return True
+        self.elev_msg = why or self.elev_msg or "sudo -i 与逐条 sudo 都没通过"
+        return False
+
+    def verify_root(self) -> tuple[bool, str]:
+        """连上之后真的跑一次 `id -u` 落锤。
+
+        为什么还要这一步：`elevate_root()` 返回 True 只代表「提权那一步的
+        回显看着对」。终端里真正执行的是另一条通道（root shell / run_admin），
+        它通不通得实测 —— 用户看到的提示符已经是 `#` 了，这里就不能再猜。
+        返回 (是否 root, 说明)。说明是 uid 或失败原因，直接进日志。
+        """
+        if self.host_kind == "network":
+            ok = bool(self.enabled)
+            return ok, ("特权模式已进" if ok
+                        else (self.elev_msg or "没进特权模式"))
+        if self.kind == "local":
+            return bool(self.elevated), (self.elev_method or "本机")
+        try:
+            rc, out, err = term_exec(self, "id -u", timeout=20)
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+        text = (out or "") + "\n" + (err or "")
+        got = re.findall(r"(?m)^\s*(\d+)\s*$", text)
+        if rc == 0 and got and got[-1] == "0":
+            return True, "0"
+        return False, (f"id -u = {got[-1]}" if got
+                       else (text.strip()[-160:] or "读不到 id -u"))
 
     def can_admin(self) -> tuple[bool, str]:
         if self.host_kind == "network":
@@ -662,7 +728,10 @@ class TelnetSession(BaseSession):
 
     def sudo_ok(self, pw: str) -> bool:
         """一个密码框，两种含义：网络设备是 enable，Linux 是 sudo。"""
+        self.elev_msg = ""
+        self.elev_method = ""
         if not self._impl:
+            self.elev_msg = "Telnet 连接已断开"
             return False
         if self.host_kind == "unix":
             ok = bool(self._impl.sudo_check(pw))
@@ -670,6 +739,10 @@ class TelnetSession(BaseSession):
                 self.sudo_pw = pw
                 self.is_root = True
                 self.elevated = True
+                self.elev_method = "percmd"
+            else:
+                self.elev_msg = getattr(self._impl, "last_error", "") or \
+                    "sudo 密码没通过"
             return ok
         ok = self._impl.enable(pw)
         self.enabled = bool(ok)
@@ -677,6 +750,9 @@ class TelnetSession(BaseSession):
             self.sudo_pw = pw
             self.is_root = True
             self.elevated = True
+            self.elev_method = "enable"
+        else:
+            self.elev_msg = getattr(self._impl, "last_error", "") or "enable 没成功"
         return ok
 
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
