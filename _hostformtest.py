@@ -415,6 +415,72 @@ if sys.platform == "win32":
 else:
     eq(s.argv_for("ls")[:2], ["/bin/sh", "-c"], "类 Unix 走 /bin/sh -c")
 
+# ================================================================== 8. 编辑不改名
+sec("8. 编辑主机：名字没改也能存（不是新建一条）")
+
+import pages.hosts_page as HP  # noqa: E402
+
+
+class _MB:
+    """换个不弹窗的假 messagebox，把警告收起来断言。"""
+
+    def __init__(self) -> None:
+        self.warn: list[str] = []
+
+    def showwarning(self, title, msg, **kw):
+        self.warn.append(str(msg))
+
+    def askyesno(self, *a, **kw):
+        return True
+
+
+_orig_mb = HP.messagebox
+_orig_open = forms.FormDialog.open
+mb = _MB()
+HP.messagebox = mb
+
+# 用户遇到的场景：档案里就这一台，点 ✎ / 点「编辑」，什么都不改直接保存，
+# 结果弹「名称「DESKTOP-HBM6KCB」已被占用」—— 查重把自己算成了别人。
+win.profiles.profiles.clear()
+win.profiles.upsert({"name": "other", "host": "10.0.0.2", "port": "22",
+                     "proto": "ssh", "auth": "key"})
+win.profiles.upsert({"name": "DESKTOP-HBM6KCB", "host": "10.0.0.1",
+                     "port": "22", "proto": "ssh", "auth": "key",
+                     "note": "改之前"})
+eq(len(win.profiles.profiles), 2, "备好两条档案")
+
+forms.FormDialog.open = staticmethod(lambda *a, **k: {
+    "name": "DESKTOP-HBM6KCB", "host": "10.0.0.1", "port": "22",
+    "proto": "ssh", "auth": "key", "note": "改之后"})
+mb.warn.clear()
+win.host_edit(dict(win.profiles.get("DESKTOP-HBM6KCB")))   # 传副本 = 点 ✎ 那条路
+eq(mb.warn, [], "编辑不改名：不再弹「已被占用」")
+eq(len(win.profiles.profiles), 2, "编辑不改名：没有多出一条")
+eq(str((win.profiles.get("DESKTOP-HBM6KCB") or {}).get("note")), "改之后",
+   "编辑不改名：改动真的存下去了")
+
+# 改成另一条已存在的名字 → 仍然要拦
+forms.FormDialog.open = staticmethod(lambda *a, **k: {
+    "name": "other", "host": "10.0.0.1", "port": "22",
+    "proto": "ssh", "auth": "key", "note": "想抢名字"})
+mb.warn.clear()
+win.host_edit(dict(win.profiles.get("DESKTOP-HBM6KCB")))
+chk(any("已被占用" in w for w in mb.warn), "编辑时撞别人的名字：拦住", mb.warn)
+eq(len(win.profiles.profiles), 2, "撞名被拦后档案没动")
+
+# 真改名 → 旧名删掉、新名加上，不留孤儿
+forms.FormDialog.open = staticmethod(lambda *a, **k: {
+    "name": "改过名的", "host": "10.0.0.1", "port": "22",
+    "proto": "ssh", "auth": "key", "note": "改名"})
+mb.warn.clear()
+win.host_edit(dict(win.profiles.get("DESKTOP-HBM6KCB")))
+eq(sorted(str(p.get("name")) for p in win.profiles.profiles),
+   ["other", "改过名的"], "改名：旧名不残留")
+eq(mb.warn, [], "改名：没有误报警告")
+
+forms.FormDialog.open = _orig_open
+HP.messagebox = _orig_mb
+
 try:
     win.destroy()
 except tkinter.TclError:

@@ -20,7 +20,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-VER = "1.0.12"
+VER = "1.0.13"
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "_release" / f"v{VER}"
 STAMP = (2026, 10, 24, 17, 0, 0)

@@ -317,14 +317,20 @@ def summary(rows: list[dict], total: int | None = None) -> str:
 
 
 # ------------------------------------------------------------------ 校验
-def validate(rec: dict, others: list[dict] | None = None) -> list[str]:
+def validate(rec: dict, others: list[dict] | None = None,
+             skip_name: str = "") -> list[str]:
     """返回错误文案列表，空列表表示通过。
 
     只做「不拦住就会出事」的检查：
       · 名字不能空（档案靠名字做主键）
       · 远程主机必须有地址；地址里不能有空白或路径分隔符
       · 端口必须是 1–65535 的整数
-      · 名字不能和别的记录撞（会直接覆盖别人）
+      · 名字不能和别的记录撞（upsert 按名字原地替换，撞了就是覆盖别人）
+
+    `skip_name`：**编辑时必须传改之前的名字**。主机记录没有 id（名字就是主键），
+    而调用方交过来的 `rec` 通常是表单合并出来的新 dict，`o is rec` 这种身份比对
+    永远不成立 —— 不按名字跳过的话，编辑任何一台主机、只要名字没改，
+    都会被判「名称已被占用」，改完也存不下。
     """
     errs: list[str] = []
     name = str((rec or {}).get("name") or "").strip()
@@ -349,10 +355,14 @@ def validate(rec: dict, others: list[dict] | None = None) -> list[str]:
                 if not (0 < pn < 65536):
                     errs.append("端口必须在 1–65535 之间")
     if name and others:
+        skip = str(skip_name or "").strip()
         for o in others:
-            if o is rec:
+            if not isinstance(o, dict) or o is rec:
                 continue
-            if str(o.get("name") or "").strip() == name:
+            oname = str(o.get("name") or "").strip()
+            if skip and oname == skip:
+                continue        # 这是「改之前的自己」，不算撞名
+            if oname == name:
                 errs.append(f"名称「{name}」已被占用")
                 break
     return errs

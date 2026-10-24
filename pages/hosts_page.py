@@ -695,7 +695,10 @@ class HostsPage:
         if not data:
             return None
         merged = merge_host_form(data, base=rec)
-        errs = H.validate(merged, others=self.profiles.profiles)
+        # 名字就是主键，编辑时要按「改之前的名字」跳过自己：
+        # merged 是合并出来的新 dict，validate 里的身份比对认不出它是同一条。
+        errs = H.validate(merged, others=self.profiles.profiles,
+                          skip_name=str(rec.get("name") or ""))
         if errs:
             messagebox.showwarning("保存不了", "\n".join(errs), parent=self)
             return None

@@ -120,6 +120,24 @@ eq(H.validate({"name": "a", "host": "h", "port": "abc"}), ["端口必须是数�
    "校验-端口非数字")
 eq(H.validate({"name": "a", "host": "h", "port": "22"}, others=[{"name": "a"}]),
    ["名称「a」已被占用"], "校验-重名")
+# 编辑场景：主机没有 id，名字就是主键，必须能按「改之前的名字」跳过自己。
+# 不传 skip_name 时老逻辑靠 `o is rec` 判身份，而调用方交来的永远是合并后的新
+# dict，于是编辑任何一台主机都被判重名（用户看到「名称已被占用」）。
+eq(H.validate({"name": "a", "host": "h", "port": "22"},
+              others=[{"name": "a"}], skip_name="a"),
+   [], "校验-编辑改自己不算重名")
+eq(H.validate({"name": "b", "host": "h", "port": "22"},
+              others=[{"name": "a"}, {"name": "b"}], skip_name="a"),
+   ["名称「b」已被占用"], "校验-编辑时撞到别人仍拦住")
+eq(H.validate({"name": "a", "host": "h", "port": "22"},
+              others=[{"name": "a"}], skip_name=""),
+   ["名称「a」已被占用"], "校验-新增时同名仍拦住")
+eq(H.validate({"name": "a", "host": "h", "port": "22"},
+              others=[{"name": " a "}], skip_name="a"),
+   [], "校验-跳过自己时也去空白")
+eq(H.validate({"name": "a", "host": "h", "port": "22"},
+              others=[{"name": "a"}, {"name": "a"}], skip_name="a"),
+   [], "校验-老档里有同名的两条也能存")
 eq(H.validate({"name": "a", "proto": "local"}), [], "校验-本机不需要地址")
 
 rec = H.record_from_form({"name": " n1 ", "host": " h1 ", "tags": "a, b",
