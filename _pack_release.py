@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -29,6 +30,14 @@ JUNK_DIRS = {"data", "build", "__pycache__", ".git", ".venv", "node_modules",
              "_release", "_test_data", "screenshots_tmp"}
 JUNK_EXT = {".pyc", ".pyo", ".bak", ".log", ".spec.bak", ".tmp", ".dbg"}
 JUNK_PREFIX = ("dbg", "err.txt", "out.txt", "build_log", "_TODO")
+# 系统查询命令被误重定向到项目根目录时留下的空壳文件。`sc query ... > query`
+# 就这么在源码树里留了个 13 字节的 `query`，而且从 v1.0.4 一路带进每个发布包。
+JUNK_NAMES = {"query", "out.txt", "err.txt", "nul", "con",
+              "desktop.ini", "thumbs.db"}
+
+# 被 .gitignore 挡住、但工具包确实要带的东西。只有 exe：它是零安装交付件，
+# 而仓库不允许跟踪二进制。其余一律以 git 清单为准。
+KEEP_IGNORED = ("*.exe",)
 
 
 def skip(rel: Path, keep_git: bool = False) -> bool:
@@ -42,16 +51,50 @@ def skip(rel: Path, keep_git: bool = False) -> bool:
         return True
     if rel.name.startswith(JUNK_PREFIX):
         return True
+    if rel.name.lower() in JUNK_NAMES:
+        return True
     return False
 
 
+def git_listing(root: Path) -> set[str] | None:
+    """git 眼里的文件清单（已跟踪 + 未跟踪但没被忽略）。
+
+    拿它当白名单的理由：`data/`、`/query`、`*.local.cmd` 这些排除规则在
+    `.gitignore` 里已经维护过一遍，打包脚本再抄一份必然漏 —— `/query` 就是这么
+    从 v1.0.4 一路漏到 v1.0.12 的。直接问 git，谁也漏不掉。
+
+    拿不到（不是仓库 / 没装 git）返回 None，调用方退回目录遍历 + JUNK_NAMES。
+    """
+    try:
+        r = subprocess.run(["git", "-C", str(root), "ls-files", "-z",
+                            "-co", "--exclude-standard"],
+                           capture_output=True, timeout=180)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode != 0:
+        return None
+    names = {s.replace("\\", "/") for s in
+             r.stdout.decode("utf-8", "replace").split("\0") if s}
+    return names or None
+
+
 def add_tree(zf: zipfile.ZipFile, root: Path, arc_prefix: str = "",
-             keep_git: bool = False) -> int:
+             keep_git: bool = False, honor_git: bool = True) -> int:
+    """把一个目录塞进包。honor_git=True 时以 git 清单为准（见 git_listing）。
+
+    keep_git=True（打 `git clone` 快照）时不能套白名单 —— 清单里没有 .git
+    内部文件，套上会把整个 .git 目录丢掉。
+    """
+    allow = git_listing(root) if (honor_git and not keep_git) else None
     n = 0
     for p in sorted(root.rglob("*")):
         if p.is_dir():
             continue
         rel = p.relative_to(root)
+        key = rel.as_posix()
+        if allow is not None and key not in allow \
+                and not any(fnmatch.fnmatch(key, pat) for pat in KEEP_IGNORED):
+            continue
         if skip(rel, keep_git=keep_git):
             continue
         arc = (Path(arc_prefix) / rel) if arc_prefix else rel
@@ -214,6 +257,30 @@ def make_github_clone() -> Path | None:
     return out
 
 
+def audit(paths: list[Path]) -> int:
+    """打好之后逐个包复核：不许有垃圾文件，不许有 data/ 机密目录。
+
+    这一步是补出来的 —— `/query` 在四个发布包里躺了 8 个版本没人发现，
+    因为以前打完就走，没有任何一环会回头看包里到底装了什么。
+    空目录条目（portable 包里的 `data/` 占位）不算；只查带内容的路径。
+    """
+    bad = 0
+    for p in paths:
+        with zipfile.ZipFile(p) as zf:
+            hits = [n for n in zf.namelist()
+                    if not n.endswith("/")
+                    and (Path(n).name.lower() in JUNK_NAMES
+                         or set(Path(n).parts) & {"data", "_test_data", ".venv"})]
+        if hits:
+            bad += 1
+            print(f"[warn] {p.name} 里混进不该带的东西：")
+            for h in hits[:10]:
+                print(f"        {h}")
+        else:
+            print(f"[ok] {p.name} 无垃圾 / 机密残留")
+    return bad
+
+
 def main() -> int:
     """默认四个包全打。带 `--only kb,kit,portable,github` 可以只打其中几个。
 
@@ -254,6 +321,11 @@ def main() -> int:
     print("\n产物：")
     for p in made:
         print(f"  {p.name}  {p.stat().st_size / 1024 / 1024:.1f} MB")
+    print()
+    bad = audit(made)
+    if bad:
+        print(f"\n[error] {bad} 个包未通过复核，别分发。")
+        return 1
     return 0
 
 
