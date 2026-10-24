@@ -159,6 +159,15 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * Fixed: the mouse pointer turned into a horizontal resize arrow over the
+    whole data table, not just over the column separators. ttk::treeview
+    handles <Motion> as a *class* binding, so any handler bound to the widget
+    runs first and gets overwritten immediately; deferring to after_idle still
+    let the intermediate cursor reach the screen because the pointer moves
+    dozens of times per second. The cursor guard now lives in a custom
+    bindtag inserted right after "Treeview", so it runs in the same event as
+    ttk and only the final value is rendered. Dragging a column keeps the
+    resize arrow; everywhere else returns to a plain arrow.
   * Fixed: "auto-elevate on connect" did not elevate the terminal. The option
     only verified the password, and terminal commands went through an
     unprivileged channel, so `id` still showed the login user. Elevation now

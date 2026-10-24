@@ -193,12 +193,14 @@ def main() -> int:
     tree.configure(cursor="sb_h_double_arrow")
     tree.event_generate("<ButtonRelease-1>", x=10, y=10)
     root.update()
-    eq(str(tree.cget("cursor")), "", "松手后光标还原成箭头")
+    # 期望 "arrow" 而不是 ""：守卫显式写死箭头，不把决定权留给 ttk 的
+    # ttk::saveCursor（它会拿当前值当默认值，留空就等于又交回去了）。
+    eq(str(tree.cget("cursor")), "arrow", "松手后光标还原成箭头")
 
     tree.configure(cursor="sb_h_double_arrow")
     tree.event_generate("<Motion>", x=20, y=120, state=0)
     root.update()
-    eq(str(tree.cget("cursor")), "", "左键早就松了时，移动鼠标也会还原")
+    eq(str(tree.cget("cursor")), "arrow", "左键早就松了时，移动鼠标也会还原")
 
     tree.configure(cursor="sb_h_double_arrow")
     tree.event_generate("<Motion>", x=20, y=120, state=0x100)

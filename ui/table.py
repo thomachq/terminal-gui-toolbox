@@ -107,6 +107,10 @@ class EmptyState(tk.Frame):
                                    fill=c, dash=(3, 3))
 
 
+# 光标守卫的 bindtag 名。为什么要自己插一个 tag，见 _install_cursor_guard。
+CUR_TAG = "TblCursorGuard"
+
+
 class DataTable(tk.Frame):
     """带工具条、搜索、排序、空态、右键菜单的列表。"""
 
@@ -147,9 +151,6 @@ class DataTable(tk.Frame):
         self._fit_job = None
         self._sbx_job = None
         self._sbx_need = False
-        # 光标整顿用：排一个 idle 任务在 ttk 自己的 <Motion> 之后判定
-        self._cur_job = None
-        self._cur_xy: tuple[int, int] | None = None
 
         # ---- 工具条
         self.toolbar = U.wframe(self, bg_role)
@@ -221,13 +222,13 @@ class DataTable(tk.Frame):
         # 换了控件），release 落不到原来那棵树上 —— 光标就一直卡在 ↔。
         # 三个地方兜底：松手、移动时发现左键早松了、指针离开表格。
         self.tree.bind("<ButtonRelease-1>", self._reset_cursor, add="+")
-        self.tree.bind("<Motion>", self._maybe_reset_cursor, add="+")
         self.tree.bind("<Leave>", self._reset_cursor, add="+")
         try:
             self.winfo_toplevel().bind("<ButtonRelease-1>",
                                        self._reset_cursor, add="+")
         except tk.TclError:
             pass
+        self._install_cursor_guard()
         self._menu = tk.Menu(self, tearoff=0)
 
         U.register(self, self._paint)
@@ -312,54 +313,72 @@ class DataTable(tk.Frame):
 
     # ------------------------------------------------------------ 光标
     def _reset_cursor(self, _e=None) -> None:
-        """把表格上的小手/双箭头还原成普通箭头。
+        """把表格光标还原成普通箭头。
 
-        只在真的设过 cursor 时才调 configure —— 这个回调挂在 toplevel 上，
-        整个窗口每次松手都会走到，没必要每次都发一条 Tk 命令。
+        注意设的是 `"arrow"` 而不是 `""`：ttk::treeview 的 <Motion> 里有一句
+        `ttk::saveCursor $w State(userConfCursor) [ttk::cursor hresize]`，
+        它会把「当前 cursor 值」记下来当成后续的默认值。留空的话等于把
+        决定权全交给 ttk；显式写 arrow，ttk 就不会去猜。
         """
         try:
-            if self.tree.cget("cursor"):
-                self.tree.configure(cursor="")
+            if str(self.tree.cget("cursor")) != "arrow":
+                self.tree.configure(cursor="arrow")
         except tk.TclError:
             pass
 
-    def _maybe_reset_cursor(self, event) -> None:
-        """鼠标在表格上移动：把不该出现的拖拽光标及时收掉。
+    def _install_cursor_guard(self) -> None:
+        """往 bindtags 里插一个 tag，让光标纠正排在 ttk 的类绑定**之后**。
 
-        这里有个坑 —— ttk::treeview 自己那条 <Motion> 是**类绑定**，执行顺序在
-        本控件的绑定**之后**。所以在这里直接 configure("") 是白费：ttk 随后
-        又按自己记的状态把光标设回 ↔，用户看到的就是「鼠标停在数据行的文字上
-        还顶着左右箭头」（截图就是这个现象）。
+        为什么不能挂在控件上：bindtags 顺序是 widget → class → toplevel → all。
+        ttk::treeview 的 <Motion> 是**类绑定**，永远在我们后面跑，所以
+        `bind("<Motion>", ...)` 里怎么改都会被它当场改回去。
 
-        改成排一个 idle 任务：idle 排在本次事件所有绑定跑完之后，那时 ttk 已经
-        定完态，我们再按真实的 identify_region 纠正一次。只有指针真的压在列
-        分隔线上（separator）才留着 ↔，别处一律箭头。
+        为什么不能用 after_idle：idle 要等下一轮事件循环，而鼠标移动每秒几十
+        次 —— 每次移动 ttk 先设一次 ↔，idle 才清掉，用户在这中间看到的就是
+        「鼠标移到哪都是双箭头」。v1.0.12 就是这么修的，没修干净。
+
+        插进 bindtags 之后，`_guard_cursor` 与 ttk 在**同一个事件**里先后执行，
+        屏幕只渲染最终值，中间态不可见。
         """
         try:
-            if int(getattr(event, "state", 0)) & 0x100:   # Button1 还按着
+            if str(self.tree.cget("cursor")) != "arrow":
+                self.tree.configure(cursor="arrow")   # 先给一个明确的底色
+            tags = list(self.tree.bindtags())
+            if CUR_TAG in tags:
                 return
-        except (TypeError, ValueError):
-            return
-        self._cur_xy = (int(event.x), int(event.y))
-        if self._cur_job is None:
-            try:
-                self._cur_job = self.after_idle(self._settle_cursor)
-            except tk.TclError:
-                self._cur_job = None
-
-    def _settle_cursor(self) -> None:
-        """idle 里做真正的光标判定（这时 ttk 的绑定已经跑完）。"""
-        self._cur_job = None
-        xy = self._cur_xy
-        if xy is None:
-            return
-        try:
-            region = str(self.tree.identify_region(xy[0], xy[1]))
+            idx = tags.index("Treeview") + 1 if "Treeview" in tags else 1
+            tags.insert(idx, CUR_TAG)
+            self.tree.bindtags(tuple(tags))
+            self.tree.bind_class(CUR_TAG, "<Motion>", self._guard_cursor)
+            self.tree.bind_class(CUR_TAG, "<Leave>", self._guard_cursor)
         except tk.TclError:
-            return
-        if region == "separator":
-            return          # 表头上的列分隔线，↔ 是应该有的提示
-        self._reset_cursor()
+            pass
+
+    def _guard_cursor(self, event=None) -> None:
+        """ttk 刚设完光标，这里按真实区域改一次（同一事件内，用户看不到）。
+
+        · 列分隔线 -> ↔，提示这里能拖动列宽
+        · 其它任何地方（表头、数据行、下方空白）-> 普通箭头
+        · 左键按着（正在拖列宽）-> 不插手，ttk 保持 ↔ 是对的
+        """
+        if event is not None:
+            try:
+                if int(getattr(event, "state", 0)) & 0x100:     # Button1 按着
+                    return
+            except (TypeError, ValueError):
+                pass
+        want = "arrow"
+        try:
+            leaving = str(getattr(event, "type", "")) == "Leave"
+            if not leaving:
+                region = str(self.tree.identify_region(int(event.x),
+                                                       int(event.y)))
+                if region == "separator":
+                    want = "sb_h_double_arrow"
+            if str(self.tree.cget("cursor")) != want:
+                self.tree.configure(cursor=want)
+        except (tk.TclError, AttributeError):
+            pass
 
     # ------------------------------------------------------------ 主题
     def _xscroll_set(self, first, last) -> None:

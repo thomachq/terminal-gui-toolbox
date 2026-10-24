@@ -41,7 +41,7 @@ appmod.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 import tkinter as tk  # noqa: E402
 from pages import hosts_page as HP  # noqa: E402
-from ui.table import Column, DataTable  # noqa: E402
+from ui.table import CUR_TAG, Column, DataTable  # noqa: E402
 
 
 def chk(ok, name, extra=""):
@@ -88,42 +88,77 @@ tbl.pack(fill="both", expand=True, padx=20, pady=10)
 tbl.set_rows([{"a": f"host-{i}", "b": f"10.0.0.{i}"} for i in range(6)])
 pump(win, 0.5)
 
-# 假装 ttk 刚把光标设成 ↔，指针落在数据行里
-tbl.tree.configure(cursor="sb_h_double_arrow")
-tbl._cur_xy = (60, 60)
-tbl._settle_cursor()
-eq(tbl.tree.cget("cursor"), "", "数据区：↔ 被收掉")
+# 机制核心：守卫必须排在 ttk 的类绑定**之后**（bindtags 里紧跟 "Treeview"）。
+# 挂在控件上的 <Motion> 永远跑在 ttk 前面，改什么都会被 ttk 当场改回去 ——
+# 这就是 v1.0.12 没修干净的原因。
+tags = list(tbl.tree.bindtags())
+chk(CUR_TAG in tags, "bindtags 里有光标守卫 tag", str(tags))
+if CUR_TAG in tags and "Treeview" in tags:
+    eq(tags.index(CUR_TAG), tags.index("Treeview") + 1,
+       "守卫 tag 紧跟在 Treeview 之后（同一事件内后执行）")
+else:
+    chk(False, "守卫 tag 紧跟在 Treeview 之后（同一事件内后执行）", str(tags))
 
-# 指针落在表头的列分隔线上 → 应该留着（那里真能拖列宽）
+# 守卫挂的是 <Motion>/<Leave> 两个类绑定
+guard = []
+for seq in ("<Motion>", "<Leave>"):
+    guard.append(seq in str(tbl.tree.bind_class(CUR_TAG)))
+chk(all(guard), "守卫挂上了 <Motion> 与 <Leave>")
+
+
+def motion(x, y, state=0):
+    """模拟一次 ttk 已经把光标设成 ↔ 之后的 <Motion>。"""
+    tbl.tree.configure(cursor="sb_h_double_arrow")
+    tbl._guard_cursor(types.SimpleNamespace(x=x, y=y, state=state,
+                                            type="Motion"))
+    return str(tbl.tree.cget("cursor"))
+
+
+# 数据行里：ttk 设成 ↔ 后必须被按回箭头
+arrow_ok = 0
+for y in (50, 70, 90, 120):
+    if motion(60, y) == "arrow":
+        arrow_ok += 1
+chk(arrow_ok >= 3, "数据行：↔ 被按回箭头", f"{arrow_ok}/4")
+
+# 表头文字上（不是分隔线）也要是箭头
+hdr_ok = motion(40, 6) == "arrow"
+chk(hdr_ok, "表头文字区：箭头（不能拖列）", str(tbl.tree.cget("cursor")))
+
+# 指针落在表头的列分隔线上 → 应该留着 ↔（那里真能拖列宽）
 sep_ok = False
 for x in range(20, 400, 2):
     try:
         if str(tbl.tree.identify_region(x, 6)) == "separator":
-            tbl.tree.configure(cursor="sb_h_double_arrow")
-            tbl._cur_xy = (x, 6)
-            tbl._settle_cursor()
-            sep_ok = str(tbl.tree.cget("cursor")) == "sb_h_double_arrow"
+            sep_ok = motion(x, 6) == "sb_h_double_arrow"
             break
     except tk.TclError:
         break
 chk(sep_ok, "表头分隔线：↔ 保留（那是真能拖的地方）")
 
-# 模拟一次真实 <Motion>：排的是 idle，不该立刻改，跑完事件循环后才纠正
-tbl.tree.configure(cursor="sb_h_double_arrow")
-tbl._cur_xy = None
-tbl._cur_job = None
-ev = types.SimpleNamespace(x=40, y=70, state=0)
-tbl._maybe_reset_cursor(ev)
-chk(tbl._cur_job is not None, "<Motion> 排了 idle 任务（等 ttk 先定完态）")
-pump(win, 0.2)
-eq(tbl.tree.cget("cursor"), "", "idle 跑完：残留的 ↔ 清掉了")
+# 左键按着（正在拖列宽）时不许插手，ttk 保持 ↔ 才是对的
+held = motion(60, 70, state=0x100)
+eq(held, "sb_h_double_arrow", "左键按着：不去动光标（正在拖）")
 
-# 左键按着（正在拖列宽）时不许清
+# 指针离开表格 → 必须还原，否则光标卡在 ↔ 带到别的控件上
 tbl.tree.configure(cursor="sb_h_double_arrow")
-tbl._cur_job = None
-tbl._maybe_reset_cursor(types.SimpleNamespace(x=40, y=70, state=0x100))
-chk(tbl._cur_job is None, "左键按着：不去动光标（正在拖）")
-eq(str(tbl.tree.cget("cursor")), "sb_h_double_arrow", "左键按着：↔ 原样留着")
+tbl._guard_cursor(types.SimpleNamespace(x=60, y=70, state=0, type="Leave"))
+eq(str(tbl.tree.cget("cursor")), "arrow", "<Leave>：还原成箭头")
+
+# _reset_cursor 设的是 "arrow" 而不是 ""：ttk::saveCursor 会把当前值记成
+# 默认值，留空等于把决定权交回给 ttk 猜。
+tbl.tree.configure(cursor="sb_h_double_arrow")
+tbl._reset_cursor()
+eq(str(tbl.tree.cget("cursor")), "arrow", "_reset_cursor 显式写 arrow")
+
+# 连续扫一遍：模拟鼠标真实游走，跑完不该退化
+degraded = 0
+for _round in range(3):
+    for y in range(40, 200, 12):
+        if motion(60, y) != "arrow":
+            degraded += 1
+chk(degraded == 0, "反复移动不退化（3 轮 × 13 个位置）", f"异常 {degraded} 次")
+
 tbl.destroy()
 pump(win, 0.2)
 
