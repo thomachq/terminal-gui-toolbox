@@ -12,6 +12,7 @@ Treeview 只能整行着色，所以「状态」用文字色 + 前置圆点表�
 """
 from __future__ import annotations
 
+import inspect
 import tkinter as tk
 from tkinter import ttk
 from tkinter import font as tkfont
@@ -770,13 +771,40 @@ class DataTable(tk.Frame):
         """items: [(label, callback, enabled_fn|None)]，label 为 None 表示分隔线。"""
         self._menu_items = items or []
 
+    @staticmethod
+    def _takes_row(cb) -> bool:
+        """右键回调要不要行数据。
+
+        项目里两种写法并存：`lambda r: ...` 和 `lambda: self.xxx(self._pick())`。
+        以前一律按 `cb(row)` 调，后者直接 TypeError —— 而 Tk 把回调异常
+        打进 stderr 就完了，界面上表现就是「右键点编辑，什么都不发生」。
+        """
+        try:
+            sig = inspect.signature(cb)
+        except (TypeError, ValueError):
+            return False
+        for p in sig.parameters.values():
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD,
+                          p.VAR_POSITIONAL):
+                return True
+        return False
+
     def _popup(self, event):
         if not self._menu_items:
             return
+        # 先让「指针下那一行」成为选中行：右键菜单本来就该作用在手指着的那条上。
+        # 以前读的是上一次的选中项，右键没选中的行 → None 或者别人的数据。
+        try:
+            iid = self.tree.identify_row(int(event.y))
+        except (tk.TclError, TypeError, ValueError):
+            iid = ""
+        if iid and iid in self._iid_row:
+            try:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+            except tk.TclError:
+                pass
         row = self.selected()
-        if row is None:
-            # 右键空白行也允许（比如「新建」）
-            pass
         self._menu.delete(0, "end")
         for label, cb, enabled in self._menu_items:
             if label is None:
@@ -788,8 +816,13 @@ class DataTable(tk.Frame):
                     ok = bool(enabled(row))
                 except Exception:  # noqa: BLE001
                     ok = False
-            self._menu.add_command(label=label,
-                                   command=(lambda c=cb: c(row)) if cb else None,
+            if cb is None:
+                cmd = None
+            elif self._takes_row(cb):
+                cmd = lambda c=cb: c(row)          # noqa: E731
+            else:
+                cmd = lambda c=cb: c()             # noqa: E731
+            self._menu.add_command(label=label, command=cmd,
                                    state="normal" if ok else "disabled")
         try:
             self._menu.tk_popup(event.x_root, event.y_root)

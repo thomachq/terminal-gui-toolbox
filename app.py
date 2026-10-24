@@ -83,6 +83,13 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
+# 自测 / 截图时的数据目录重定向：`TB_DATA_DIR=<临时目录>` 一行就能把档案、
+# 设置、窗口状态、审计日志全挪走，真实 data 一个字节都不动。
+# 为什么放在模块级：这些存储都是 import 时按 DATA_DIR 定位的，事后改
+# `appmod.DATA_DIR` 只对「还没建的对象」有效，容易漏 —— 从源头算更保险。
+_env_data = os.environ.get("TB_DATA_DIR", "").strip()
+if _env_data:
+    DATA_DIR = Path(_env_data).expanduser().resolve()
 SAMPLE_MS = 3000
 
 
@@ -106,7 +113,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.9"
+APP_VER = "1.0.10"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -1355,6 +1362,25 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 self.status.set_state(s.error[:80], "err")
 
     # ============================================================ 连接
+    # 「目标系统」下拉的选项：值 → 显示。提权方式由它决定。
+    # 目标系统可选值的唯一来源在 core/hosts.OS_PICK（主机表单也用它）
+    OS_UI = list(hosts_core.OS_PICK)
+
+    def _sync_ostype_ui(self) -> None:
+        """把 v_ostype 的值反映到下拉框上（档案里存的是 key，界面显示中文）。"""
+        cb = getattr(self, "cb_ostype", None)
+        var = getattr(self, "v_ostype", None)
+        if cb is None or var is None:
+            return
+        try:
+            key = str(var.get() or "")
+        except tk.TclError:
+            return
+        try:
+            cb.set(dict(self.OS_UI).get(key, self.OS_UI[0][1]))
+        except tk.TclError:
+            pass
+
     def _build_conn(self, pg):
         pg.columnconfigure(0, weight=1)
         pg.rowconfigure(2, weight=1)
@@ -1371,6 +1397,30 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             ttk.Radiobutton(r, text=label, value=val, variable=self.v_proto,
                             style="Card.TRadiobutton",
                             command=self._proto_changed).pack(side="left", padx=(0, 20))
+
+        # 目标系统：决定提权问的是 sudo 密码、enable 密码，还是根本不用密码。
+        # 默认「自动」—— 连上后 detect() 会把真实系统写进档案，下次打开就是准的。
+        self.v_ostype = tk.StringVar(value="")
+        self.row_ostype = U.wframe(b, "card")
+        self.row_ostype.pack(fill="x", pady=(8, 0))
+        U.wlabel(self.row_ostype, "目标", "card", U.FONT_S).pack(side="left")
+        _OS_KEY = {lab: k for k, lab in self.OS_UI}
+        self.cb_ostype = ttk.Combobox(
+            self.row_ostype, state="readonly", width=18, font=U.FONT_S,
+            values=[lab for _, lab in self.OS_UI])
+        self.cb_ostype.pack(side="left", padx=(8, 0))
+        self._sync_ostype_ui()
+
+        def _os_pick(_e=None, c=self.cb_ostype):
+            try:
+                self.v_ostype.set(_OS_KEY.get(c.get(), ""))
+            except tk.TclError:
+                return
+            self._rebuild_elevation()
+
+        self.cb_ostype.bind("<<ComboboxSelected>>", _os_pick)
+        U.wlabel(self.row_ostype, "提权那一块跟着它变", "dim", U.FONT_XS).pack(
+            side="left", padx=(10, 0))
 
         self.v_prof = tk.StringVar()
         # 每个口令各自一个「保存」开关：只勾私钥口令就只存私钥口令，
@@ -1547,11 +1597,21 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             self.row_prof.pack_forget()
             self.row_addr.pack_forget()
             self.row_auth.pack_forget()
+            try:
+                self.row_ostype.pack_forget()
+            except (AttributeError, tk.TclError):
+                pass
         else:
             if not self.row_prof.winfo_manager():
                 self.row_prof.pack(fill="x", pady=(10, 0), before=self.row_elev)
             if not self.row_addr.winfo_manager():
                 self.row_addr.pack(fill="x", pady=(9, 0), before=self.row_elev)
+            try:
+                if not self.row_ostype.winfo_manager():
+                    self.row_ostype.pack(fill="x", pady=(8, 0),
+                                         before=self.row_prof)
+            except (AttributeError, tk.TclError):
+                pass
             self.e_host.configure(state="normal")
             if proto == "telnet":
                 self.v_port.set("23")
@@ -1656,25 +1716,39 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             self._refresh_cred_hint()
             return
 
+        target = hosts_core.assume_os(
+            {"proto": proto, "ostype": self.v_ostype.get()},
+            sys.platform == "win32")
+        if target == "windows":
+            # 远程 Windows：SSH 进来也没有 sudo 这回事，别摆一个用不上的密码框
+            row = U.wframe(holder, "card")
+            row.pack(fill="x")
+            U.wlabel(row, "目标系统是 Windows：没有 sudo，也不需要 sudo 密码",
+                     "card", U.FONT_S).pack(side="left")
+            U.wlabel(holder,
+                     "提权靠管理员账户（runas / UAC）；「以管理员身份运行」只对"
+                     "本机 Windows 有意义。",
+                     "dim", U.FONT_XS, justify="left").pack(anchor="w", pady=(6, 0))
+            self._refresh_cred_hint()
+            return
+
         row = U.wframe(holder, "card")
         row.pack(fill="x")
-        if proto == "local":
+        if target == "network":
+            title = "连接后自动进特权模式（enable）"
+            pw_label = "enable 密码"
+            hint = ("交换机 / 路由器用 enable 密码。不勾选也能看，"
+                    "写操作时才会问你要密码 —— 也可以到「终端」里自己敲。")
+        elif proto == "local":
             title = "使用 sudo 提权（进入后自动 sudo -i）"
             pw_label = "sudo 密码"
             hint = ("本机的提权就是 sudo：勾选后所有命令都走 sudo -i；"
                     "不勾选也能用，需要 root 时会弹窗问你要密码 —— "
                     "也可以到「终端」里自己敲。")
-        elif proto == "telnet":
-            title = "连接后自动进特权模式"
-            pw_label = "提权密码"
-            hint = ("交换机 / 路由器填 enable 密码；对端其实是 Linux / Unix 的话"
-                    "这里就是 sudo 密码 —— 连上探测完系统再决定敲哪条命令。"
-                    "不勾选也能看，写操作时才会问你要密码。")
         else:
-            title = "使用提权（登录后自动 sudo -i / enable）"
-            pw_label = "提权密码"
-            hint = ("勾选后在连接时自动提权：服务器上执行 sudo -i，交换机 / 路由器"
-                    "上进 enable 特权模式（SSH 也支持）。不勾选也能用，"
+            title = "使用提权（登录后自动 sudo -i）"
+            pw_label = "sudo 密码"
+            hint = ("勾选后在连接时自动执行 sudo -i。不勾选也能用，"
                     "需要提权时会弹窗问你要密码 —— 也可以到「终端」里自己敲。")
         U.Check(row, title, self.v_elevate,
                 command=self._elev_toggled).pack(side="left")
@@ -1774,7 +1848,10 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             if self.v_save_pw.get() and self.v_mode.get() == "password":
                 keep.append("登录密码")
             if self.v_save_sudo.get():
-                keep.append("enable 密码" if proto == "telnet" else "sudo 密码")
+                target = hosts_core.assume_os(
+                    {"proto": proto, "ostype": self.v_ostype.get()},
+                    sys.platform == "win32")
+                keep.append("enable 密码" if target == "network" else "sudo 密码")
             if not keep:
                 lbl.configure(text="未勾选「保存口令」· 口令只留在本次运行的内存里",
                               fg=U.T.text_mute)
@@ -1848,16 +1925,17 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             "key_path": norm_path(self.v_key.get()),
             "remember": bool(self.v_remember.get()),
             "proto": self.v_proto.get(),
+            "ostype": str(self.v_ostype.get() or ""),
         }
-        # 本机那三个只在「本机」协议下有意义；远程档案里留着它们，
-        # 下次以本机身份连接时会被误用，所以非本机一律清空。
-        if p["proto"] == "local":
-            p["sudo"] = bool(self.v_elevate.get())
-            p["elevate"] = bool(self.v_admin.get())
-            p["shell"] = str(self.v_shell.get() or "")
-        else:
-            p["sudo"] = p["elevate"] = False
-            p["shell"] = ""
+        # 提权那两个开关按**目标系统**存：Linux 有 sudo、交换机有 enable、
+        # Windows 两者都没有（它要的是 UAC）。不这么分的话，一条远程档案
+        # 拿到本机 Windows 上打开就会冒出一个用不上的 sudo 密码框。
+        target = hosts_core.assume_os(p, sys.platform == "win32")
+        p["sudo"] = (bool(self.v_elevate.get())
+                     if (hosts_core.is_unix(target) or target == "network")
+                     else False)
+        p["elevate"] = bool(self.v_admin.get()) if target == "windows" else False
+        p["shell"] = str(self.v_shell.get() or "") if p["proto"] == "local" else ""
         # 每一项单独决定存不存：勾了私钥口令就只存私钥口令，
         # 别把一个没勾的口令也顺手写进文件。
         if self.v_save_pw.get():
@@ -1882,6 +1960,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         auth = p.get("auth", "key")
         self.v_mode.set(auth if auth in ("key", "password") else "key")
         self._mode_changed()
+        self.v_ostype.set(hosts_core.os_of(p))
+        self._sync_ostype_ui()
         self.v_key.set(norm_path(p.get("key_path")))
         self.v_keypw.set(p.get("key_passphrase", "") or "")
         self.v_pw.set(p.get("password", "") or "")
@@ -2104,6 +2184,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             self.status.set_state("已连接", "ok")
             self.pill_dev.set(dev.os_name or "已连接", "ok")
             self.pill_proto.set(s.kind.upper(), "ok")
+            # 探测到的才是真的：把目标系统写回档案，下次表单 / 提权区就跟着准
+            self._remember_detected_os(dev)
             # 换了设备：页面上的旧数据全部作废，重新按新设备探测
             self._local_dev = None
             self._routes_loaded = False
@@ -2133,6 +2215,64 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             messagebox.showerror("连接失败", msg, parent=self)
 
         self.bg(work, ok=ok, err=err)
+
+    def _remember_detected_os(self, dev) -> None:
+        """把探测到的目标系统写回档案。
+
+        光靠本机平台猜提权方式是不对的：SSH 打到一台 Windows 上，
+        那边根本没有 sudo。连上认准之后把系统写进档案，
+        下次打开表单、下次连接，提权区就是对的。
+
+        本机连接一律不动：这台机器的系统不是「目标系统」，写进下拉里会让
+        下次切回 SSH 时目标还停在 Windows —— 于是 sudo 密码框整个不出现。
+        """
+        if self.v_proto.get() == "local":
+            return
+        fam = str(getattr(dev, "os_family", "") or "").strip().lower()
+        # 认准了是什么系统就记什么 —— 以前 darwin / freebsd 一律写成 linux，
+        # 于是 macOS 和 FreeBSD 的机器在档案里都变成「Linux」，用户改不动也看不出来。
+        if fam in ("windows", "network"):
+            key = fam
+        elif fam in ("darwin", "macos", "mac", "osx"):
+            key = "macos"
+        elif fam in ("freebsd", "openbsd", "netbsd", "bsd"):
+            key = "freebsd"
+        elif fam in ("linux", "posix"):
+            key = "linux"
+        else:
+            return
+        try:
+            if str(self.v_ostype.get()) != key:
+                self.v_ostype.set(key)
+                self._sync_ostype_ui()
+                self._rebuild_elevation()
+        except (AttributeError, tk.TclError):
+            pass
+        name = str(getattr(dev, "os_name", "") or "")
+        pname = self.v_prof.get().strip()
+        if not pname:
+            return
+        rec = self.profiles.get(pname)
+        if rec is None:
+            return
+        # 连的地址跟档案里记的不是同一台，也别写 —— 手动改过地址时尤其容易错。
+        host = str(self.v_host.get() or "").strip().lower()
+        if host and str(rec.get("host") or "").strip().lower() != host:
+            return
+        if rec.get("ostype") == key and str(rec.get("os_name") or "") == name:
+            return
+        rec = dict(rec)
+        rec["ostype"] = key
+        if name:
+            rec["os_name"] = name
+        try:
+            self.profiles.upsert(rec)
+        except (ValueError, OSError):
+            return
+        try:
+            self.host_refresh()
+        except Exception:  # noqa: BLE001  页面还没建好也不该影响连接
+            pass
 
     def _disconnect(self):
         """只断当前这一台；关掉后自动切到剩下的上一台（没有就回本机）。"""

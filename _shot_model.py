@@ -15,6 +15,10 @@ import _shots as SH  # noqa: E402
 
 import app as appmod  # noqa: E402
 
+# 下面会先删光 ollama 的模型再灌 demo —— 必须改临时副本（这就是 10-24
+# 把用户真实模型表覆盖掉的元凶），真实 data 一个字节都不动
+SH.isolate("tbshot_model_")
+
 
 def pump(win, sec=0.3):
     end = time.time() + sec

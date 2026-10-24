@@ -13,7 +13,8 @@
   default   默认值
   options   select 用：["a","b"] 或 [("值","显示")]
   required  必填
-  hint      控件下方灰色说明
+  hint      控件下方灰色说明（按实际分到的宽度自动换行）
+  hint_below 这一行太挤时，把说明挪到输入框下面单独一行
   width     输入框宽度（字符）
   unit      值右侧的单位文字
   pattern   (正则, 错误提示)
@@ -23,6 +24,10 @@
   show_if   {源字段: [可接受的值, ...]} 或 lambda 值字典 -> bool
             不满足就整行收起来（也跳过必填校验）。联动靠它 —— 例如协议选
             「本机」时，地址 / 端口 / 认证 / 私钥 / 凭证 / 代理全都不该出现。
+  watch     show_if 是谓词时，用它能反查依赖了谁（改这些字段要重算显隐）
+  save      password 专用：框后面长一个「保存」勾，结果键是 `<key>__save`
+  save_label  那个勾的文字，默认「保存」
+  save_default 勾的初始状态（档案里已经有这个口令时应当默认勾上）
 """
 from __future__ import annotations
 
@@ -32,6 +37,29 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 
 import wbtui as U
+
+
+def _autofit_hint(label: tk.Label) -> None:
+    """让说明文字按「分到的宽度」换行，而不是按设计稿的固定像素。
+
+    以前 wraplength 写死 300，窗口窄一点就变成「文字比格子宽」——
+    Tk 不会换行，直接把右边切掉，看着像说明少了一截。
+    """
+    def _fit(event, lb=label):
+        try:
+            wrap = max(U.px(80), int(event.width) - U.px(4))
+            if int(lb.cget("wraplength") or 0) != wrap:
+                lb.configure(wraplength=wrap)
+        except tk.TclError:
+            pass
+    label.bind("<Configure>", _fit)
+
+
+def _hint(master, text: str, **kw) -> tk.Label:
+    lb = U.wlabel(master, text, "mute", U.FONT_XS, justify="left",
+                  wraplength=U.px(110), **kw)
+    _autofit_hint(lb)
+    return lb
 
 
 class FormDialog(tk.Toplevel):
@@ -46,6 +74,7 @@ class FormDialog(tk.Toplevel):
         self.transient(parent)
         self.result: dict | None = None
         self.fields = fields
+        self._fixed_w = 0
         self._getters: dict[str, callable] = {}
         self._checks: dict[str, U.Check] = {}
         self._widgets: dict[str, tk.Widget] = {}
@@ -64,7 +93,7 @@ class FormDialog(tk.Toplevel):
 
         card = U.Card(wrap)
         card.pack(fill="both", expand=True, pady=(U.px(14), 0))
-        body = card.body
+        body = self._scroll_body(card.body)
         body.columnconfigure(1, weight=1)
 
         r = 0
@@ -94,6 +123,7 @@ class FormDialog(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
         self.update_idletasks()
+        self._fit_body()
         self._center(parent, width)
         self._bind_show_if()
         self._apply_show_if()
@@ -108,6 +138,110 @@ class FormDialog(tk.Toplevel):
                     w.focus_set()
                 except tk.TclError:
                     pass
+
+    # ------------------------------------------------------------ 滚动正文
+    def _max_h(self) -> int:
+        """这个窗口最高能长到多少（留出任务栏和标题栏的空间）。"""
+        try:
+            return max(U.px(320), int(self.winfo_screenheight() * 0.86))
+        except tk.TclError:
+            return U.px(680)
+
+    def _scroll_body(self, parent) -> tk.Frame:
+        """卡片里放一块可滚动的正文。
+
+        字段一多（主机表单加上私钥密码、保存勾、目标系统就十几行），
+        窗口会高过屏幕 —— 模态窗又不能滚，底下的「确定」直接被挤出屏幕，
+        用户看到的就是「存不了」。所以正文一律可滚：
+        够高时滚动条自动消失，不够高时也不会把按钮顶出去。
+        """
+        self._body_cv = tk.Canvas(parent, bg=U.T.card, bd=0, highlightthickness=0,
+                                  width=U.px(400), height=U.px(200),
+                                  yscrollincrement=U.px(18))
+        self._body_sb = tk.Scrollbar(parent, orient="vertical",
+                                     command=self._body_cv.yview,
+                                     width=U.px(10), bd=0, relief="flat",
+                                     troughcolor=U.T.card,
+                                     activebackground=U.T.border,
+                                     bg=U.T.border)
+        self._body_cv.configure(yscrollcommand=self._body_sb.set)
+        self._body_cv.pack(side="left", fill="both", expand=True)
+        inner = U.wframe(self._body_cv, "card")
+        self._body_inner = inner
+        self._body_win = self._body_cv.create_window((0, 0), window=inner,
+                                                     anchor="nw")
+        inner.bind("<Configure>", self._on_body_inner)
+        self._body_cv.bind("<Configure>", self._on_body_canvas)
+        self.bind("<MouseWheel>", self._on_wheel)
+        self.bind("<Button-4>", self._on_wheel)
+        self.bind("<Button-5>", self._on_wheel)
+        self._fit_job = None
+        return inner
+
+    def _on_body_inner(self, _e=None) -> None:
+        try:
+            self._body_cv.configure(scrollregion=self._body_cv.bbox("all"))
+        except tk.TclError:
+            return
+        if self._fit_job is None:
+            try:
+                self._fit_job = self.after_idle(self._fit_body)
+            except tk.TclError:
+                pass
+
+    def _on_body_canvas(self, event) -> None:
+        try:
+            self._body_cv.itemconfigure(self._body_win, width=max(1, event.width))
+        except tk.TclError:
+            pass
+        if self._fit_job is None:
+            try:
+                self._fit_job = self.after_idle(self._fit_body)
+            except tk.TclError:
+                pass
+
+    def _fit_body(self) -> None:
+        """画布高度取「内容高度」，但不超过屏幕能给的空间。"""
+        self._fit_job = None
+        cv = getattr(self, "_body_cv", None)
+        inner = getattr(self, "_body_inner", None)
+        if cv is None or inner is None:
+            return
+        try:
+            self.update_idletasks()
+            chrome = max(0, self.winfo_reqheight() - cv.winfo_reqheight())
+            avail = max(U.px(140), self._max_h() - chrome)
+            want = max(U.px(120), inner.winfo_reqheight() + U.px(2))
+            want = min(want, avail)
+            if int(cv.cget("height")) != int(want):
+                cv.configure(height=int(want))
+            need = (inner.winfo_reqheight() > want + 2)
+            if need and not self._body_sb.winfo_manager():
+                self._body_sb.pack(side="right", fill="y", before=cv)
+            elif not need and self._body_sb.winfo_manager():
+                self._body_sb.pack_forget()
+                cv.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _on_wheel(self, event):
+        """滚轮：内容比可视区高才滚，否则交给 Tk 默认处理。"""
+        cv = getattr(self, "_body_cv", None)
+        if cv is None:
+            return None
+        try:
+            if self._body_inner.winfo_reqheight() <= cv.winfo_height() + 2:
+                return None
+            if getattr(event, "num", 0) == 4:
+                step = -3
+            elif getattr(event, "num", 0) == 5:
+                step = 3
+            else:
+                step = -1 * int(getattr(event, "delta", 0) or 0) // 40 or -1
+            cv.yview_scroll(int(step), "units")
+        except tk.TclError:
+            return None
+        return "break"
 
     # ------------------------------------------------------------ 行
     def _widgets_init(self):
@@ -214,18 +348,46 @@ class FormDialog(tk.Toplevel):
             else:
                 self._getters[f["key"]] = lambda e=ent: e.get().strip()
             self._widgets[f["key"]] = ent
+            if f.get("save"):
+                # 口令框后面就地放一个「保存」：勾了才落盘，留空表示这次不改。
+                # 单独一个总开关会让人猜「到底存了哪几项」，所以一框一个。
+                self._add_save_check(cell, f, values)
 
         if f.get("unit"):
             U.wlabel(cell, f["unit"], "mute", U.FONT_XS).pack(
                 side="left", padx=(U.px(7), 0))
+        if f.get("hint") and f.get("hint_below"):
+            # 这一行控件太挤（输入框 + 浏览… + 说明），说明单独占一行更清楚
+            lb2 = _hint(body, f["hint"])
+            lb2.grid(row=r + 1, column=1, sticky="we", pady=(0, U.px(4)))
+            self._row_widgets[f["key"]].append(lb2)
+            return r + 2
         if f.get("hint"):
-            U.wlabel(cell, f["hint"], "mute", U.FONT_XS, justify="left",
-                     wraplength=U.px(300)).pack(side="left", padx=(U.px(9), 0))
+            # fill + expand：说明吃掉剩下的宽度，再按这个宽度自己换行
+            _hint(cell, f["hint"]).pack(side="left", fill="x", expand=True,
+                                        padx=(U.px(9), 0))
         return r + 1
+
+    def _add_save_check(self, cell, f, values) -> None:
+        """口令框后面那个「保存」勾。
+
+        结果键是 `<字段>__save`，跟口令本身分开 —— 口令为空时「保不保存」
+        仍然是一个独立的事实（留空 = 不改档案里已有的口令）。
+        """
+        key = f["key"] + "__save"
+        var = tk.BooleanVar(
+            value=bool(values.get(key, f.get("save_default", False))))
+        ck = U.Check(cell, f.get("save_label", "保存"), var)
+        ck.pack(side="left", padx=(U.px(7), 0))
+        self._checks[key] = ck
+        self._vars[key] = var
+        self._getters[key] = ck.get
 
     def _row_check(self, body, f, values, r) -> int:
         cell = U.wframe(body, "card")
-        cell.grid(row=r, column=0, columnspan=2, sticky="w",
+        # sticky="we"：整行都归它，说明文字才有地方换行（"w" 的话它只有
+        # 勾选框那么宽，一句说明能被折成五行）
+        cell.grid(row=r, column=0, columnspan=2, sticky="we",
                   pady=(U.px(6), U.px(6)))
         self._row_widgets[f["key"]] = [cell]
         ck = U.Check(cell, f.get("label", f["key"]), bg=None)
@@ -235,8 +397,8 @@ class FormDialog(tk.Toplevel):
         self._getters[f["key"]] = ck.get
         self._vars[f["key"]] = ck.var
         if f.get("hint"):
-            U.wlabel(cell, f["hint"], "mute", U.FONT_XS).pack(
-                anchor="w", padx=(U.px(26), 0))
+            _hint(cell, f["hint"]).pack(anchor="w", fill="x", expand=True,
+                                        padx=(U.px(26), 0))
         return r + 1
 
     def _row_readonly(self, body, f, values, r) -> int:
@@ -273,12 +435,18 @@ class FormDialog(tk.Toplevel):
         return True
 
     def _bind_show_if(self) -> None:
-        """谁被 show_if 提到，就盯住谁的变量。"""
+        """谁被 show_if 提到，就盯住谁的变量。
+
+        除了字典式 show_if 里点到的字段，还认 `watch` 列表 —— 谓词式
+        show_if（lambda）没法反查依赖了谁，由字段自己声明。
+        """
         watch: set[str] = set()
         for f in self.fields:
             spec = f.get("show_if")
             if isinstance(spec, dict):
                 watch |= set(spec.keys())
+            for k in (f.get("watch") or ()):
+                watch.add(str(k))
         for key in watch:
             var = self._vars.get(key)
             if var is None:
@@ -311,26 +479,42 @@ class FormDialog(tk.Toplevel):
         """字段增减后重新量高度，宽度与位置不动。
 
         不重设 geometry 的话，Toplevel 会保留原来的高度 —— 收起几行之后
-        底下留一大片空白，看起来像没生效。
+        底下留一大片空白，看起来像没生效。高度上限压到屏幕内，
+        超出的部分由正文区的滚动条接管。
         """
         try:
             self.update_idletasks()
-            w = self.winfo_width() or self.winfo_reqwidth()
-            h = self.winfo_reqheight()
+            self._fit_body()
+            self.update_idletasks()
+            # 宽度用创建时定的那个：winfo_width() 在窗口还没映射时是 1，
+            # 拿它当基准会让窗口被 reqwidth 缩小（580 → 470 这种事）。
+            w = self._fixed_w or self.winfo_width() or self.winfo_reqwidth()
+            h = min(self.winfo_reqheight(), self._max_h())
             x, y = self.winfo_rootx(), self.winfo_rooty()
-            self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+            # 高度一变就可能顶出屏幕下沿：以前勾一下「连接后自动提权」多出一行，
+            # 窗口往下长到 1238，可 y 还停在 +220 —— 底部的「确定」被屏幕边缘
+            # 吃掉，用户看到的就是「存不了」。所以高度变了必须重新夹一次坐标。
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            x = max(0, min(x, sw - w - U.px(12)))
+            # h 是客户区高度，外面还有标题栏和边框，一并让出来
+            y = max(0, min(y, sh - h - U.px(64)))
+            self.geometry(f"{w}x{h}+{x}+{y}")
         except tk.TclError:
             pass
 
     # ------------------------------------------------------------ 动作
     def _center(self, parent, width: int) -> None:
         w = self.winfo_reqwidth()
-        h = self.winfo_reqheight()
+        h = min(self.winfo_reqheight(), self._max_h())
         w = max(w, U.px(width))
+        self._fixed_w = int(w)
         try:
             px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
-            py = parent.winfo_rooty() + max(U.px(40),
+            py = parent.winfo_rooty() + max(U.px(30),
                                             (parent.winfo_height() - h) // 3)
+            # 别让窗口顶到屏幕外面：底部按钮被任务栏吃掉是最烦的。
+            # h 只是客户区，标题栏和边框还在外头，所以多留 px(64)。
+            py = max(0, min(py, self.winfo_screenheight() - h - U.px(64)))
         except tk.TclError:
             px = py = 200
         self.geometry(f"{w}x{h}+{max(0, px)}+{max(0, py)}")

@@ -32,16 +32,12 @@ def pump(root, sec=0.2):
 
 
 def main():
-    import json
     from pathlib import Path
-    # 别让上一次自测留下的锁拦住宿主
+    # 别让上一次自测留下的锁拦住宿主；走 _lockoff：备份 + 退出还原
     try:
-        p = Path("data/settings.json")
-        d = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-        for k in ("lock_enabled", "lock_hash", "lock_timeout",
-                  "lock_auto_login", "lock_pass_enc"):
-            d[k] = False if "enabled" in k or "auto" in k else (0 if "timeout" in k else "")
-        p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+        import _lockoff
+
+        _lockoff.unlock(Path("data/settings.json"))
     except Exception:  # noqa: BLE001
         pass
 

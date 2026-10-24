@@ -227,12 +227,6 @@ pump(win, 0.3)
 
 # ================================================================== 布局
 sec("13. 设置页签里的导航与工作区位置")
-win.open_settings("look")
-pump(win, 0.5)
-p4 = win._settings_reg().get("settings")
-eq(win.tabbar.current, "settings", "设置页签是当前页")
-chk(p4.winfo_ismapped(), "设置 pane 可见")
-chk(win.nav.winfo_rootx() < p4.winfo_rootx(), "左侧导航在设置页左边")
 
 
 def rx(w):
@@ -242,7 +236,22 @@ def rx(w):
         return -1
 
 
-chk(rx(win.nav) < rx(win.workspace), "主导航仍在工作区左边")
+win.open_settings("look")
+pump(win, 0.5)
+p4 = win._settings_reg().get("settings")
+eq(win.tabbar.current, "settings", "设置页签是当前页")
+chk(p4.winfo_ismapped(), "设置 pane 可见")
+# 左边那条是「主机资源」页签自己的二级导航（见 app.py 里 nav 的挂载注释）。
+# 切到设置时它跟着整页一起被摘掉，这是有意的 —— 设置页左边不该还杵着
+# 主机管理菜单。所以这里验的是「已收起」，不是「还在左边」。
+chk(not win.nav.winfo_ismapped(), "设置页打开时，主机管理导航已收起")
+
+win._on_tab("hosts")
+pump(win, 0.4)
+chk(win.nav.winfo_ismapped(), "切回主机资源：导航又出来了")
+# 导航和内容区现在是同一个父容器（ws_hosts）里的兄弟，所以比的是
+# 「导航 < 内容区」，不是「导航 < 整个工作区」—— 后者按构造永远不成立。
+chk(rx(win.nav) < rx(win.stack), "导航在内容区左边")
 
 # ================================================================== 收尾
 try:

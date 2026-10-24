@@ -33,11 +33,10 @@ FAKE_TA = """-----BEGIN OpenVPN Static key V1-----
 
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
-    p = Path("data/settings.json")
-    d = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-    d.update({"lock_enabled": False, "lock_hash": "", "lock_timeout": 0,
-              "lock_auto_login": False, "lock_pass_enc": ""})
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 备份 + 退出还原：别把用户真实设的锁屏密码当成自测垃圾清掉
+    import _lockoff
+
+    _lockoff.unlock(Path("data/settings.json"))
 
     key_file = Path(tempfile.gettempdir()) / "demo_id_ed25519"
     key_file.write_text(FAKE_KEY + "\n", encoding="utf-8")

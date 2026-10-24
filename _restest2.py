@@ -61,25 +61,42 @@ pump(win, 0.8)
 
 # ================================================================== 骨架
 sec("1. 页面骨架与导航")
-wanted = ["hosts", "proxy", "cred", "script", "log"]
+# v1.0.6：「日志管理」不占页签了，改成底部可开关的日志面板；
+# v1.0.9：「模型管理」并进设置中心的页签。所以顶层是 15 个页。
+wanted = ["hosts", "proxy", "cred", "script", "tools", "sys", "files",
+          "routes", "sec", "docker", "web", "db", "cron", "vpn", "api"]
 for k in wanted:
     chk(k in win._pages, f"页面已构建：{k}")
-eq(len(win._pages), 16, "页面总数（原 12 − conn + 5）")
+eq(len(win._pages), 15, "页面总数（15 个顶层页）")
 chk("conn" not in win._pages, "连接与设备不再是独立页")
-eq(len(win.nav.items), 16, "导航条目数")
+chk("log" not in win._pages, "日志不再是独立页（改成底部面板）")
+eq(len(win.nav.items), 15, "导航条目数")
 chk("hosts" in win.nav.items, "导航含主机管理")
 chk(win.nav.alias.get("conn") == "hosts", "旧键 conn 指向主机管理")
 chk(win.nav.alias.get("fw") == "sec", "旧键 fw 仍指向安全中心")
 
 labels = [it.lbl.cget("text") for it in win.nav.items.values()]
-chk("主机管理" in labels and "日志管理" in labels, "导航文案")
-group_titles = [w.cget("text") for w in win.nav.winfo_children()
-                if isinstance(w, tkinter.Label)]
+chk("主机管理" in labels and "日志管理" not in labels, "导航文案")
+
+
+def _labels(w) -> list[str]:
+    """导航现在放在可滚动 Canvas 里，标签不是 nav 的直接子控件，得递归找。"""
+    out: list[str] = []
+    for c in w.winfo_children():
+        try:
+            if isinstance(c, tkinter.Label):
+                out.append(c.cget("text"))
+        except tkinter.TclError:
+            pass
+        out += _labels(c)
+    return out
+
+
+group_titles = _labels(win.nav)
 # 「主机资源」这组刻意不画标题 —— 顶部页签已经写了这四个字，重复一遍很啰嗦。
-# 所以这里断言的是「第一组没有标题、且五个页面都在里面」。
 # 刻意只给第二组画小标题：顶部页签已经写着「主机资源」了。
-chk(group_titles == ["运维工具"], "主机资源那组不重复画标题", str(group_titles))
-chk("运维工具" in group_titles, "有「运维工具」分组标题")
+chk("运维工具" in group_titles, "有「运维工具」分组标题", str(group_titles))
+chk("主机资源" not in group_titles, "主机资源那组不重复画标题", str(group_titles))
 
 # ================================================================== 主机
 sec("2. 主机管理")
@@ -203,6 +220,9 @@ sec("6. 日志管理")
 for i in range(25):
     win.audit.record("capability.terminal.exec" if i % 2 else "fs.write",
                      "ok" if i % 3 else "fail", f"第 {i} 条", "web-1")
+# 日志现在是底部 dock，点了才建界面 —— 不打开的话 tbl_audit 根本不存在
+win.log_dock_open()
+pump(win, 0.4)
 win.audit_reload()
 pump(win, 0.3)
 eq(len(win._audit_events), 25, "日志读回 25 条")

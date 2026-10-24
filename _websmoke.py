@@ -466,12 +466,10 @@ def test_deploy():
 # ------------------------------------------------------------------ B. 界面
 def test_ui():
     print("\n== B1. 界面 ==")
-    p = HERE / "data" / "settings.json"
-    d = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-    d.update({"lock_enabled": False, "lock_hash": "", "lock_timeout": 0,
-              "lock_auto_login": False, "lock_pass_enc": ""})
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    import _lockoff
+
+    # 备份 + 退出还原，别把用户的锁屏密码真删了
+    _lockoff.unlock(HERE / "data" / "settings.json")
 
     import app as APP
 

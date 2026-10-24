@@ -102,13 +102,10 @@ SW1#
 # ------------------------------------------------------------------ 1. 连接页
 def test_conn_page() -> None:
     print("\n[1] 连接页三种形态")
-    import json
-    p = HERE / "data" / "settings.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    d = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-    d.update({"lock_enabled": False, "lock_hash": "", "lock_timeout": 0,
-              "lock_auto_login": False, "lock_pass_enc": ""})
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    import _lockoff
+    # 关锁屏要能还原：以前直接写真实 settings.json，跑一遍就把用户的
+    # 锁屏密码抹了。现在由 _lockoff 备份，进程退出自动 move 回去。
+    _lockoff.unlock(HERE / "data" / "settings.json")
 
     import app as APP
     a = APP.ToolboxApp()
@@ -581,13 +578,10 @@ def test_telnet() -> None:
 # ------------------------------------------------------------------ 7. 弹窗
 def test_elevation_dialog() -> None:
     print("\n[7] 提权弹窗与重试")
-    import json
-    p = HERE / "data" / "settings.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    d = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-    d.update({"lock_enabled": False, "lock_hash": "", "lock_timeout": 0,
-              "lock_auto_login": False, "lock_pass_enc": ""})
-    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    import _lockoff
+    # 关锁屏要能还原：以前直接写真实 settings.json，跑一遍就把用户的
+    # 锁屏密码抹了。现在由 _lockoff 备份，进程退出自动 move 回去。
+    _lockoff.unlock(HERE / "data" / "settings.json")
 
     import app as APP
     from ui import forms as UI_FORMS
@@ -683,6 +677,58 @@ def test_elevation_dialog() -> None:
         a.destroy()
 
 
+def test_remember_os() -> None:
+    """探测到的系统只写回「真的连上的那一台」，本机不许写。
+
+    这条是血换的：本机连着 chromas 那条档案的地址时切成本机连了一下，
+    本机的 Windows 就被写进了 chromas 的 ostype —— 而 chromas 是个
+    Synology（Linux）。顺带把连接页的目标系统钉在 Windows 上，
+    之后切回 SSH，sudo 密码框整个不出现。
+    """
+    print("\n[8] 探测回写：只写连上的那一台")
+    import _lockoff
+    from types import SimpleNamespace
+
+    _lockoff.unlock(HERE / "data" / "settings.json")
+    import app as APP
+
+    a = APP.ToolboxApp()
+    a.update()
+    a.profiles.upsert({"name": "nas-1", "host": "10.9.9.9", "port": "22",
+                       "proto": "ssh", "ostype": "", "os_name": ""})
+    dev = SimpleNamespace(os_family="windows", os_name="Windows Server 2022")
+
+    # ① 本机连接：既不写档案，也不把目标系统钉住
+    a.v_proto.set("local")
+    a.v_prof.set("nas-1")
+    a.v_ostype.set("")
+    a._remember_detected_os(dev)
+    check("本机连接：目标系统没被改写", a.v_ostype.get() == "",
+          a.v_ostype.get())
+    check("本机连接：档案没被写上本机系统",
+          not a.profiles.get("nas-1").get("ostype"),
+          a.profiles.get("nas-1").get("ostype"))
+
+    # ② 远端但地址对不上：也不写（手动改过地址时最容易错）
+    a.v_proto.set("ssh")
+    a.v_prof.set("nas-1")
+    a.v_host.set("10.9.9.10")
+    a._remember_detected_os(dev)
+    check("地址对不上：档案不动",
+          not a.profiles.get("nas-1").get("ostype"),
+          a.profiles.get("nas-1").get("ostype"))
+
+    # ③ 远端且地址一致：写
+    a.v_host.set("10.9.9.9")
+    a._remember_detected_os(dev)
+    rec = a.profiles.get("nas-1")
+    check("地址对上：系统写进档案", rec.get("ostype") == "windows",
+          rec.get("ostype"))
+    check("地址对上：系统名也写进档案",
+          rec.get("os_name") == "Windows Server 2022", rec.get("os_name"))
+    a.destroy()
+
+
 def main() -> int:
     test_vendors()
     test_routes()
@@ -691,6 +737,7 @@ def main() -> int:
     test_telnet()
     test_conn_page()
     test_elevation_dialog()
+    test_remember_os()
     print(f"\n===== 结果：{passed} 通过 / {failed} 失败 =====")
     return 1 if failed else 0
 

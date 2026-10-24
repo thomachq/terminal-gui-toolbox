@@ -22,6 +22,43 @@ TAG_SEP = re.compile(r"[,，;；、\s]+")
 _BAD_ADDR = re.compile(r"[\s/\\]")
 _PROTO_LABEL = {"ssh": "SSH", "telnet": "Telnet", "local": "本机"}
 _AUTH_LABEL = {"key": "私钥", "password": "密码"}
+# 「目标系统」：提权方式由它决定，多一类就多一套分支。
+# 用户能自己选（不止 Windows / Linux，macOS / FreeBSD 这类类 Unix 也要），
+# 所以下拉项的**唯一**来源放在这里 —— 主机表单和连接页都从这里取，
+# 免得两边各写一份、以后加系统只改了一边。
+OS_PICK = (
+    ("", "自动探测（连上就认）"),
+    ("linux", "Linux / Unix"),
+    ("macos", "Mac OS"),
+    ("freebsd", "FreeBSD"),
+    ("windows", "Windows"),
+    ("network", "交换机 / 路由器"),
+)
+OS_LABEL = {
+    "linux": "Linux", "macos": "Mac OS", "freebsd": "FreeBSD",
+    "windows": "Windows", "network": "交换机 / 路由器",
+    # 探测回来的别名（`uname` 给的是 darwin / freebsd / sunos 这种），
+    # 能显示、能记住，但不进下拉框 —— 下拉只给用户看得懂的那几个。
+    "darwin": "macOS", "bsd": "BSD", "posix": "Unix",
+    "solaris": "Solaris", "aix": "AIX",
+}
+#: 类 Unix —— 提权一律 sudo，既不是 Windows 的 UAC，也不是交换机的 enable
+UNIX_OS = ("linux", "macos", "freebsd", "bsd", "posix", "darwin",
+           "solaris", "aix")
+OS_CHOICES = tuple(k for k, _ in OS_PICK)
+#: 探测别名 → 下拉里的规范项
+_OS_ALIAS = {"darwin": "macos", "bsd": "freebsd", "posix": "linux",
+             "solaris": "linux", "aix": "linux"}
+
+
+def is_unix(v: str) -> bool:
+    """这个目标系统是不是类 Unix（提权走 sudo）。"""
+    return str(v or "").strip().lower() in UNIX_OS
+
+
+def pick_options() -> list[tuple[str, str]]:
+    """下拉框要的 `[(值, 显示), ...]`，调用方直接拿去用。"""
+    return list(OS_PICK)
 
 
 # ------------------------------------------------------------------ 标签
@@ -63,6 +100,52 @@ def proto_of(p: dict) -> str:
     return "telnet" if str((p or {}).get("port") or "") == "23" else "ssh"
 
 
+# ------------------------------------------------------------------ 目标系统
+def os_of(p: dict) -> str:
+    """记录里登记的「目标系统」，空串表示还没认出来（自动探测）。"""
+    v = str((p or {}).get("ostype") or "").strip().lower()
+    return v if v in OS_LABEL else ""
+
+
+def os_label(p: dict, local_os: str = "") -> str:
+    """清单「系统」列显示什么。
+
+    优先级：探测到的具体版本名 > 手选/探测到的系统类别 > 不知道。
+    本机记录直接给本机真实系统（`local_os`），不然一列全是「自动」看着像没填。
+    """
+    p = p or {}
+    name = str(p.get("os_name") or "").strip()
+    if name:
+        return name
+    fam = os_of(p)
+    if fam:
+        return OS_LABEL.get(fam, fam)
+    if proto_of(p) == "local":
+        return local_os or "本机"
+    return "自动"
+
+
+def assume_os(vals: dict, is_win: bool) -> str:
+    """从「表单值 / 记录」推断提权该按哪套来。
+
+    返回值是**规范化的目标系统**：linux / macos / freebsd / windows / network。
+    判断提权时请用 `is_unix()`，别直接跟 "linux" 比 —— 类 Unix 有好几种。
+
+    · 协议是本机 —— 就是跑程序的这台机器，用当地平台，问都不用问；
+    · 明确选过目标系统 —— 照选的（Mac OS / FreeBSD 这些都算数）；
+    · 还是「自动」—— SSH 九成是 Linux 服务器，Telnet 九成是交换机 / 路由器。
+      连上之后 `detect()` 会把真实系统写回档案，下次就是准的。
+    """
+    proto = proto_of(vals)
+    if proto == "local":
+        return "windows" if is_win else "linux"
+    fam = os_of(vals).lower()
+    fam = _OS_ALIAS.get(fam, fam)
+    if fam in OS_CHOICES and fam:
+        return fam
+    return "network" if proto == "telnet" else "linux"
+
+
 # ------------------------------------------------------------------ 地址
 def addr_of(p: dict) -> str:
     """`user@host:port` —— 缺哪段就少哪段，不留 `@:22` 这种残句。
@@ -95,7 +178,8 @@ def display_name(p: dict) -> str:
 
 
 # ------------------------------------------------------------------ 行模型
-def host_view(p: dict, cred_name: str = "", proxy_name: str = "") -> dict:
+def host_view(p: dict, cred_name: str = "", proxy_name: str = "",
+              local_os: str = "") -> dict:
     """把一个档案 dict 变成表格行。
 
     额外塞两个下划线开头的键（`_raw`）给调用方取原始记录 —— 表格行里
@@ -113,6 +197,8 @@ def host_view(p: dict, cred_name: str = "", proxy_name: str = "") -> dict:
         "user": str(p.get("user") or ""),
         "proto": _PROTO_LABEL.get(proto, proto),
         "proto_key": proto,
+        "os": os_label(p, local_os),
+        "ostype": os_of(p),
         "group": group_of(p),
         "tags": ", ".join(tags),
         "tag_list": tags,
@@ -122,6 +208,8 @@ def host_view(p: dict, cred_name: str = "", proxy_name: str = "") -> dict:
         "note": str(p.get("note") or ""),
         "last_used": fmt_ts(p.get("last_used")) or "从未连接",
         "created": fmt_ts(p.get("created")),
+        "status": "未检测",
+        "edit": "✎",
         "_raw": p,
     }
 
@@ -282,6 +370,7 @@ def blank_record(proto: str = "ssh") -> dict:
         "name": "", "host": "", "port": "22" if proto != "telnet" else "23",
         "user": "", "auth": "key", "key_path": "", "proto": proto,
         "group": "", "tags": "", "note": "", "cred_id": "", "proxy_id": "",
+        "ostype": "", "os_name": "",
         "remember": False, "password": "", "key_passphrase": "",
         "sudo_password": "", "sudo": False, "elevate": False, "shell": "",
         "created": str(now_ts()), "last_used": "",
@@ -292,7 +381,7 @@ def record_from_form(data: dict, base: dict | None = None) -> dict:
     """表单值 → 档案记录。保留 base 里的口令等不可见字段。"""
     out = dict(base or blank_record())
     for k in ("name", "host", "port", "user", "auth", "key_path", "proto",
-              "group", "note", "cred_id", "proxy_id", "shell"):
+              "group", "note", "cred_id", "proxy_id", "shell", "ostype"):
         if k in data:
             out[k] = str(data.get(k) or "").strip()
     for k in ("sudo", "elevate"):

@@ -17,8 +17,10 @@ import _shots as SH  # noqa: E402
 
 import app as appmod  # noqa: E402
 
-# 清锁，别让截图停在锁屏上
-_cfg = HERE / "data" / "settings.json"
+# 清锁，别让截图停在锁屏上。改的是临时副本 —— 以前直接清真实
+# settings.json，跑一次就把用户设的锁屏密码删了，而且不还原。
+SH.isolate("tbshot_ai_")
+_cfg = Path(appmod.DATA_DIR) / "settings.json"
 if _cfg.is_file():
     try:
         d = json.loads(_cfg.read_text(encoding="utf-8"))

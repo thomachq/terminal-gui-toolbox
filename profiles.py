@@ -31,6 +31,10 @@ PROFILE_FIELDS = (
     "proto", "group", "tags", "cred_id", "proxy_id",
     # ---- 本机协议专用（v1.0.7）：Linux 是 sudo，Windows 是 UAC + 外壳
     "sudo", "elevate", "shell",
+    # ---- 目标系统（v1.0.9）：ostype 决定提权问 sudo 还是 enable；
+    # os_name 是连上之后 detect() 探到的具体版本名（Debian 12 / Windows 11），
+    # 只用来显示，不含任何凭据。
+    "ostype", "os_name",
     "created", "last_used",
 )
 

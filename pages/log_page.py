@@ -108,6 +108,12 @@ class LogPage:
             self.toast(f"读日志失败：{e}", "err")
             evs = []
         self._audit_events = evs
+        # 日志面板现在是底部 dock，点了才建。在那之前筛选控件、表格都还不存在，
+        # 直接往下走会 AttributeError（`_restest2` 就是这么炸的）。
+        # 这里只负责把数据读进来；等 build_log 建好界面，它会自己再调一次。
+        if getattr(self, "tbl_audit", None) is None:
+            self._audit_loaded = True
+            return
         groups = ["全部分类"] + A.groups()
         statuses = ["全部状态"] + [A.STATUS[k][0] for k in A.STATUS_KEYS]
         for cb, var, opts in ((self.cb_audit_group, self.v_audit_group, groups),
@@ -131,6 +137,9 @@ class LogPage:
         self._audit_apply()
 
     def _audit_apply(self) -> None:
+        # 界面还没建（dock 没打开）就没什么可刷的 —— 数据在 audit_reload 里已经缓存
+        if getattr(self, "tbl_audit", None) is None:
+            return
         evs = list(getattr(self, "_audit_events", []))
         st = self.v_audit_status.get()
         gr = self.v_audit_group.get()

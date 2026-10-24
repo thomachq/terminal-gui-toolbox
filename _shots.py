@@ -7,12 +7,14 @@
 每页单独起一个进程（--page X），等它把数据拉完再抓，抓完立刻关掉。
 锁屏那张会临时往 data\\settings.json 写一个锁，抓完原样还原。
 """
+import atexit
 import ctypes
 import ctypes.wintypes as wt
 import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -23,6 +25,40 @@ PY = sys.executable
 OUT = HERE / "screenshots"
 TITLE = "Terminal GUI Toolbox"
 SETTINGS = HERE / "data" / "settings.json"
+#: isolate() 之后指向临时副本里的 data 目录，没隔离时是 None
+SHOT_DATA_DIR = None
+
+
+def isolate(prefix="tbshot_", skip=("ca", "logs", "agent_sessions", "output")):
+    """把 app 的 data 目录切到「临时副本」，跑完自动删。
+
+    为什么必须：截图脚本经常要「造几条 demo 档案 / demo 模型」才看得出
+    观感，以前它们直接写真实 data —— 2026-10-24 `_shot_model.py` 先清空
+    ollama 的模型列表再灌 demo，`_shot_host.py` 又 upsert 了 6 条假主机，
+    把用户真实的档案和模型表一起覆盖掉，而且没有更早的备份可恢复。
+    凡是要往盘上写的截图脚本，建 App 之前先调这个：
+    改的是临时副本，真实 data 一个字节都不动。
+
+    要保留的东西（`.vpncert-key`）在副本里照样有一份，所以密文档案
+    在副本里仍然读得开；`ca/`（CA 私钥）不复制，少一份私钥落临时目录。
+    """
+    global SHOT_DATA_DIR
+    import app as appmod
+
+    real = Path(appmod.DATA_DIR)
+    td = Path(tempfile.mkdtemp(prefix=prefix))
+    dst = td / "data"
+    if real.is_dir():
+        shutil.copytree(real, dst, ignore=shutil.ignore_patterns(*skip),
+                        dirs_exist_ok=True)
+    else:
+        dst.mkdir(parents=True, exist_ok=True)
+
+    appmod.APP_DIR = td
+    appmod.DATA_DIR = dst
+    SHOT_DATA_DIR = dst
+    atexit.register(shutil.rmtree, td, True)
+    return td
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
