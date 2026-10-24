@@ -521,6 +521,10 @@ terminal-gui-toolbox/
 ├─ THIRD-PARTY-NOTICES.md  第三方组件归属与许可证
 ├─ .gitignore           排除 data/、*.exe、build/ 等
 ├─ assets/app.ico       应用图标（_mkicon.py 生成）
+├─ docs/                长文档与交付文档模板
+│  ├─ 改造说明-AI运维与宝塔对齐.md
+│  ├─ 模板-项目交接说明.md   交付文档**模板**：打包时代入版本号生成，改内容改这里
+│  └─ 模板-deb构建说明.md    Linux 打 deb 说明的模板（同上）
 ├─ app.py               主程序：十一页导航 + 状态栏 + 日志侧边栏 + 应用锁 + 托盘
 ├─ core/
 │  ├─ detect.py         设备/系统探测 + 命令方言

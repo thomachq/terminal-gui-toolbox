@@ -1,26 +1,31 @@
 # -*- coding: utf-8 -*-
-"""打 v1.0.7 的四个交付包。
+"""打四个交付包（知识库 / 工具包 / 便携包 / github 快照）。
 
 为什么用脚本而不是右键压缩：
   · 排除项（data / .git / build / __pycache__ / *.bak）漏一个就会把 CA 私钥
     或几百兆缓存塞进包里；
   · 四个包的取舍不一样（知识库只放文档、工具包放源码、portable 只放能跑的），
-    写死在一处，下次发版改版本号就能复用。
+    写死在一处，下次发版改版本号就能复用；
+  · 交付文档（交接说明 / deb 构建说明）从这里由 `render_docs()` 代入版本号生成，
+    不再依赖有人记得手工往 `_release/<版本>/` 里放。
 
-用法：  python _pack_release.py
-产物：  _release/<版本>/ 下的四个 zip
+用法：  python _pack_release.py [--only kb,kit,portable,github]
+产物：  _release/<版本>/ 下的四个 zip + 两份 Markdown
 """
 from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import shutil
 import subprocess
 import sys
 import zipfile
+from datetime import date
+from email.utils import formatdate
 from pathlib import Path
 
-VER = "1.0.13"
+VER = "1.0.14"
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "_release" / f"v{VER}"
 STAMP = (2026, 10, 24, 17, 0, 0)
@@ -107,8 +112,18 @@ def add_tree(zf: zipfile.ZipFile, root: Path, arc_prefix: str = "",
     return n
 
 
-def add_file(zf: zipfile.ZipFile, src: Path, arc: str) -> bool:
+def add_file(zf: zipfile.ZipFile, src: Path, arc: str,
+             required: bool = False) -> bool:
+    """把一个文件写进包。`required=True` 且文件不存在时**抛错**。
+
+    默认静默返回 False 是有意的：可选文档（截图、第三方声明）缺了不该阻断发版。
+    但**交付清单上的东西必须是 required** —— 那两份说明文档当年就栽在这里：
+    `add_file` 悄悄返回 False，`_deploy_share.py` 又悄悄「跳过（本地没有）」，
+    共享盘上的交接说明从 v1.0.6 一直停到 v1.0.12，七个版本没人发现。
+    """
     if not src.is_file():
+        if required:
+            raise FileNotFoundError(f"必需文件缺失：{src}")
         return False
     info = zipfile.ZipInfo(arc.replace("\\", "/"), STAMP)
     info.compress_type = zipfile.ZIP_DEFLATED
@@ -117,35 +132,91 @@ def add_file(zf: zipfile.ZipFile, src: Path, arc: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- 0. 文档渲染
+DOC_TPL = HERE / "docs"
+
+
+def _fill(text: str, ctx: dict, name: str = "模板") -> str:
+    """替换 `{{KEY}}` 占位符；替换完还有残留就抛错。
+
+    单独抽出来是为了能脱离文件系统测：`render_docs()` 里那层 try/except
+    只负责把错误转成退出码，判断「有没有漏替换」的规则在这里。
+    """
+    for k, v in ctx.items():
+        text = text.replace("{{" + k + "}}", v)
+    left = sorted(set(re.findall(r"\{\{([A-Za-z_]+)\}\}", text)))
+    if left:
+        raise ValueError(f"{name} 里有未替换的占位符：{', '.join(left)}")
+    return text
+
+
+def render_docs() -> list[Path]:
+    """把 `docs/模板-*.md` 渲染成当前版本的交付文档，写进 `_release/v<VER>/`。
+
+    以前这两份是手工放进 `_release/<版本>/` 的：忘了放就等于没交付，而且
+    `add_file()` 静默 False + 部署脚本静默跳过，整整七个版本没人发现。
+    现在模板进仓库（能 diff、能 review），打包时自动代入版本号，渲染完还会
+    扫一遍有没有漏替换的 `{{...}}`——有就直接抛错，绝不让半成品流出去。
+    """
+    ctx = {
+        "VER": VER,
+        "VER_V": "v" + VER,
+        "DATE": date.today().isoformat(),
+        # debian/changelog 要的格式：Sat, 24 Oct 2026 23:10:00 +0800
+        "DATE_RFC2822": formatdate(localtime=True),
+    }
+    pairs = (
+        ("模板-项目交接说明.md", "terminal-gui-toolbox项目交接说明.md"),
+        ("模板-deb构建说明.md", f"terminal-gui-toolbox-deb构建说明-{VER}.md"),
+    )
+    made: list[Path] = []
+    for tpl_name, out_name in pairs:
+        tpl = DOC_TPL / tpl_name
+        if not tpl.is_file():
+            raise FileNotFoundError(f"文档模板不存在：{tpl}")
+        text = _fill(tpl.read_text(encoding="utf-8"), ctx, tpl_name)
+        dst = OUT / out_name
+        dst.write_text(text, encoding="utf-8", newline="\n")
+        made.append(dst)
+    return made
+
+
 # ---------------------------------------------------------------- 1. 知识库
 def make_kb() -> Path:
     """文档集合：给接手的人看的，不含任何可执行文件。"""
     out = OUT / "terminal-gui-toolbox项目知识库.zip"
     docs = [
-        (HERE / "README.md", "README.md"),
-        (HERE / "使用说明.txt", "使用说明.txt"),
-        (HERE / "LICENSE", "LICENSE"),
-        (HERE / "THIRD-PARTY-NOTICES.md", "THIRD-PARTY-NOTICES.md"),
-        (HERE / "docs" / "改造说明-AI运维与宝塔对齐.md", "docs/改造说明-AI运维与宝塔对齐.md"),
-        (OUT / "terminal-gui-toolbox项目交接说明.md", "terminal-gui-toolbox项目交接说明.md"),
+        (HERE / "README.md", "README.md", True),
+        (HERE / "使用说明.txt", "使用说明.txt", True),
+        (HERE / "LICENSE", "LICENSE", True),
+        (HERE / "THIRD-PARTY-NOTICES.md", "THIRD-PARTY-NOTICES.md", True),
+        (HERE / "docs" / "改造说明-AI运维与宝塔对齐.md",
+         "docs/改造说明-AI运维与宝塔对齐.md", True),
+        (OUT / "terminal-gui-toolbox项目交接说明.md",
+         "terminal-gui-toolbox项目交接说明.md", True),
         (OUT / f"terminal-gui-toolbox-deb构建说明-{VER}.md",
-         f"terminal-gui-toolbox-deb构建说明-{VER}.md"),
+         f"terminal-gui-toolbox-deb构建说明-{VER}.md", True),
     ]
-    extra_docs = [p for p in (HERE / "docs").glob("*.md")]
+    # docs/ 下的模板不进知识库：知识库要的是渲染好的成品，模板留给工具包
+    # （接手的人改的是模板）。否则包里两份「交接说明」并排，看的人会懵。
+    extra_docs = [p for p in (HERE / "docs").glob("*.md")
+                  if not p.name.startswith("模板-")]
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
         # 显式清单和 docs/*.md 通配会撞名（改造说明那篇两边都有）。
         # 记一下已经写进去的路径，重复的跳过 —— 否则 zipfile 会警告，
         # 而且同一份文档在包里出现两次，用户解开看着也奇怪。
         done: set[str] = set()
 
-        def once(src: Path, arc: str) -> None:
+        def once(src: Path, arc: str, required: bool = False) -> None:
             key = arc.replace("\\", "/")
-            if key in done or not add_file(zf, src, key):
+            if key in done:
+                return
+            if not add_file(zf, src, key, required=required):
                 return
             done.add(key)
 
-        for src, arc in docs:
-            once(src, arc)
+        for src, arc, required in docs:
+            once(src, arc, required)
         for p in extra_docs:
             once(p, f"docs/{p.name}")
         # 几张关键界面图，纯文档用
@@ -162,9 +233,9 @@ def make_kit() -> Path:
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
         add_tree(zf, HERE, "terminal-gui-toolbox")
         add_file(zf, OUT / "terminal-gui-toolbox项目交接说明.md",
-                 "terminal-gui-toolbox/项目交接说明.md")
+                 "terminal-gui-toolbox/项目交接说明.md", required=True)
         add_file(zf, OUT / f"terminal-gui-toolbox-deb构建说明-{VER}.md",
-                 f"terminal-gui-toolbox/deb构建说明-{VER}.md")
+                 f"terminal-gui-toolbox/deb构建说明-{VER}.md", required=True)
     return out
 
 
@@ -307,6 +378,14 @@ def main() -> int:
               + "；可选 " + ", ".join(sorted(known)))
         return 2
     OUT.mkdir(parents=True, exist_ok=True)
+    # 文档先渲染再打包：kb / kit 都要从 _release/<VER>/ 取那两份成品
+    try:
+        docs = render_docs()
+    except (OSError, ValueError) as e:
+        print(f"[error] 文档渲染失败，一个包都不打：{e}")
+        return 1
+    for d in docs:
+        print(f"[info] 渲染 {d.name}  {d.stat().st_size} bytes")
     made = []
     if not only or "kb" in only:
         made.append(make_kb())

@@ -41,6 +41,15 @@ def files(v: str) -> list[str]:
     ]
 
 
+def missing(v: str, src_dir: Path) -> list[str]:
+    """六个交付件里缺了哪些（抽成函数是为了能脱离网络单测）。
+
+    这些是**交付清单**，不是「有就带上」的附件：少一个就说明这一版没打全，
+    此时部署只会把共享盘刷成半新半旧的状态。
+    """
+    return [n for n in files(v) if not (src_dir / n).is_file()]
+
+
 def archive(p: Path, name: str) -> None:
     """把旧文件挪进 old/。挪不动不算错，最多少一份留档。
 
@@ -83,14 +92,27 @@ def main() -> int:
     if not DST.is_dir():
         print("共享目录不可达：", DST)
         return 2
+
+    # 预检：六个交付件一个都不能少。以前是「缺了就跳过」，于是交接说明与 deb
+    # 说明在共享盘上从 v1.0.6 卡到 v1.0.12 —— 那行「跳过（本地没有）」混在
+    # 几十行输出里，谁也没看见。现在缺一个就整轮拒绝：**半套交付比不交付更糟**，
+    # 用户拿到一份旧文档，会以为那就是当前版本的说明。
+    miss = missing(v, src_dir)
+    if miss:
+        print(f"!! 交付不完整（v{v}），缺 {len(miss)} 个文件，拒绝部署：")
+        for m in miss:
+            print("   -", m)
+        print("   先跑 python _pack_release.py 补齐，再来分发。")
+        return 2
+
     OLD.mkdir(exist_ok=True)
 
     print(f"→ {DST}   (v{v})")
     for name in files(v):
         src = src_dir / name
-        if not src.is_file():
-            print("跳过（本地没有）", name)
-            continue
+        if not src.is_file():          # 预检已保证不会走到这
+            print("!! 预检漏了，运行时才发现缺文件：", name)
+            return 1
         dst = DST / name
         if dst.is_file() and dst.stat().st_size == src.stat().st_size:
             print("尺寸一致，跳过覆盖", name)
@@ -109,14 +131,11 @@ def main() -> int:
         print("  已写 %-52s %7.1f MB" % (name, dst.stat().st_size / 1048576))
 
     # 复核：逐个比大小，别把「复制了」当成「复制对了」
-    bad = []
-    for name in files(v):
-        src, dst = src_dir / name, DST / name
-        if src.is_file() and (not dst.is_file()
-                              or dst.stat().st_size != src.stat().st_size):
-            bad.append(name)
+    bad = [n for n in files(v)
+           if not (DST / n).is_file()
+           or (DST / n).stat().st_size != (src_dir / n).stat().st_size]
     if bad:
-        print("!! 大小不符：", bad)
+        print("!! 大小不符（这几个没真正落地）：", bad)
         return 1
     print("全部就位（大小逐个核对过）")
     return 0
