@@ -194,3 +194,31 @@ class CLIClient:
         """验密码 + 顺手刷新 sudo 票据（默认 15 分钟）。"""
         ok, _ = self.run_sudo("true", password, timeout=20)
         return ok
+
+    def sudo_i(self, password: str, timeout: int = 25) -> bool:
+        """真的执行 `sudo -i`，进 root shell；之后所有命令都在这个 shell 里跑。
+
+        与 `run_sudo` 的分工：那个是「一条命令临时 sudo」，每条都要重新过一遍
+        密码提示；这个是**一次性进入 root**，和在终端里手敲 `sudo -i` 同义 ——
+        提示符变成 `#`，之后不再重复提权。
+
+        判定不靠提示符：有的发行版 root 也用 `$`，看走眼就把普通用户当 root。
+        进完跑一次 `id -u`，输出是 0 才算数。
+        """
+        if not self.alive():
+            return False
+        if not password:
+            return False
+        self._send("sudo -i\r\n")
+        head = self._drain(time.time() + 5, quiet=0.45)
+        if _PASSWORD.search(head):
+            self._send(password + "\r\n")
+            head += self._drain(time.time() + max(timeout - 5, 6), quiet=0.6)
+        # 密码错 / 不在 sudoers / 要 tty：这三种都不能假装成功
+        if _SUDO_BAD.search(head):
+            return False
+        # 密码对了也可能仍停在原 shell（sudoers 只放行了部分命令），落一锤
+        self._send("id -u\r\n")
+        out = self._drain(time.time() + 8, quiet=0.5)
+        self._remember_prompt(out)
+        return bool(re.search(r"(?m)^\s*0\s*$", out))

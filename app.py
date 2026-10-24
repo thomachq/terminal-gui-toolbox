@@ -50,7 +50,7 @@ from core.metrics import (Sampler, human_bytes, human_gb, human_rate,
                           human_uptime)
 from core.sessionmgr import SessionManager
 from core.session import (ConnSpec, LocalSession, NeedElevation, SSHSession,
-                          SessionError, open_session)
+                          SessionError, open_session, term_exec)
 from pages.ai_dock import AiDockPage
 from pages.log_dock import LogDock
 from pages.cred_page import CredPage
@@ -114,7 +114,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.14"
+APP_VER = "1.0.15"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -1902,19 +1902,21 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         if target == "network":
             title = "连接后自动进特权模式（enable）"
             pw_label = "enable 密码"
-            hint = ("交换机 / 路由器用 enable 密码。不勾选也能看，"
-                    "写操作时才会问你要密码 —— 也可以到「终端」里自己敲。")
+            hint = ("交换机 / 路由器用 enable 密码，连上就执行 enable。"
+                    "不勾选也能看，写操作时才会问你要密码。"
+                    "密码留空则不提权。")
         elif proto == "local":
             title = "使用 sudo 提权（进入后自动 sudo -i）"
             pw_label = "sudo 密码"
-            hint = ("本机的提权就是 sudo：勾选后所有命令都走 sudo -i；"
-                    "不勾选也能用，需要 root 时会弹窗问你要密码 —— "
-                    "也可以到「终端」里自己敲。")
+            hint = ("本机的提权就是 sudo：勾选后终端与页面操作都以 root 执行；"
+                    "不勾选也能用，需要 root 时会弹窗问你要密码。"
+                    "密码留空则不提权。")
         else:
             title = "使用提权（登录后自动 sudo -i）"
             pw_label = "sudo 密码"
-            hint = ("勾选后在连接时自动执行 sudo -i。不勾选也能用，"
-                    "需要提权时会弹窗问你要密码 —— 也可以到「终端」里自己敲。")
+            hint = ("勾选后在连上时真的执行一次 sudo -i 进 root，"
+                    "之后终端里敲的命令都是 root；不勾选也能用，"
+                    "需要提权时会弹窗问你要密码。密码留空则不提权。")
         U.Check(row, title, self.v_elevate,
                 command=self._elev_toggled).pack(side="left")
         U.wlabel(row, pw_label, "card", U.FONT_S).pack(side="left", padx=(14, 8))
@@ -2327,7 +2329,10 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             if spec.elevate and spec.sudo_password:
                 okadm = False
                 try:
-                    okadm = bool(s.sudo_ok(spec.sudo_password))
+                    # 真的进去：类 Unix 开一条持久 shell 执行 sudo -i，
+                    # 交换机 / 路由器走 enable。不是只验一下密码就算数 ——
+                    # 光验密码的话终端里手敲的命令仍然不带提权。
+                    okadm = bool(s.elevate_root(spec.sudo_password))
                 except Exception:  # noqa: BLE001
                     okadm = False
                 # 连上之后核实一次：密码错了不能装作生效
@@ -2335,6 +2340,8 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                     elev = "enable" if s.admin_kind == "enable" else "sudo -i"
                 else:
                     elev = "failed"
+            elif spec.elevate:
+                elev = "nopw"
             return s, dev, elev
 
         def ok(res):
@@ -2366,8 +2373,13 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             if elev == "failed":
                 self._log_raw("bad", "[提权] 密码没通过，需要时再问你要一次\n")
                 self.status.set_state("已连接（提权未生效）", "warn")
+            elif elev == "nopw":
+                self._log_raw("warn", "[提权] 勾了「连接后自动提权」但没填 "
+                                      "sudo / enable 密码，这次没有提权\n")
+                self.status.set_state("已连接（未提权：缺密码）", "warn")
             elif elev:
-                self._log_raw("ok", f"[提权] {elev} 已生效，之后的命令都带 root 权限\n")
+                self._log_raw("ok", f"[提权] 已进入 {elev}，终端里敲的命令"
+                                     f"与页面操作都以 root / 特权身份执行\n")
             # 勾了「记住凭据」就顺手把档案落盘 —— 口令要真的进文件，
             # 不能指望用户连通之后还想起来点一次「保存」。
             if self.v_remember.get() and self.v_prof.get().strip():
@@ -2834,7 +2846,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         def work():
             t0 = time.time()
             try:
-                rc, out, err = s.run_traced(full, timeout=180)
+                # 提权生效了就走提权通道（root shell / sudo / 设备 enable），
+                # 否则与以前一样普通执行。见 core.session.term_exec。
+                rc, out, err = term_exec(s, full, timeout=180)
             except Exception as e:  # noqa: BLE001
                 rc, out, err = 1, "", str(e)
             done(rc, out, err, int((time.time() - t0) * 1000))

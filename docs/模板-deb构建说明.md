@@ -159,6 +159,12 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * Fixed: "auto-elevate on connect" did not elevate the terminal. The option
+    only verified the password, and terminal commands went through an
+    unprivileged channel, so `id` still showed the login user. Elevation now
+    really runs `sudo -i` in a persistent shell (or `enable` on switches) and
+    terminal commands are dispatched through it.
+  * Elevating without a password is now reported instead of silently skipped.
   * Delivery docs are now rendered from templates in docs/ by the release
     script, so the handover and .deb guides can no longer silently go stale.
   * deploy_share.py now refuses to deploy when any of the six artifacts is

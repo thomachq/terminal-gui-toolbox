@@ -124,6 +124,9 @@ class BaseSession:
         self.user = ""
         self.label = ""
         self.is_root = False        # 探测到 root/管理员后由上层写入
+        # 提权是否**已经生效**（不是「有密码」，是「验过并且真的进去了」）。
+        # 终端靠它决定命令走不提权通道还是 root 通道。
+        self.elevated = False
 
     # ---------------- 由子类实现
     def run(self, cmd: str, timeout: int = 30) -> tuple[int, str, str]:
@@ -292,11 +295,17 @@ class LocalSession(BaseSession):
         return windows_argv(cmd)     # 自动：看命令自己有没有 powershell 前缀
 
     def sudo_ok(self, pw: str) -> bool:
-        """在本机类 Unix 上验一次 sudo 密码（sudo -v 只刷时间戳，不执行命令）。"""
+        """在本机类 Unix 上验一次 sudo 密码（sudo -v 只刷时间戳，不执行命令）。
+
+        本机没有「持久 shell」可进（每个命令都是独立的子进程），所以提权
+        只体现在 `elevated` 上：终端与页面操作改走 `run_admin()`，
+        由它在每条命令前面套 `sudo -S`。
+        """
         if self.is_windows:
             return False
         self.sudo_pw = pw
         rc, _, _ = self._exec(["sudo", "-S", "-p", "", "-v"], 20, pw + "\n")
+        self.elevated = rc == 0
         return rc == 0
 
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
@@ -345,6 +354,7 @@ class SSHSession(BaseSession):
         self.sudo_pw: str | None = None
         self._sftp = None
         self._cli = None            # 交换机 / 路由器用的持久 shell
+        self._root_shell = None     # sudo -i 之后的 root 持久 shell（见 elevate_root）
         self.enabled = False        # 网络设备是否已进 enable
         self.vendor = ""            # detect 之后由 bind_device 补上，关分页要用
 
@@ -387,6 +397,13 @@ class SSHSession(BaseSession):
         return bool(tr and tr.is_active())
 
     def close(self) -> None:
+        try:
+            if self._root_shell:
+                self._root_shell.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._root_shell = None
+        self.elevated = False
         try:
             if self._cli:
                 self._cli.close()
@@ -439,14 +456,6 @@ class SSHSession(BaseSession):
         err = decode_bytes(stderr.read())
         rc = stdout.channel.recv_exit_status()
         return rc, out, err
-
-    def sudo_ok(self, pw: str) -> bool:
-        self.sudo_pw = pw
-        try:
-            rc, _, _ = self.run("id -u", sudo=True, timeout=20)
-            return rc == 0
-        except Exception:  # noqa: BLE001
-            return False
 
     # ---------------- 提权（看设备类型，不看协议）
     # SSH 连服务器是 sudo；SSH 连交换机 / 路由器就是 enable + 配置视图。
@@ -512,13 +521,59 @@ class SSHSession(BaseSession):
             if ok:
                 self.sudo_pw = pw
                 self.is_root = True
+                self.elevated = True
             return ok
         self.sudo_pw = pw
         try:
             rc, _, _ = self.run("id -u", sudo=True, timeout=20)
+            self.elevated = rc == 0
             return rc == 0
         except Exception:  # noqa: BLE001
             return False
+
+    def elevate_root(self, pw: str) -> bool:
+        """「连接后自动提权」的真正落地：**进去**，而不是每条命令再 sudo 一次。
+
+        · 交换机 / 路由器 -> `enable`（进特权视图）
+        · 类 Unix 服务器 -> 开一条持久 shell 执行 `sudo -i`
+        · 登录用户本来就是 root -> 什么都不用做
+
+        为什么必须开持久 shell：`exec_command` 每条都是新通道，`sudo -i`
+        进去就退出来了，状态带不过去。而终端里手敲的命令走的正是这条 shell，
+        所以进去之后敲 `id` 就是 0，不是每条命令重新过一遍密码。
+        """
+        if self.host_kind == "network":
+            return self.sudo_ok(pw)
+        if self.is_root or self.user == "root":
+            self.elevated = True
+            return True
+        if not pw:
+            return False
+        if self._root_shell is not None and self._root_shell.alive():
+            self.elevated = True
+            return True
+        try:
+            from core.ssh_shell import SSHShellClient
+            sh = SSHShellClient(self.client)
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            ok = bool(sh.sudo_i(pw))
+        except Exception:  # noqa: BLE001
+            ok = False
+        if not ok:
+            try:
+                sh.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        self._root_shell = sh
+        self.sudo_pw = pw
+        self.elevated = True
+        # 刻意**不动 is_root**：它表示「登录用户本身就是 root」。
+        # 这里只是多了一条 root shell，exec 通道还是原用户，
+        # run_admin 该走 sudo 的还得走 sudo。
+        return True
 
     def can_admin(self) -> tuple[bool, str]:
         if self.host_kind == "network":
@@ -614,12 +669,14 @@ class TelnetSession(BaseSession):
             if ok:
                 self.sudo_pw = pw
                 self.is_root = True
+                self.elevated = True
             return ok
         ok = self._impl.enable(pw)
         self.enabled = bool(ok)
         if ok:
             self.sudo_pw = pw
             self.is_root = True
+            self.elevated = True
         return ok
 
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
@@ -687,3 +744,33 @@ def open_session(spec: ConnSpec) -> BaseSession:
               key_path=spec.key_path if spec.auth == "key" else None,
               key_passphrase=spec.key_passphrase or None)
     return s
+
+
+def term_exec(s: BaseSession, cmd: str,
+              timeout: int = 180) -> tuple[int, str, str]:
+    """终端里的一条命令怎么跑 —— 提权生效了就走提权通道。
+
+    这是「勾了自动提权、终端里还是普通用户」的修复点。以前终端固定调
+    `run_traced()`，那是**不带任何提权**的通道；只有页面上那些显式调
+    `run_admin()` 的按钮才带 sudo。于是提示写着「之后的命令都带 root」，
+    用户在终端里敲 `id` 看到的还是自己。
+
+    三档优先级：
+      1. 有 `sudo -i` 进出来的 root 持久 shell -> 直接发给它
+      2. 提权已生效但没有持久 shell（本机类 Unix / 交换机 enable）
+         -> 走 `run_admin()`，由它决定是套 sudo 还是发给设备 CLI
+      3. 都没提权 -> 普通执行，与以前完全一致
+    """
+    sh = getattr(s, "_root_shell", None)
+    if sh is not None:
+        try:
+            if sh.alive():
+                return 0, sh.command(cmd, timeout=timeout), ""
+        except Exception as e:  # noqa: BLE001
+            return 1, "", str(e)
+    if getattr(s, "elevated", False):
+        try:
+            return s.run_admin(cmd, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            return 1, "", str(e)
+    return s.run_traced(cmd, timeout=timeout)
