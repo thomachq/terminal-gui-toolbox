@@ -43,6 +43,7 @@ from core import hosts as hosts_core
 from core import proxies as proxies_core
 from core import scripts as scripts_core
 from core import redact
+from core import singleinstance
 from core import winstate
 from core.detect import DeviceInfo, capabilities, detect, dialect_for
 from core.metrics import (Sampler, human_bytes, human_gb, human_rate,
@@ -113,7 +114,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.11"
+APP_VER = "1.0.12"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -325,6 +326,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             self.after(500, self.log_dock_open)
         self._maybe_lock_on_start()
         self.after(600, self._boot_api)
+        # 单实例：第二个进程双击时会把我们叫醒（见 core/singleinstance.py）。
+        # 轮询而不是等 Win32 消息 —— Tk 不暴露窗口过程，收不到自定义消息。
+        self.after(700, self._wake_poll)
 
     # ============================================================ 骨架
     def _header(self):
@@ -966,6 +970,27 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             self.deiconify()
             self.lift()
             self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _wake_poll(self) -> None:
+        """有人又双击了一次程序图标 → 把自己叫到前台。
+
+        「参考微信」：只允许一个进程，第二次双击就把已有窗口弹出来，
+        而不是默默多开一份（多开会各自写一套 data，托盘里还两个图标）。
+        """
+        try:
+            if singleinstance.consume():
+                self._show_from_tray()
+                try:
+                    self.status.set_state(
+                        "已经有一个窗口在运行，给你叫到前面来了", "warn")
+                except (AttributeError, tk.TclError):
+                    pass
+        except Exception:  # noqa: BLE001  单实例是锦上添花，不能拖垮主循环
+            pass
+        try:
+            self.after(700, self._wake_poll)
         except tk.TclError:
             pass
 
@@ -3587,6 +3612,16 @@ def main():
 
     # 证书控制台已经内嵌在「隧道客户端证书管理」页里，不再有 --vpncert 子进程形态。
     # 想单独调它可以直接 `python vpncert_gui.py`（它自己能独立跑）。
+
+    # 单实例（参考微信）：已经有一套在跑，就把那个窗口叫到前台，自己退出。
+    # 测试/截图参数一律跳过 —— _texe 会连着起好几次窗口，_shot_* 也常常和
+    # 用户自己开着的那个并存，加了限制就互相挡死了。
+    _NO_SINGLETON = ("--smoke", "--page", "--no-probe", "--dark", "--version")
+    if not any(a in sys.argv for a in _NO_SINGLETON):
+        if not singleinstance.acquire():
+            singleinstance.wake()           # 叫醒它（本版本起会自己弹到前台）
+            singleinstance.bring_to_front(APP_NAME)  # 老版本收不到事件，兜底
+            return
 
     if "--dark" in sys.argv:
         U.T = U.DARK

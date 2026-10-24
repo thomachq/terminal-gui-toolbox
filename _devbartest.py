@@ -247,7 +247,11 @@ win2._host_rows_all = [{"host": "127.0.0.1", "port": "9", "proto": "ssh",
 win2._probe_at = 0.0
 win2._probe_retry = 0
 win2._maybe_auto_probe()
-pump(win2, 0.8)
+# 别用固定等待：机器忙的时候（整套回归跑着 40 多个窗口）after(350) 可能
+# 迟迟排不到，等 3 秒更稳，正常情况下几十毫秒就命中。
+_deadline = time.time() + 3.0
+while time.time() < _deadline and not hit:
+    pump(win2, 0.1)
 chk(bool(hit), "映射好了：自动探测被触发", f"hit={len(hit)}")
 
 # 页面没映射时不该放弃，而是排重试
@@ -258,7 +262,9 @@ win2._probe_at = 0.0
 hit.clear()
 win2._maybe_auto_probe()
 chk(win2._probe_retry == 1, "页面没映射：排了一次重试", f"retry={win2._probe_retry}")
-pump(win2, 0.8)
+_deadline = time.time() + 3.0
+while time.time() < _deadline and win2._probe_retry < 2:
+    pump(win2, 0.1)
 chk(win2._probe_retry >= 2, "重试链继续往下走", f"retry={win2._probe_retry}")
 chk(not hit, "没映射时没真去探测（不瞎扫）", f"hit={len(hit)}")
 win2.destroy()
