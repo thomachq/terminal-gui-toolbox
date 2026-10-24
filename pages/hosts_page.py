@@ -484,13 +484,35 @@ class HostsPage:
             out.append(row)
         return out
 
+    def _local_live(self) -> bool:
+        """本机会话现在是不是连着。
+
+        本机不占 DeviceSlot（它的 sid 是空串），所以只能看当前活动会话：
+        活动设备是远程时，本机即便还能用也不算「正在连这台」。
+        """
+        if str(getattr(self.sessions, "active_id", "") or ""):
+            return False
+        s = getattr(self, "session", None)
+        if s is None:
+            return False
+        try:
+            if str(getattr(s, "kind", "") or "").lower() != "local":
+                return False
+            return bool(s.alive)
+        except Exception:  # noqa: BLE001
+            return False
+
     def _host_status(self, rec: dict) -> tuple[str, str]:
         """这一行现在什么状态 → (文案, 色调)。
 
         优先级：已连接的活会话 > 上次探测结果 > 未检测。
         活会话优先，因为「连着」比「端口通」是更强的事实。
+        本机以前一律返回「● 本机」，于是连着本机的时候状态列永远看不到
+        「已连接」—— 用户说的「连接状态依然没有」有一半是这个。
         """
         if H.proto_of(rec) == "local":
+            if self._local_live():
+                return STATUS_TEXT["live"], "ok"
             return STATUS_TEXT["local"], "ok"
         host = str(rec.get("host") or "").strip().lower()
         port = str(rec.get("port") or "").strip()
@@ -576,6 +598,11 @@ class HostsPage:
 
         状态列如果默认全是「未检测」，等于没有这一列 —— 用户不会为了看红绿灯
         先去点一次按钮。所以第一次进这个页面就在后台探一轮，之后按 PROBE_TTL 节流。
+
+        以前这里把 `winfo_ismapped()` 当硬门槛：页面还在构建、或者窗口刚建还没
+        映射上去，它返回 False，于是**一次都没探过**，用户打开就是满屏「未检测」
+        （截图反馈的「连接状态依然没有」就是这个）。现在改成：没映射就隔一会儿
+        再看，最多试几次；页面被别的页盖住时不算失败。
         """
         if getattr(self, "_no_probe", False):
             return
@@ -586,10 +613,19 @@ class HostsPage:
         if time.time() - getattr(self, "_probe_at", 0.0) < PROBE_TTL:
             return
         try:
-            if not self.hosts_box.winfo_ismapped():
-                return
+            mapped = bool(self.hosts_box.winfo_ismapped())
         except (AttributeError, tk.TclError):
+            mapped = False
+        if not mapped:
+            n = int(getattr(self, "_probe_retry", 0))
+            if n < 15:                      # 15 × 400ms ≈ 6 秒，够窗口映射完了
+                self._probe_retry = n + 1
+                try:
+                    self.after(400, self._maybe_auto_probe)
+                except tk.TclError:
+                    pass
             return
+        self._probe_retry = 0
         try:
             self.after(350, self.host_probe)
         except tk.TclError:

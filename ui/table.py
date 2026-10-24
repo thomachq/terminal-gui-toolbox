@@ -147,6 +147,9 @@ class DataTable(tk.Frame):
         self._fit_job = None
         self._sbx_job = None
         self._sbx_need = False
+        # 光标整顿用：排一个 idle 任务在 ttk 自己的 <Motion> 之后判定
+        self._cur_job = None
+        self._cur_xy: tuple[int, int] | None = None
 
         # ---- 工具条
         self.toolbar = U.wframe(self, bg_role)
@@ -321,12 +324,41 @@ class DataTable(tk.Frame):
             pass
 
     def _maybe_reset_cursor(self, event) -> None:
-        """鼠标在表格上移动：左键已经松开却还顶着拖拽光标，就地还原。"""
+        """鼠标在表格上移动：把不该出现的拖拽光标及时收掉。
+
+        这里有个坑 —— ttk::treeview 自己那条 <Motion> 是**类绑定**，执行顺序在
+        本控件的绑定**之后**。所以在这里直接 configure("") 是白费：ttk 随后
+        又按自己记的状态把光标设回 ↔，用户看到的就是「鼠标停在数据行的文字上
+        还顶着左右箭头」（截图就是这个现象）。
+
+        改成排一个 idle 任务：idle 排在本次事件所有绑定跑完之后，那时 ttk 已经
+        定完态，我们再按真实的 identify_region 纠正一次。只有指针真的压在列
+        分隔线上（separator）才留着 ↔，别处一律箭头。
+        """
         try:
             if int(getattr(event, "state", 0)) & 0x100:   # Button1 还按着
                 return
         except (TypeError, ValueError):
             return
+        self._cur_xy = (int(event.x), int(event.y))
+        if self._cur_job is None:
+            try:
+                self._cur_job = self.after_idle(self._settle_cursor)
+            except tk.TclError:
+                self._cur_job = None
+
+    def _settle_cursor(self) -> None:
+        """idle 里做真正的光标判定（这时 ttk 的绑定已经跑完）。"""
+        self._cur_job = None
+        xy = self._cur_xy
+        if xy is None:
+            return
+        try:
+            region = str(self.tree.identify_region(xy[0], xy[1]))
+        except tk.TclError:
+            return
+        if region == "separator":
+            return          # 表头上的列分隔线，↔ 是应该有的提示
         self._reset_cursor()
 
     # ------------------------------------------------------------ 主题

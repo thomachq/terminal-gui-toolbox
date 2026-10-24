@@ -113,7 +113,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.10"
+APP_VER = "1.0.11"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -121,6 +121,14 @@ APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 ·
 # 以前的脚本、截图脚本都指着它），只是指到同一页。
 # 已合并/改名的页面：旧键继续可用，--page 与旧脚本不会突然断掉。
 NAV_ALIAS = {"fw": "sec", "conn": "hosts"}
+
+# 运维工具那一组：这些页打的命令都落在「当前活动设备」上，所以顶部要显示
+# 并允许切换「操作目标」。上面那组（主机管理 / 代理池 / 凭证 / 脚本）管的是
+# 资产本身，跟连没连设备无关，不显示设备条。
+TOOL_PAGES = frozenset({
+    "tools", "sys", "files", "routes", "sec", "docker",
+    "web", "db", "cron", "vpn", "api",
+})
 
 
 SYS_COLS = {
@@ -402,12 +410,26 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             bar.pack_forget()
             self._tabs_shown = False
 
-    def _switch_device(self, sid: str):
+    def _switch_device(self, sid: str, open_term: bool = True):
+        """切到某台设备。
+
+        `open_term` —— 点顶部会话标签时是 True（用户要的是「看那台的终端」）；
+        在运维工具页用「操作目标」下拉切换时是 False（人还在当前页，别被拽走）。
+        """
         if sid and self.sessions.set_active(sid) is None:
             return
         if not sid:
             self.sessions.active_id = ""
         self._after_switch()
+        if not open_term:
+            return
+        # 点会话标签的直觉就是「看那台设备的终端」——以前切完只是把上下文换掉，
+        # 画面还停在原页面，用户点了半天以为没反应（截图反馈就是这个）。
+        # 切完顺手打开终端页签；已经开着就只是切过去，不新建第二个视图。
+        try:
+            self.open_terminal()
+        except (AttributeError, tk.TclError):
+            pass
 
     def _close_device(self, sid: str):
         slot = self.sessions.get(sid)
@@ -423,9 +445,108 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.sessions.close(sid)
         self._after_switch()
 
+    # ------------------------------------------- 运维工具顶部的「操作目标」条
+    def _build_devstrip(self) -> None:
+        strip = self.dev_strip
+        U.wlabel(strip, "操作目标", "pagedim", U.FONT_XS).pack(
+            side="left", padx=(0, U.px(6)))
+        self.cb_target = ttk.Combobox(strip, state="readonly", width=22,
+                                      font=U.FONT_S)
+        self.cb_target.pack(side="left")
+        self.cb_target.bind("<<ComboboxSelected>>", self._target_pick)
+        self.pill_target = U.Pill(strip, "未连接", "mute", font=U.FONT_XS)
+        self.pill_target.pack(side="left", padx=(U.px(8), 0))
+        U.RoundButton(strip, "去连接…", lambda: self._show("hosts"),
+                      variant="ghost", font=U.FONT_XS, height=24,
+                      padx=10).pack(side="right")
+        self._target_map: dict[str, str] = {}
+        self._rebuild_devstrip()
+
+    def _rebuild_devstrip(self) -> None:
+        """按当前会话重填下拉：本机 + 每个已连接设备。
+
+        只列「已连接」的会话 —— 运维工具发的是命令，没会话就发不出去，
+        摆一台连不上的进来只会让人以为能点。要连新机器走右上角「去连接…」。
+        """
+        cb = getattr(self, "cb_target", None)
+        if cb is None:
+            return
+        active = str(self.sessions.active_id or "")
+        local_os = "Windows" if sys.platform == "win32" else "Linux"
+        self._target_map = {}
+        vals: list[str] = []
+
+        def _add(label: str, sid: str) -> None:
+            lab, i = label, 2
+            while lab in self._target_map:   # 同名设备加序号，别出现两条一样的
+                lab = f"{label} #{i}"
+                i += 1
+            self._target_map[lab] = sid
+            vals.append(lab)
+
+        _add(f"本机 · {local_os}", "")
+        for slot in self.sessions:
+            try:
+                alive = bool(slot.alive())
+            except Exception:  # noqa: BLE001
+                alive = False
+            _add(f"{slot.label}{'' if alive else '（离线）'}", slot.sid)
+        cb["values"] = vals
+        cb.set(next((k for k, v in self._target_map.items() if v == active),
+                    vals[0]))
+        self._sync_target_pill()
+
+    def _sync_target_pill(self) -> None:
+        pill = getattr(self, "pill_target", None)
+        if pill is None:
+            return
+        active = str(self.sessions.active_id or "")
+        if not active:
+            alive = self._local_live()
+        else:
+            slot = self.sessions.get(active)
+            try:
+                alive = bool(slot is not None and slot.alive())
+            except Exception:  # noqa: BLE001
+                alive = False
+        pill.set("已连接" if alive else "未连接", "ok" if alive else "mute")
+
+    def _target_pick(self, _e=None) -> None:
+        """在运维工具页换了操作目标。
+
+        这里刻意**不**打开终端（open_term=False）：人还在系统信息 / 防火墙
+        这一页，切完设备就该就地按新设备重取，被拽到终端反而打断。
+        """
+        sid = self._target_map.get(self.cb_target.get(), "")
+        if sid == str(self.sessions.active_id or ""):
+            return
+        self._switch_device(sid, open_term=False)
+        self.status.set_state(f"操作目标 → {self.cb_target.get()}", "ok")
+
+    def _sync_devstrip(self, key: str) -> None:
+        """只有运维工具那组页面需要这条，资产类页面收起来。"""
+        strip = getattr(self, "dev_strip", None)
+        if strip is None:
+            return
+        want = key in TOOL_PAGES
+        on = bool(getattr(self, "_devstrip_on", False))
+        if want and not on:
+            strip.pack(side="top", fill="x", pady=(0, U.px(6)),
+                       before=getattr(self, "stack", None))
+            self._devstrip_on = True
+        elif not want and on:
+            strip.pack_forget()
+            self._devstrip_on = False
+        if want:
+            self._rebuild_devstrip()
+
     def _after_switch(self):
         """切换/关闭设备后的统一收尾：重画标签、作废页面缓存、按新设备重取。"""
         self._rebuild_devtabs()
+        try:
+            self._rebuild_devstrip()      # 运维工具顶部那条「操作目标」跟着变
+        except (AttributeError, tk.TclError):
+            pass
         self._local_dev = None
         self._routes_loaded = False
         self._sec_done = False
@@ -558,6 +679,15 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         body.pack(side="left", fill="both", expand=True, padx=U.px(10))
         body.pack_propagate(False)
 
+        # 「操作目标」条：运维工具那组页面（网络工具 / 系统信息 / 文件管理 /
+        # 路由表 / 安全中心 / Docker / Web / 数据库 / 计划任务 / 证书 / 智能体接入）
+        # 打的命令全落在「当前活动设备」上，但页面本身一点都不显示是哪台 ——
+        # 开了多台设备时根本分不清（用户反馈）。这里补一条常显的指示 + 切换器。
+        # 默认不 pack：只在运维工具组出现，主机资源组（资产）跟设备无关。
+        self.dev_strip = U.wframe(body, "page")
+        self._build_devstrip()
+        self._devstrip_on = False
+
         # 各页的内容容器（导航右侧）
         self.stack = U.wframe(body, "page")
         self.stack.pack(fill="both", expand=True)
@@ -637,10 +767,20 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                     page.grid_remove()
                 except tk.TclError:
                     pass
+        # 运维工具那组页面要显示「操作目标」条；资产类页面收起来。
+        # 放在 _no_probe 之前 —— 纯界面元素，截图时也得在。
+        try:
+            self._sync_devstrip(key)
+        except (AttributeError, tk.TclError):
+            pass
         # --no-probe：只画界面、不主动跑探测。截图与打包验收用得上 ——
         # 那几个探测会去调系统的 reg / schtasks，在某些受限环境里会卡住。
         if self._no_probe:
             return
+        # 每次回到主机页都补一次自动探测：TTL 内不会重复探，但「上次没探成」
+        # （页面还没映射、窗口刚建）的情况能在这里补上，不至于一直是「未检测」。
+        if key == "hosts":
+            self.after(200, self._maybe_auto_probe)
         # 页面懒加载：连上设备后再探测，免得开局就对着本机乱跑
         if key == "hosts" and not self._hosts_ready:
             self._hosts_ready = True
@@ -2547,6 +2687,11 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
     def _on_tab(self, key: str) -> None:
         if key == "hosts":
             self._ws_raise(self.ws_hosts)
+            # 从终端 / 设置那些页签切回来时，运维工具条要按当前页重新收放
+            try:
+                self._sync_devstrip(getattr(self.nav, "current", "") or "hosts")
+            except (AttributeError, tk.TclError):
+                pass
             return
         pane = self._tab_pane(key)
         if pane is not None:
