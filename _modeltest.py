@@ -202,6 +202,19 @@ chk(hasattr(f, "chips_context") and len(f.chips_context) == 6,
     "上下文有 6 个预设胶囊")
 chk(hasattr(f, "chips_max_output") and len(f.chips_max_output) == 5,
     "最大输出有 5 个预设胶囊")
+chk(not hasattr(f, "cmb_provider") and not hasattr(f, "var_prov"),
+    "表单里没有「服务商」下拉：归属由左侧选中的那一家决定")
+chk(not hasattr(f, "ent_key"),
+    "表单里没有 API Key 输入框：Key 属于服务商，改一次全下生效")
+chk(not hasattr(f, "ent_base"),
+    "表单里没有接口地址输入框：地址也属于服务商，不在每条模型上重复")
+
+# 新模型的归属就是「从哪家点进来的那一家」
+fp = _ModelForm(win, None, win.ai_cfg, default_provider="ollama")
+pump(win, 0.3)
+eq(fp._prov, "ollama", "从哪家点进来就归哪家")
+fp._cancel()
+pump(win, 0.2)
 
 # 胶囊点了要把值写进输入框
 f.chips_context[0].command()

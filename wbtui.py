@@ -783,6 +783,125 @@ class _NavItem(tk.Frame):
             pass
 
 
+class ScrollBox(tk.Frame):
+    """竖向滚动容器：Canvas + 内嵌 Frame，滚轮按指针位置路由。
+
+    Tk 没有现成的「滚动画布」。以前两处（助手侧栏、设置页）各写一份，
+    都用 `<Enter>` 抢 `bind_all`、`<Leave>` 解绑 —— 结果指针一移到卡片上
+    （卡片是 Canvas 的子控件，盖住了内胆）就收到 Leave，滚轮当场失效，
+    表现为「在这个区域滚不动，得挪到卡片之间的缝里」。
+
+    这里换一种判法：把滚轮绑在**本窗口的 toplevel** 上，事件来了从
+    `event.widget` 沿着 master 链往上走，先碰到哪个滚动容器的内胆就归谁滚。
+      · 不依赖 Enter/Leave，卡片怎么叠都行；
+      · 不依赖 `winfo_containing`（那个走 WindowFromPoint，窗口被别的程序
+        盖住就返回 None，结论会随桌面状态变）；
+      · 遇到 Text / Listbox / Treeview 直接让开 —— 它们自己能滚。
+    """
+
+    def __init__(self, master, bg: str | None = None, **kw):
+        bg = T.page if bg is None else bg
+        super().__init__(master, bg=bg, bd=0, **kw)
+        self.cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.vs = tk.Scrollbar(self, orient="vertical", command=self.cv.yview,
+                               width=px(10), bd=0, relief="flat")
+        self.cv.configure(yscrollcommand=self.vs.set)
+        # 先 pack 滚动条、再 pack 画布：画布带 expand，先 pack 会把整条宽度吃光，
+        # 滚动条只能分到 1px（表现为「滚动条不见了，滚轮也压不到它」）。
+        self.vs.pack(side="right", fill="y")
+        self.cv.pack(side="left", fill="both", expand=True)
+        self.inner = tk.Frame(self.cv, bg=bg, bd=0)
+        # 标记：嵌套滚动容器时，从里往外找，先碰到谁就归谁滚
+        self.inner._is_scroll_inner = True
+        self._win = self.cv.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._grow)
+        self.cv.bind("<Configure>", self._fit)
+        self.vs.bind("<MouseWheel>", self._wheel)
+        self._wheel_ids: list[str] = []
+        self._bind_wheel()
+        self.bind("<Destroy>", self._unbind_wheel, add="+")
+
+    # ---------------------------------------------------------- 滚轮
+    def _bind_wheel(self) -> None:
+        try:
+            top = self.winfo_toplevel()
+        except tk.TclError:
+            return
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self._wheel_ids.append(top.bind(seq, self._wheel, add="+"))
+            except tk.TclError:
+                pass
+
+    def _unbind_wheel(self, e=None) -> None:
+        if e is not None and getattr(e, "widget", None) is not self:
+            return
+        try:
+            top = self.winfo_toplevel()
+        except tk.TclError:
+            return
+        for seq, fid in zip(("<MouseWheel>", "<Button-4>", "<Button-5>"),
+                            self._wheel_ids):
+            try:
+                top.unbind(seq, fid)
+            except tk.TclError:
+                pass
+        self._wheel_ids = []
+
+    def _owns(self, widget) -> bool:
+        node = widget
+        while node is not None:
+            if node is self.cv or node is self.vs:
+                return True
+            if isinstance(node, (tk.Text, tk.Listbox, ttk.Treeview)):
+                return False
+            if getattr(node, "_is_scroll_inner", False):
+                return node is self.inner
+            node = getattr(node, "master", None)
+        return False
+
+    def _grow(self, _e=None) -> None:
+        try:
+            self.cv.configure(scrollregion=self.cv.bbox("all") or (0, 0, 0, 0))
+        except tk.TclError:
+            pass
+
+    def _fit(self, e) -> None:
+        try:
+            self.cv.itemconfigure(self._win, width=e.width)
+        except tk.TclError:
+            pass
+
+    def _wheel(self, e):
+        try:
+            if not self._owns(getattr(e, "widget", None)):
+                return None
+        except tk.TclError:
+            return None
+        if getattr(e, "num", None) == 4:
+            step = -3
+        elif getattr(e, "num", None) == 5:
+            step = 3
+        else:
+            step = -3 if getattr(e, "delta", 0) > 0 else 3
+        try:
+            self.cv.yview_scroll(step, "units")
+        except tk.TclError:
+            return None
+        return "break"
+
+    # ---------------------------------------------------------- 常用动作
+    def to_end(self) -> None:
+        self.update_idletasks()
+        self._grow()
+        self.cv.yview_moveto(1.0)
+
+    def clear(self) -> None:
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self.cv.yview_moveto(0.0)
+
+
 class Nav(tk.Frame):
     """左侧导航。
 

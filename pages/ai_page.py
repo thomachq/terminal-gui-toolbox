@@ -469,31 +469,34 @@ class AiPage:
                 self.toast(f"这一轮执行了 {n} 条命令", "ok")
 
 
-class SkillDialog(tk.Toplevel):
+class SkillPanel(tk.Frame):
     """技能库：看正文、装第三方技能、打开目录。
 
-    技能只是文本 —— 这个窗口里所有按钮都不执行技能目录里的任何脚本。
+    技能只是文本 —— 这个面板里所有按钮都不执行技能目录里的任何脚本。
+
+    做成 Frame 而不是 Toplevel：设置中心要把它当成一个内嵌页签
+    （「智能体 / 模型 / 技能库 / MCP 库」），另开一个窗口会让人来回找。
+    需要独立窗口时用下面的 SkillDialog 包一层。
     """
 
-    def __init__(self, parent, page):
-        super().__init__(parent)
+    def __init__(self, master, page, on_close=None):
+        super().__init__(master, bg=U.T.page, bd=0)
         self.page = page
         self.store = page.ai_skill_store
-        self.title("技能库")
-        self.configure(bg=U.T.page)
-        self.transient(parent)
+        self.on_close = on_close
         self._items: list = []
 
         wrap = U.wframe(self, "page")
-        wrap.pack(fill="both", expand=True, padx=U.px(18), pady=U.px(16))
+        wrap.pack(fill="both", expand=True, padx=U.px(14), pady=U.px(12))
 
         head = U.wframe(wrap, "page")
         head.pack(fill="x")
         U.wlabel(head, "技能库", "page", U.FONT_T).pack(side="left")
         self.lbl_info = U.wlabel(head, "", "pagedim", U.FONT_XS)
         self.lbl_info.pack(side="left", padx=(U.px(10), 0))
-        U.RoundButton(head, "关闭", self.destroy, variant="secondary",
-                      height=30, padx=16).pack(side="right")
+        if on_close is not None:
+            U.RoundButton(head, "关闭", on_close, variant="secondary",
+                          height=30, padx=16).pack(side="right")
 
         bar = U.wframe(wrap, "page")
         bar.pack(fill="x", pady=(U.px(10), 0))
@@ -512,7 +515,7 @@ class SkillDialog(tk.Toplevel):
 
         left = U.Card(body)
         left.pack(side="left", fill="y")
-        self.lst = tk.Listbox(left.body, width=30, height=18, bd=0,
+        self.lst = tk.Listbox(left.body, width=30, height=14, bd=0,
                               relief="flat", highlightthickness=0,
                               activestyle="none", exportselection=False,
                               font=U.FONT_S, bg=U.T.card, fg=U.T.text,
@@ -523,12 +526,9 @@ class SkillDialog(tk.Toplevel):
 
         right = U.Card(body, title="正文")
         right.pack(side="left", fill="both", expand=True, padx=(U.px(10), 0))
-        self.tb = U.TextBox(right.body, role="console", height=18, readonly=True)
+        self.tb = U.TextBox(right.body, role="console", height=14, readonly=True)
         self.tb.pack(fill="both", expand=True)
 
-        self.geometry(f"{U.px(980)}x{U.px(600)}")
-        self.minsize(U.px(720), U.px(420))
-        self.bind("<Escape>", lambda e: self.destroy())
         self._reload()
 
     # -- 数据
@@ -579,7 +579,7 @@ class SkillDialog(tk.Toplevel):
 
     def _import(self):
         path = filedialog.askopenfilename(
-            parent=self, title="选择技能包",
+            parent=self.winfo_toplevel(), title="选择技能包",
             filetypes=[("技能包", "*.md *.zip"), ("Markdown", "*.md"),
                        ("Zip", "*.zip"), ("全部文件", "*.*")])
         if not path:
@@ -600,3 +600,18 @@ class SkillDialog(tk.Toplevel):
             _open_in_shell(str(self.store.dir))
         except Exception as e:  # noqa: BLE001
             self.page.toast(f"打不开目录：{e}", "err")
+
+
+class SkillDialog(tk.Toplevel):
+    """独立窗口形态的技能库（侧栏「技能库…」还用这个）。"""
+
+    def __init__(self, parent, page):
+        super().__init__(parent)
+        self.title("技能库")
+        self.configure(bg=U.T.page)
+        self.transient(parent)
+        self.panel = SkillPanel(self, page, on_close=self.destroy)
+        self.panel.pack(fill="both", expand=True)
+        self.geometry(f"{U.px(980)}x{U.px(600)}")
+        self.minsize(U.px(720), U.px(420))
+        self.bind("<Escape>", lambda e: self.destroy())

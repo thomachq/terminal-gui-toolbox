@@ -32,7 +32,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, ttk
 
 import wbtui as U
 from core import agent as A
@@ -140,65 +140,8 @@ def _lines_to_text(lines: list[str], limit: int = 8) -> str:
     return "\n".join(lines[:limit]) + f"\n…（共 {len(lines)} 行）"
 
 
-class _Scroll(tk.Frame):
-    """竖向滚动容器。tk 没有现成的「滚动画布」，只能 Canvas + 内嵌 Frame。
-
-    滚轮用 bind_all 是为了让指针停在消息卡片上也能滚 —— 那些卡片是 Canvas 的
-    子控件，事件不会冒泡到 Canvas。指针离开时立刻解绑，免得抢走别处的滚轮。
-    """
-
-    def __init__(self, master, bg: str):
-        super().__init__(master, bg=bg, bd=0)
-        self.cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
-        self.vs = tk.Scrollbar(self, orient="vertical", command=self.cv.yview,
-                               width=U.px(10), bd=0, relief="flat")
-        self.cv.configure(yscrollcommand=self.vs.set)
-        self.cv.pack(side="left", fill="both", expand=True)
-        self.vs.pack(side="right", fill="y")
-        self.inner = tk.Frame(self.cv, bg=bg, bd=0)
-        self._win = self.cv.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>", self._grow)
-        self.cv.bind("<Configure>", self._fit)
-        self.cv.bind("<Enter>", self._grab_wheel)
-        self.cv.bind("<Leave>", self._drop_wheel)
-        self.inner.bind("<Enter>", self._grab_wheel)
-        self.inner.bind("<Leave>", self._drop_wheel)
-
-    def _grow(self, _e=None):
-        self.cv.configure(scrollregion=self.cv.bbox("all") or (0, 0, 0, 0))
-
-    def _fit(self, e):
-        self.cv.itemconfigure(self._win, width=e.width)
-
-    def _grab_wheel(self, _e=None):
-        self.cv.bind_all("<MouseWheel>", self._wheel)
-        self.cv.bind_all("<Button-4>", self._wheel)
-        self.cv.bind_all("<Button-5>", self._wheel)
-
-    def _drop_wheel(self, _e=None):
-        self.cv.unbind_all("<MouseWheel>")
-        self.cv.unbind_all("<Button-4>")
-        self.cv.unbind_all("<Button-5>")
-
-    def _wheel(self, e):
-        if getattr(e, "num", None) == 4:
-            step = -3
-        elif getattr(e, "num", None) == 5:
-            step = 3
-        else:
-            step = -3 if e.delta > 0 else 3
-        self.cv.yview_scroll(step, "units")
-        return "break"
-
-    def to_end(self) -> None:
-        self.update_idletasks()
-        self._grow()
-        self.cv.yview_moveto(1.0)
-
-    def clear(self) -> None:
-        for w in self.inner.winfo_children():
-            w.destroy()
-        self.cv.yview_moveto(0.0)
+class _Scroll(U.ScrollBox):
+    """滚动容器（实现在 wbtui.ScrollBox：Canvas + 内嵌 Frame + 按指针路由滚轮）。"""
 
 
 class AiDockPage:
@@ -213,6 +156,8 @@ class AiDockPage:
         dock.pack_propagate(False)
         self.ai_dock = dock
         self._ai_flow_labels: list[tk.Label] = []
+        self._ai_wrap_w = 0
+        self._ai_reflow_job = None
         # Markdown 渲染出来的块：窗口变宽时它们不像 Label 那样自己重排，
         # 记下来，必要时整块重画（见 _ai_dock_reflow）
         self._ai_md_views: list = []
@@ -670,13 +615,30 @@ class AiDockPage:
 
         **不在这里记宽度**：这个回调在程序摆放分隔条时也会被触发，
         边摆边记会把自己越记越偏（旧代码就这么把记忆搞坏的）。
+
+        拖动边缘时 <Configure> 是按像素来的，气泡一多，同步遍历所有 Label
+        逐个改 wraplength 会让窗口像卡住一样（每次都要重排整段文本）。
+        所以这里只记宽度、debounce 70ms，等手停下来再统一改。
         """
-        w = (event.width if event is not None else self.ai_dock.winfo_width())
-        wrap = max(U.px(180), w - U.px(46))
+        w = int(event.width if event is not None else self.ai_dock.winfo_width())
+        if self._ai_wrap_w and abs(w - self._ai_wrap_w) < 2:
+            return
+        self._ai_wrap_w = w
+        if self._ai_reflow_job:
+            try:
+                self.after_cancel(self._ai_reflow_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._ai_reflow_job = self.after(70, self._ai_apply_wrap)
+
+    def _ai_apply_wrap(self) -> None:
+        self._ai_reflow_job = None
+        wrap = max(U.px(180), int(self._ai_wrap_w or 0) - U.px(46))
         for lb in self._ai_flow_labels:
             try:
-                lb.configure(wraplength=wrap)
-            except tk.TclError:
+                if int(lb.cget("wraplength")) != wrap:
+                    lb.configure(wraplength=wrap)
+            except (tk.TclError, ValueError):
                 pass
 
     # ================================================================ 卡片
@@ -2567,6 +2529,13 @@ class AiDockPage:
 
     # ================================================================ 工作线程
     def _ai_worker(self, goal: str, context: str, skill_text: str) -> None:
+        # MCP 工具是动态的：每轮开始前刷新一次，别让模型拿着上一轮的清单乱调。
+        # 这里在工作线程里跑（会起子进程），失败不影响这一轮的任务。
+        try:
+            rows = self.mcp_pool.ensure_tools() if hasattr(self, "mcp_pool") else []
+        except Exception:  # noqa: BLE001
+            rows = []
+        A.register_dynamic(rows)
         try:
             res = self.agent.run(
                 goal, self._ai_tool_exec, context=context, skill_text=skill_text,
@@ -2694,13 +2663,16 @@ class AiDockPage:
         """
         ok, text = self._ai_tool_dispatch(tool, args)
         if tool not in ("exec", "device", "pages", "page_read"):
-            label = A.TOOLS[tool].label if tool in A.TOOLS else tool
+            label = (A.TOOLS[tool].label if tool in A.TOOLS
+                     else (A.DYNAMIC.get(tool) or {}).get("name") or tool)
             self.ai_trace(aitrace.note(
                 f"{label} · {'完成' if ok else '失败'} · {str(text or '')[:120]}",
                 tone="ok" if ok else "err"), ensure=True)
         return ok, text
 
     def _ai_tool_dispatch(self, tool: str, args: dict):
+        if tool.startswith("mcp__"):
+            return self._ai_mcp_call(tool, args)
         if tool == "device":
             return True, self._ai_device_text()
         if tool == "pages":
@@ -2718,6 +2690,27 @@ class AiDockPage:
         if tool == "page_read":
             return self._ai_ui_call(self._ai_page_read, args.get("page", ""))
         return False, f"不认识这个工具：{tool}"
+
+    def _ai_mcp_call(self, tool: str, args: dict):
+        """MCP 工具落地：真去调那条服务器的 tools/call。
+
+        跑在工作线程里（MCP 调用本身是阻塞的），结果拍平成文本回灌给模型。
+        出错不抛异常 —— 助手要能看见「为什么没成」再决定下一步。
+        """
+        try:
+            from core import mcp as mcp_mod
+        except Exception as e:  # noqa: BLE001
+            return False, f"MCP 模块不可用：{e}"
+        pool = getattr(self, "mcp_pool", None)
+        if pool is None:
+            return False, "MCP 会话池没起来（这一版没初始化）"
+        try:
+            text = pool.call(tool, args or {})
+        except mcp_mod.MCPError as e:
+            return False, f"MCP 调用失败：{e}"
+        except Exception as e:  # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"
+        return True, str(text or "（这个工具没有输出）")
 
     def _ai_ui_call(self, fn, *a):
         """从工作线程切回主线程执行，并等结果 —— Tk 不是线程安全的。"""
@@ -3165,35 +3158,37 @@ def _scroll_list(parent, bg: str, height: int, builder) -> "_Scroll":
     return sc
 
 
-class AgentDialog(tk.Toplevel):
+class AgentPanel(tk.Frame):
     """智能体设置：基本信息 / 提示词 / 技能 / 工具，四段。
 
     这里改的全是「它是什么、能干什么」，模型 Key 仍在「模型设置」里 —— 两件事分开，
     换模型不改人设，改人设不动凭据。
+
+    做成 Frame：设置中心把它当成内嵌页签（智能体 / 模型 / 技能库 / MCP 库）。
+    要独立窗口就用下面的 AgentDialog 包一层。
     """
 
-    def __init__(self, parent, page):
-        super().__init__(parent)
+    def __init__(self, master, page, on_close=None):
+        super().__init__(master, bg=U.T.page, bd=0)
         self.page = page
         self.cfg = page.agent_cfg
-        self.title("智能运维助手 · 设置")
-        self.configure(bg=U.T.page)
-        self.transient(parent)
+        self.on_close = on_close
         self._skill_vars: dict[str, tk.BooleanVar] = {}
         self._tool_vars: dict[str, tk.BooleanVar] = {}
 
         wrap = U.wframe(self, "page")
-        wrap.pack(fill="both", expand=True, padx=U.px(18), pady=U.px(16))
+        wrap.pack(fill="both", expand=True, padx=U.px(14), pady=U.px(12))
 
         head = U.wframe(wrap, "page")
         head.pack(fill="x")
         U.wlabel(head, "智能运维助手", "page", U.FONT_T).pack(side="left")
         U.wlabel(head, "描述 · 提示词 · 技能 · 工具", "pagedim",
                  U.FONT_XS).pack(side="left", padx=(U.px(10), 0))
-        U.RoundButton(head, "模型设置", self._model, variant="ghost",
-                      height=30, padx=14).pack(side="right", padx=(U.px(6), 0))
-        U.RoundButton(head, "取消", self.destroy, variant="secondary",
-                      height=30, padx=16).pack(side="right")
+        if on_close is not None:
+            U.RoundButton(head, "模型设置", self._model, variant="ghost",
+                          height=30, padx=14).pack(side="right", padx=(U.px(6), 0))
+            U.RoundButton(head, "取消", on_close, variant="secondary",
+                          height=30, padx=16).pack(side="right")
         U.RoundButton(head, "保存", self._save, variant="primary",
                       height=30, padx=18).pack(side="right", padx=(0, U.px(6)))
 
@@ -3212,9 +3207,15 @@ class AgentDialog(tk.Toplevel):
         }
         self.seg.select("base")
 
-        self.geometry(f"{U.px(880)}x{U.px(640)}")
-        self.minsize(U.px(680), U.px(460))
-        self.bind("<Escape>", lambda e: self.destroy())
+    def _close(self) -> None:
+        cb = self.on_close
+        if cb is not None:
+            cb()
+            return
+        try:
+            self.winfo_toplevel().destroy()
+        except tk.TclError:
+            pass
 
     def _tab(self, key: str) -> None:
         for k, f in self._frames.items():
@@ -3416,7 +3417,8 @@ class AgentDialog(tk.Toplevel):
         cfg.save()
         self.page._ai_refresh_dock_state()
         self.page.toast("设置已保存", "ok")
-        self.destroy()
+        # 内嵌形态保存完不关（用户可能还要接着改别的段）；独立窗口形态才关掉
+        self._close()
 
     def _model(self) -> None:
         self.page.ai_model_settings()
@@ -3438,3 +3440,18 @@ class AgentDialog(tk.Toplevel):
                     padx=U.px(8), pady=U.px(6))
         t.insert("1.0", text or "")
         return t
+
+
+class AgentDialog(tk.Toplevel):
+    """独立窗口形态的智能体设置（侧栏「⋯ → 助手设置」还用这个）。"""
+
+    def __init__(self, parent, page):
+        super().__init__(parent)
+        self.title("智能运维助手 · 设置")
+        self.configure(bg=U.T.page)
+        self.transient(parent)
+        self.panel = AgentPanel(self, page, on_close=self.destroy)
+        self.panel.pack(fill="both", expand=True)
+        self.geometry(f"{U.px(880)}x{U.px(640)}")
+        self.minsize(U.px(680), U.px(460))
+        self.bind("<Escape>", lambda e: self.destroy())

@@ -59,6 +59,7 @@ from pages.proxy_page import ProxyPage
 from pages.script_page import ScriptPage
 from pages.settings_center import SettingsCenter
 from core import agent as agent_core
+from core import mcp as mcp_mod
 from pages.api_page import ApiPage
 from pages.cron_page import CronPage
 from pages.db_page import DbPage
@@ -105,7 +106,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.8"
+APP_VER = "1.0.9"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -275,6 +276,10 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         # 智能体的「人设」与「模型」分开存：换模型不动人设，改人设不碰凭据
         self.agent_cfg = agent_core.AgentConfig(DATA_DIR / "agent.json")
         self.agent = agent_core.Agent(self.agent_cfg, self.ai_cfg)
+        # MCP 库：清单 + 会话池。进程起在**本机**，被管设备上不落任何东西。
+        # 懒启动 —— 没人用 MCP 的时候一个进程都不会起。
+        self.mcp_store = mcp_mod.MCPStore(DATA_DIR / "mcp.json")
+        self.mcp_pool = mcp_mod.MCPPool(self.mcp_store)
         self.ai_busy = False
         self._ai_stop = threading.Event()
         # 助手自己发出去的远端命令：终端别再喂一遍（见 _term_feed）
@@ -1008,6 +1013,11 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             pass
         try:
             self.api_server.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        # MCP 是本机起的子进程，退出得收干净，否则会留下一堆孤儿进程
+        try:
+            self.mcp_pool.stop_all()
         except Exception:  # noqa: BLE001
             pass
         self.destroy()
@@ -2369,11 +2379,26 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
     # ------------------------------------------------------------ 页签
     def _ws_raise(self, widget) -> None:
-        """把一块工作区抬到最上层，并记下「上面现在是谁」。
+        """把一块工作区显出来，并把其它几块**从布局里摘掉**。
 
-        所有切页签都从这里过 —— 记错了就说明真的抬错了。
+        以前只做 tkraise：谁在上面全靠 z 序。z 序有两个坑 ——
+          · 被 raise 的那块如果此刻不在布局里（grid_remove 过），
+            tkraise 什么也不做，于是「点了页签画面不动」；
+          · 新建的容器天然在最上层，和老容器交错 raise 之后，
+            谁在上面取决于操作顺序，偶尔会出现「页签是设置、画面是主机资源」。
+        改成显式的「留一块、摘其余」：结论只由这一行决定，不看历史。
+        摘掉不等于销毁 —— 状态、滚动位置、输入内容都还在。
         """
         try:
+            # 必须用 winfo_children() 而不是 grid_slaves()：被 grid_remove 掉的
+            # 那块不在 slaves 名单里，用它找目标会「找不到要显示的那块」，
+            # 结果把所有块都摘了、一个都没放回来（白屏）。
+            for w in self.workspace.winfo_children():
+                if w is widget:
+                    if w.winfo_manager() != "grid":
+                        w.grid()
+                elif w.winfo_manager() == "grid":
+                    w.grid_remove()
             widget.tkraise()
         except tk.TclError:
             return

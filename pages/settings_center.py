@@ -549,14 +549,20 @@ class _SettingsShell:
         U.wlabel(b, f"执行模式：{cfg.mode} · 最多 {cfg.max_steps} 步", "mute",
                  U.FONT_XS).pack(anchor="w")
 
-        row = U.wframe(b, "card")
-        row.pack(fill="x", pady=(U.px(12), 0))
-        U.RoundButton(row, "智能体设置…", app.ai_agent_settings, variant="primary",
-                      height=30, padx=14).pack(side="left")
-        U.RoundButton(row, "模型设置…", app.ai_model_settings, variant="ghost",
-                      height=30, padx=14).pack(side="left", padx=(U.px(8), 0))
-        U.RoundButton(row, "技能库…", app._ai_open_skill_lib, variant="ghost",
-                      height=30, padx=14).pack(side="left", padx=(U.px(6), 0))
+        # 四块设置不再各开一个窗口：以前点「智能体设置…」弹一个、「模型设置…」
+        # 再弹一个，关掉一个才能看另一个，来回找。现在就是这一页里的四个页签。
+        seg = Segmented(b, [("agent", "智能体设置"), ("model", "模型设置"),
+                            ("skill", "技能库"), ("mcp", "MCP 库")],
+                        command=self._agent_tab)
+        seg.pack(anchor="w", pady=(U.px(12), U.px(8)))
+
+        host = U.wframe(b, "card")
+        host.pack(fill="both", expand=True)
+        host.configure(height=U.px(460))
+        host.pack_propagate(False)
+        self._agent_host = host
+        self._agent_panels: dict[str, tk.Frame] = {}
+        self._agent_tab("agent")
 
         c2 = U.Card(box, title="侧边栏", hint="助手常驻在右侧，不占选项卡")
         c2.pack(fill="x", pady=(U.px(12), 0))
@@ -568,6 +574,53 @@ class _SettingsShell:
                       padx=14).pack(side="left")
         U.RoundButton(r2, "清空会话", app.ai_dock_clear, variant="ghost",
                       height=30, padx=14).pack(side="left", padx=(U.px(8), 0))
+        U.wlabel(c2.body,
+                 "想并排看：「智能体设置」「模型设置」在侧栏「⋯」菜单里还能单独"
+                 "拉成窗口。", "mute", U.FONT_XS, justify="left",
+                 wraplength=U.px(620)).pack(anchor="w", pady=(U.px(8), 0))
+
+    def _agent_tab(self, key: str) -> None:
+        """切到某个内嵌面板，第一次点才建（建面板要读配置，别在进页面时就全建）。"""
+        host = getattr(self, "_agent_host", None)
+        if host is None:
+            return
+        for k, p in self._agent_panels.items():
+            if k != key and p.winfo_manager():
+                p.pack_forget()
+        panel = self._agent_panels.get(key)
+        if panel is None:
+            panel = self._agent_build(key, host)
+            if panel is None:
+                return
+            self._agent_panels[key] = panel
+        panel.pack(fill="both", expand=True)
+
+    def _agent_pick(self, key: str) -> None:  # 自测用：等价于点页签
+        self._agent_tab(key)
+
+    def _agent_build(self, key: str, host) -> tk.Frame | None:
+        app = self.app
+        try:
+            if key == "agent":
+                from pages.ai_dock import AgentPanel
+                return AgentPanel(host, app)
+            if key == "model":
+                from pages.model_page import ModelPanel
+                return ModelPanel(app, host)
+            if key == "skill":
+                from pages.ai_page import SkillPanel
+                return SkillPanel(host, app)
+            if key == "mcp":
+                from pages.mcp_panel import MCPPanel
+                return MCPPanel(host, app)
+        except Exception as e:  # noqa: BLE001
+            box = U.wframe(host, "card")
+            U.wlabel(box, f"这块没起来：{type(e).__name__}: {e}", "pageerr",
+                     U.FONT_S, justify="left",
+                     wraplength=U.px(600)).pack(anchor="w", padx=U.px(8),
+                                                pady=U.px(10))
+            return box
+        return None
 
     # ================================================================ 安全
     def _sec_safe(self, box) -> None:
@@ -703,33 +756,8 @@ class _SettingsShell:
                                                         padx=(U.px(12), 0))
 
 
-class _Scroll(tk.Frame):
-    """设置页用的滚动容器（和助手侧栏同款，避免两处各写一份）。"""
-
-    def __init__(self, master, bg: str):
-        super().__init__(master, bg=bg, bd=0)
-        self.cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
-        self.vs = tk.Scrollbar(self, orient="vertical", command=self.cv.yview,
-                               width=U.px(10), bd=0, relief="flat")
-        self.cv.configure(yscrollcommand=self.vs.set)
-        self.cv.pack(side="left", fill="both", expand=True)
-        self.vs.pack(side="right", fill="y")
-        self.inner = tk.Frame(self.cv, bg=bg, bd=0)
-        self._win = self.cv.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>", lambda e: self.cv.configure(
-            scrollregion=self.cv.bbox("all") or (0, 0, 0, 0)))
-        self.cv.bind("<Configure>", lambda e: self.cv.itemconfigure(
-            self._win, width=e.width))
-        self.cv.bind("<Enter>", lambda e: self.cv.bind_all("<MouseWheel>",
-                                                           self._wheel))
-        self.cv.bind("<Leave>", lambda e: self.cv.unbind_all("<MouseWheel>"))
-        self.inner.bind("<Enter>", lambda e: self.cv.bind_all("<MouseWheel>",
-                                                              self._wheel))
-        self.inner.bind("<Leave>", lambda e: self.cv.unbind_all("<MouseWheel>"))
-
-    def _wheel(self, e):
-        self.cv.yview_scroll(-3 if e.delta > 0 else 3, "units")
-        return "break"
+class _Scroll(U.ScrollBox):
+    """设置页的滚动容器（实现在 wbtui.ScrollBox，滚轮按指针路由）。"""
 
 
 class SettingsPane(_SettingsShell, tk.Frame):

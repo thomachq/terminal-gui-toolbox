@@ -33,6 +33,10 @@ def chk(ok, name: str, detail: str = "") -> bool:
     return bool(ok)
 
 
+def eq(a, b, name: str) -> bool:
+    return chk(a == b, name, f"期望 {b!r} 实得 {a!r}")
+
+
 def separators(tree, y: int, limit: int = 40) -> list[int]:
     """表头上所有 separator 的 x（连续的一段算一条，取中点）。"""
     runs: list[list[int]] = []
@@ -184,6 +188,23 @@ def main() -> int:
     chk(int(tree.column("last_used", "width")) == U.px(130)
         or tree.column("name", "width") > U.px(170),
         "多出来的宽度给了填充列，不是摊给每一列")
+
+    # ---- 拖完光标要还回箭头（旧毛病：松手后一直顶着 ↔）
+    tree.configure(cursor="sb_h_double_arrow")
+    tree.event_generate("<ButtonRelease-1>", x=10, y=10)
+    root.update()
+    eq(str(tree.cget("cursor")), "", "松手后光标还原成箭头")
+
+    tree.configure(cursor="sb_h_double_arrow")
+    tree.event_generate("<Motion>", x=20, y=120, state=0)
+    root.update()
+    eq(str(tree.cget("cursor")), "", "左键早就松了时，移动鼠标也会还原")
+
+    tree.configure(cursor="sb_h_double_arrow")
+    tree.event_generate("<Motion>", x=20, y=120, state=0x100)
+    root.update()
+    eq(str(tree.cget("cursor")), "sb_h_double_arrow", "左键还按着时不抢 ttk 的拖拽光标")
+    tree.configure(cursor="")
 
     root.destroy()
     print(f"\n合计 {PASS} 项通过，{FAIL} 项失败")

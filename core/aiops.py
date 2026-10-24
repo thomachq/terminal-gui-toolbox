@@ -435,11 +435,18 @@ class AIConfig:
     # -- 便捷
     @property
     def provider(self) -> str:
-        p = str(self.data.get("provider") or DEFAULT_PROVIDER)
-        return p if p in PROVIDERS else DEFAULT_PROVIDER
+        # 供应商能自定义，所以这里不再限定在内置表里：只要求是个非空 slug。
+        p = str(self.data.get("provider") or DEFAULT_PROVIDER).strip()
+        return p or DEFAULT_PROVIDER
 
     def preset(self) -> dict:
-        return PROVIDERS[self.provider]
+        """当前供应商的类型预设。自定义供应商给一份兜底，键名和内置的一致。"""
+        p = self.provider
+        if p in PROVIDERS:
+            return PROVIDERS[p]
+        name = self.provider_name(p)
+        return {"label": name, "kind": "openai", "base": "", "model": "",
+                "need_key": True, "hint": ""}
 
     def get_key(self) -> str:
         enc = str(self.data.get("key_enc") or "")
@@ -472,12 +479,26 @@ class AIConfig:
     # 老配置没有 providers 这个键，就从该供应商下第一条模型推一个初值 ——
     # 打开界面就有内容，不用用户重填一遍。
     def provider_meta(self) -> dict:
+        """每个供应商的元信息：地址 / Key / 名字 / 类型 / 是否启用。
+
+        供应商不再是固定那几个：用户在界面上能加任意多条（同一类型也能加几条，
+        截图里就有两个「Llama 网关」）。内置的 5 个只当「类型预设」用，
+        真正在用的是 `providers` 这个字典 + 模型里出现过的 pid。
+        """
         meta = self.data.get("providers")
         if not isinstance(meta, dict):
             meta = {}
         models = self.models()
+        pids: list[str] = list(PROVIDERS)
+        for pid in list(meta):
+            if pid not in pids:
+                pids.append(str(pid))
+        for m in models:
+            pid = str(m.get("provider") or "")
+            if pid and pid not in pids:
+                pids.append(pid)
         out = {}
-        for pid in PROVIDERS:
+        for pid in pids:
             row = meta.get(pid) if isinstance(meta.get(pid), dict) else {}
             base = str(row.get("base") or "").strip()
             key_enc = str(row.get("key_enc") or "").strip()
@@ -489,12 +510,167 @@ class AIConfig:
                     key_enc = key_enc or str(m.get("key_enc") or "").strip()
                     if base and key_enc:
                         break
-            out[pid] = {"base": base, "key_enc": key_enc}
+            preset = PROVIDERS.get(pid) or {}
+            out[pid] = {
+                "base": base,
+                "key_enc": key_enc,
+                "name": str(row.get("name") or preset.get("label") or pid),
+                "kind": str(row.get("kind") or preset.get("kind") or "openai"),
+                "enabled": bool(row.get("enabled", True)),
+                # 同一家的备用地址（内网/外网、直连/中转）。Cherry Studio 的
+                # 「添加端点」就是这层意思：地址可以有多个，当前生效的只有一个。
+                "endpoints": [str(x).strip() for x in (row.get("endpoints") or [])
+                              if str(x).strip()],
+                "builtin": pid in PROVIDERS,
+            }
         return out
+
+    def provider_list(self) -> list[dict]:
+        """界面左栏用的有序清单：内置的按原顺序在前，自定义的按创建顺序在后。"""
+        meta = self.provider_meta()
+        order = list(PROVIDERS) + [p for p in meta if p not in PROVIDERS]
+        rows = []
+        for pid in order:
+            row = meta.get(pid)
+            if not row:
+                continue
+            # 内置的先全列出来（Cherry Studio 也是把服务商全摆出来，用过的排前面），
+            # 不做「没用过就藏起来」—— 藏起来等于用户找不到怎么新增这一家。
+            rows.append({"pid": pid, **row})
+        return rows
+
+    def provider_name(self, pid: str) -> str:
+        row = self.provider_meta().get(pid) or {}
+        return str(row.get("name") or (PROVIDERS.get(pid) or {}).get("label") or pid)
+
+    def provider_enabled(self, pid: str) -> bool:
+        return bool((self.provider_meta().get(pid) or {}).get("enabled", True))
+
+    def add_provider(self, name: str, kind: str = "openai", base: str = "",
+                     key: str = "") -> str:
+        """新增一条供应商，返回它的 pid。同名的会自动加序号，不会覆盖。"""
+        name = str(name or "").strip() or "新供应商"
+        meta = self.data.get("providers")
+        if not isinstance(meta, dict):
+            meta = {}
+        base_pid = re.sub(r"[^0-9a-z]+", "", name.lower()) or "prov"
+        base_pid = base_pid[:16]
+        pid = base_pid
+        i = 2
+        while pid in PROVIDERS or pid in meta:
+            pid = f"{base_pid}{i}"
+            i += 1
+        meta[pid] = {
+            "name": name,
+            "kind": kind if kind in ("openai", "dsh") else "openai",
+            "base": str(base or "").strip(),
+            "key_enc": ((crypto_store.protect(key) or "")
+                        if (key and crypto_store is not None) else key or ""),
+            "enabled": True,
+            "endpoints": ([str(base).strip()] if str(base or "").strip() else []),
+        }
+        self.data["providers"] = meta
+        self.save()
+        return pid
+
+    def remove_provider(self, pid: str) -> int:
+        """删一条供应商，连同它下面的模型。返回删掉的模型条数。
+
+        内置的那 5 个不真删 —— 删了下次升级又冒出来，只会让人困惑；
+        这里只清空它的地址/Key/模型（等于「不用了」）。
+        """
+        n = 0
+        keep = []
+        for m in self.models():
+            if str(m.get("provider") or "") == pid:
+                n += 1
+            else:
+                keep.append(m)
+        self.data["models"] = keep
+        meta = self.data.get("providers")
+        if isinstance(meta, dict):
+            if pid in PROVIDERS:
+                meta[pid] = {"base": "", "key_enc": "", "enabled": False}
+            else:
+                meta.pop(pid, None)
+            self.data["providers"] = meta
+        self.save()
+        return n
 
     def provider_base(self, pid: str) -> str:
         row = self.provider_meta().get(pid) or {}
         return str(row.get("base") or PROVIDERS.get(pid, {}).get("base") or "")
+
+    # ------------------------------------------------------------ 多端点
+    # 同一家供应商往往有好几个入口：内网直连、外网中转、备用网关。
+    # 地址只能生效一个，但清单要留着 —— 否则每次换网络都要重新敲一遍 URL。
+    def provider_endpoints(self, pid: str) -> list[str]:
+        """这家的地址清单，当前生效的那个排第一。"""
+        row = self.provider_meta().get(pid) or {}
+        out: list[str] = []
+        cur = str(row.get("base") or "").strip()
+        if cur:
+            out.append(cur)
+        for u in row.get("endpoints") or []:
+            u = str(u or "").strip()
+            if u and u not in out:
+                out.append(u)
+        return out
+
+    def add_endpoint(self, pid: str, url: str) -> bool:
+        """加一个备用地址。加完不会自动切过去（用户可能只是想先登记）。"""
+        url = str(url or "").strip()
+        if not url:
+            return False
+        if url in self.provider_endpoints(pid):
+            return False
+        meta = self.data.get("providers")
+        if not isinstance(meta, dict):
+            meta = {}
+        row = meta.get(pid) if isinstance(meta.get(pid), dict) else {}
+        eps = [str(x).strip() for x in (row.get("endpoints") or []) if str(x).strip()]
+        if url not in eps:
+            eps.append(url)
+        row["endpoints"] = eps
+        row.setdefault("name", self.provider_name(pid))
+        row.setdefault("kind", (self.provider_meta().get(pid) or {}).get("kind")
+                       or "openai")
+        row.setdefault("base", self.provider_base(pid))
+        row.setdefault("key_enc", self.provider_key_enc(pid))
+        meta[pid] = row
+        self.data["providers"] = meta
+        self.save()
+        return True
+
+    def remove_endpoint(self, pid: str, url: str) -> bool:
+        """删一个地址。删的正好是当前生效的那个就切到清单里的下一个。"""
+        url = str(url or "").strip()
+        meta = self.data.get("providers")
+        if not isinstance(meta, dict) or not url:
+            return False
+        row = meta.get(pid) if isinstance(meta.get(pid), dict) else {}
+        eps = [str(x).strip() for x in (row.get("endpoints") or [])
+               if str(x).strip() and str(x).strip() != url]
+        if not eps:
+            # 一条都不剩就没地址可用了，内置家的默认地址还会被 provider_base
+            # 兜回来 —— 界面看着像「删了没反应」。直接不许删最后一条。
+            return False
+        row["endpoints"] = eps
+        meta[pid] = row
+        self.data["providers"] = meta
+        if str(self.provider_base(pid)).strip() == url:
+            self.set_provider(pid, base=eps[0])
+        else:
+            self.save()
+        return True
+
+    def use_endpoint(self, pid: str, url: str) -> None:
+        """切换当前生效的地址（等价于在地址框里改成它并保存）。"""
+        url = str(url or "").strip()
+        if not url:
+            return
+        self.add_endpoint(pid, url)
+        self.set_provider(pid, base=url)
 
     def provider_key_enc(self, pid: str) -> str:
         return str((self.provider_meta().get(pid) or {}).get("key_enc") or "")
@@ -516,19 +692,40 @@ class AIConfig:
                 if str(m.get("provider") or "") == pid]
 
     def set_provider(self, pid: str, base: str | None = None,
-                     key: str | None = None) -> None:
-        """改供应商的地址 / Key，并下发到它下面的每条模型。
+                     key: str | None = None, name: str | None = None,
+                     enabled: bool | None = None,
+                     kind: str | None = None) -> None:
+        """改供应商的地址 / Key / 名字 / 启用状态，并把地址与 Key 下发到它下面的模型。
 
         `base` / `key` 传 None 表示「这一项不改」，传空串表示清空。
         模型自己单独填过的地址不覆盖 —— 同一个供应商下挂两个网关是常见用法。
+        自定义供应商（不在内置表里的 pid）同样能改。
         """
-        if pid not in PROVIDERS:
+        if pid not in PROVIDERS and pid not in (self.provider_meta() or {}):
             return
         old = self.provider_meta().get(pid) or {}
         old_base = str(old.get("base") or "")
         row = {"base": old_base, "key_enc": str(old.get("key_enc") or "")}
+        if pid not in PROVIDERS or old.get("name"):
+            row["name"] = str(name if name is not None
+                             else (old.get("name") or pid))
+        elif name is not None:
+            row["name"] = str(name)
+        if kind is not None:
+            row["kind"] = kind if kind in ("openai", "dsh") else "openai"
+        elif old.get("kind"):
+            row["kind"] = str(old["kind"])
+        if enabled is not None:
+            row["enabled"] = bool(enabled)
         if base is not None:
             row["base"] = str(base).strip()
+        # 端点清单必须原样带过去 —— 这里是整体覆盖 store[pid]，
+        # 少抄一个键就等于把用户攒的备用地址全丢了。
+        eps = [str(x).strip() for x in (old.get("endpoints") or []) if str(x).strip()]
+        if base is not None and row["base"] and row["base"] not in eps:
+            eps.append(row["base"])
+        if eps:
+            row["endpoints"] = eps
         if key is not None:
             if key:
                 row["key_enc"] = ((crypto_store.protect(key) or "")
@@ -613,9 +810,9 @@ class AIConfig:
 
     @staticmethod
     def _clean_model(m: dict) -> dict:
-        prov = str(m.get("provider") or DEFAULT_PROVIDER)
-        if prov not in PROVIDERS:
-            prov = DEFAULT_PROVIDER
+        # 自定义供应商的 pid 也是合法值，别把它强行改回默认那家 ——
+        # 改回去等于「重开一次配置，模型全跑到 DeepSeek 名下」。
+        prov = str(m.get("provider") or DEFAULT_PROVIDER).strip() or DEFAULT_PROVIDER
         try:
             temp = max(0.0, min(2.0, float(m.get("temperature", 0.2))))
         except (TypeError, ValueError):
@@ -659,6 +856,9 @@ class AIConfig:
             # 类型固定文本：这个程序只会发 chat/completions
             "kind": "text",
             "caps": caps,
+            # 分组名称：对齐 Cherry Studio 的「分组」——同一家供应商下按用途/家族
+            # 折叠（例如 deepseek、qwen3.6-35b）。空表示「默认」。
+            "group": str(m.get("group") or "").strip(),
             "thinking": want if want in levels else "",
             "modalities": clean_modalities(m.get("modalities")),
             "note": str(m.get("note") or ""),
@@ -721,11 +921,12 @@ class AIConfig:
         # 「供应商一层填一次，下面所有模型共用」就是这么落地的。
         rec = dict(rec or {})
         pid = str(rec.get("provider") or DEFAULT_PROVIDER)
-        if pid in PROVIDERS:
-            if not str(rec.get("base") or "").strip():
-                rec["base"] = self.provider_base(pid)
-            if not str(rec.get("key_enc") or "").strip():
-                rec["key_enc"] = self.provider_key_enc(pid)
+        # 自定义供应商（用户自己加的）同样要继承 —— 以前只对内置那 5 个生效，
+        # 结果在自己加的「Llama 网关」下新增模型时地址是空的。
+        if not str(rec.get("base") or "").strip():
+            rec["base"] = self.provider_base(pid)
+        if not str(rec.get("key_enc") or "").strip():
+            rec["key_enc"] = self.provider_key_enc(pid)
         m = self._clean_model(rec)
         models = self.models()
         for i, old in enumerate(models):
@@ -843,7 +1044,9 @@ def probe_model(rec: dict, timeout: int = 20) -> tuple[bool, str]:
     """
     rec = rec or {}
     prov = str(rec.get("provider") or DEFAULT_PROVIDER)
-    preset = PROVIDERS.get(prov) or PROVIDERS[DEFAULT_PROVIDER]
+    preset = PROVIDERS.get(prov) or {"label": prov, "kind": "openai",
+                                     "base": "", "model": "",
+                                     "need_key": True, "hint": ""}
     if preset.get("kind") == "dsh":
         exe = find_dsh()
         if exe:
@@ -896,7 +1099,9 @@ def model_view(m: dict, active_id: str) -> dict:
     prov = str(m.get("provider") or "")
     preset = PROVIDERS.get(prov) or {}
     has_key = bool(m.get("key_enc"))
-    need = bool(preset.get("need_key"))
+    # 自定义供应商没有 preset，那就按「需要 Key」算 —— 这类线路（网关、
+    # 中转站）九成都要鉴权，默认「就绪」会让人以为填不填都行。
+    need = bool(preset.get("need_key", True))
     if prov == "dsh":
         ok = bool(find_dsh())
         state = "可用" if ok else "缺 Harness"

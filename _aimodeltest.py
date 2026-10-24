@@ -166,7 +166,7 @@ eq(len(dlg.tbl_model.all_rows()), n_oll + 1, "新增后列表长一行")
 # 选中新增那条 → 设为当前
 rows = dlg.tbl_model.all_rows()
 idx = [i for i, r in enumerate(rows) if r["_id"] == rec["id"]][0]
-dlg.tbl_model.tree.selection_set(dlg.tbl_model.tree.get_children()[idx])
+dlg.tbl_model.select_index(idx)
 pump(win, 0.1)
 dlg.model_activate()
 pump(win, 0.2)

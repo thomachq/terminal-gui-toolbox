@@ -251,7 +251,9 @@ def test_dock():
 
     a = APP.ToolboxApp()
     try:
-        need = {"hosts", "proxy", "cred", "script", "log", "tools", "sys",
+        # "log" 已不再是一个导航页（v1.0.6 起改成底部可开关的日志面板），
+        # 这条断言以前还带着它，属于测试没跟上实现。
+        need = {"hosts", "proxy", "cred", "script", "tools", "sys",
                 "files", "routes", "sec", "docker", "web", "db", "cron",
                 "vpn", "api"}
         chk(need.issubset(set(a._pages)), "导航页面都在",

@@ -19,10 +19,10 @@ import sys
 import zipfile
 from pathlib import Path
 
-VER = "1.0.8"
+VER = "1.0.9"
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "_release" / f"v{VER}"
-STAMP = (2026, 10, 24, 15, 20, 0)
+STAMP = (2026, 10, 24, 17, 0, 0)
 
 # 绝不能进包的：机密档案、构建缓存、编辑器/系统垃圾
 JUNK_DIRS = {"data", "build", "__pycache__", ".git", ".venv", "node_modules",

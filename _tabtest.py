@@ -202,6 +202,54 @@ win.tabbar.close(win.SETTINGS_TAB)
 pump(win, 0.4)
 chk(win.nav in top_at(win.nav), "切回主机资源，导航回来了")
 
+# ================================================================== 切页签只留一块
+sec("6c. 切页签「只留一块在布局里」")
+
+
+def ws_visible() -> list:
+    """当前真正参与布局的工作区块（其它块必须被 grid_remove）。"""
+    out = []
+    for w in win.workspace.winfo_children():
+        try:
+            if w.winfo_manager() == "grid":
+                out.append(w)
+        except tkinter.TclError:
+            pass
+    return out
+
+
+win.open_settings()
+pump(win, 0.6)
+spane = win._settings_reg().get(win.SETTINGS_TAB)
+chk(spane is not None, "设置面板还在")
+eq(len(ws_visible()), 1, "设置页签：工作区里只有一块在布局里")
+if spane is not None:
+    eq(ws_visible()[0], spane.master, "留下的正是设置那一块")
+
+win.tabbar.select("hosts")
+pump(win, 0.3)
+eq(len(ws_visible()), 1, "主机资源：也只留一块")
+chk(ws_visible()[0] is win.ws_hosts, "留下的正是主机资源")
+
+# 以前「点页签没反应」就发生在这里：设置那块已经被摘出布局，再 raise 也抬不起来
+if spane is not None:
+    t = win.tabbar.tabs[win.SETTINGS_TAB]
+    t["label"].event_generate("<Button-1>", x=3, y=3)
+    pump(win, 0.3)
+    chk(win._ws_top is spane.master, "真点页签文字：能切回设置")
+    eq(spane.master.winfo_manager(), "grid", "设置那块重新回到布局里")
+
+    # 顶部那 2px 色条也是页签的一部分，点了也该切
+    win.tabbar.select("hosts")
+    pump(win, 0.2)
+    t["bar"].event_generate("<Button-1>", x=3, y=1)
+    pump(win, 0.3)
+    chk(win._ws_top is spane.master, "真点页签顶部色条：也能切回设置")
+
+win.tabbar.close(win.SETTINGS_TAB)
+pump(win, 0.4)
+eq(len(ws_visible()), 1, "关掉设置页签后仍只有一块")
+
 # ================================================================== 细节
 sec("7. 页签细节")
 win.tabbar.add("t2", "测试页", closable=True)

@@ -125,6 +125,19 @@ class DataTable(tk.Frame):
         self._empty_title = empty_title
         self._empty_hint = empty_hint
         self._search_var = tk.StringVar()
+        # ---- 分组折叠（默认关闭，只有显式 set_group() 才开）
+        # 为什么做成开关而不是默认：模型列表按「分组名称」折叠是对的
+        # （对齐 Cherry Studio），但防火墙规则、进程表折叠没有任何意义，
+        # 强行给所有表加一层树只会让它们多出一条没用的折叠列。
+        self._group_key: str | None = None
+        self._group_empty = "未分组"
+        self._group_open_default = True
+        self._open: dict[str, bool] = {}          # 组名 → 展开状态（重建后要还原）
+        self._gid_name: dict[str, str] = {}       # 组节点 iid → 组名
+        self._groups_seen: list[str] = []         # 上回渲染出现的组（全展开/全收起用）
+        self._iid_row: dict[str, dict] = {}       # iid → 行（分组后 iid 不再是序号）
+        self._row_iid: dict[int, str] = {}        # _view 下标 → iid
+        self._g0_w = U.px(168)                    # 分组列（#0）宽度
         # 用户拖出来的列宽（物理像素）。Tk 的 stretch 自动布局不能用 ——
         # 内容比可视宽的时候，它会把带 stretch 的列压回 minwidth，
         # 用户拖完一松手就弹回去（实测 255 → 72）。所以全部 stretch=False，
@@ -190,11 +203,27 @@ class DataTable(tk.Frame):
         self.tree.bind("<Double-1>", self._dbl)
         self.tree.bind("<<TreeviewSelect>>", self._sel)
         self.tree.bind("<Button-3>", self._popup)
+        # 用户点三角展开/收起时记下来 —— 表格一 rebuild（切供应商、
+        # 增删一条模型）就整棵重建，不记的话刚收起的组会自己弹开。
+        self.tree.bind("<<TreeviewOpen>>", self._remember_open, add="+")
+        self.tree.bind("<<TreeviewClose>>", self._remember_open, add="+")
         # 面板拉伸 / 分栏拖动后空态要跟着重新居中，列宽也要重新分配余量
         self.tree.bind("<Configure>", self._on_tree_configure, add="+")
         self.tree.bind("<Configure>", lambda _e: self._place_empty(), add="+")
         # 松手才算「用户设定的宽度」：拖动过程中读到的中间值不能记
         self.tree.bind("<ButtonRelease-1>", self._remember_widths, add="+")
+        # 列分隔线拖完要把光标还回箭头：ttk 自己在 <ButtonRelease-1> 里恢复
+        # cursor，但松手那一瞬指针往往已经移出 Treeview（或者表格当场 rebuild
+        # 换了控件），release 落不到原来那棵树上 —— 光标就一直卡在 ↔。
+        # 三个地方兜底：松手、移动时发现左键早松了、指针离开表格。
+        self.tree.bind("<ButtonRelease-1>", self._reset_cursor, add="+")
+        self.tree.bind("<Motion>", self._maybe_reset_cursor, add="+")
+        self.tree.bind("<Leave>", self._reset_cursor, add="+")
+        try:
+            self.winfo_toplevel().bind("<ButtonRelease-1>",
+                                       self._reset_cursor, add="+")
+        except tk.TclError:
+            pass
         self._menu = tk.Menu(self, tearoff=0)
 
         U.register(self, self._paint)
@@ -238,6 +267,13 @@ class DataTable(tk.Frame):
             return
         if avail <= 1 or not self.columns:
             return
+        # 分组模式下最左边那列（#0）是实打实占宽的，不算进来的话
+        # 一组模型就会平白多出一条横向滚动条。
+        if self._group_key:
+            try:
+                avail -= int(self.tree.column("#0", "width")) + U.px(4)
+            except tk.TclError:
+                pass
         key = self._filler_key()
         want = {c.key: self._width_of(c.key) for c in self.columns}
         total = sum(want.values())
@@ -269,6 +305,28 @@ class DataTable(tk.Frame):
                 return
         # 拖完之后余量要重新分配（可能拖窄了，空出一截）
         self._on_tree_configure()
+
+    # ------------------------------------------------------------ 光标
+    def _reset_cursor(self, _e=None) -> None:
+        """把表格上的小手/双箭头还原成普通箭头。
+
+        只在真的设过 cursor 时才调 configure —— 这个回调挂在 toplevel 上，
+        整个窗口每次松手都会走到，没必要每次都发一条 Tk 命令。
+        """
+        try:
+            if self.tree.cget("cursor"):
+                self.tree.configure(cursor="")
+        except tk.TclError:
+            pass
+
+    def _maybe_reset_cursor(self, event) -> None:
+        """鼠标在表格上移动：左键已经松开却还顶着拖拽光标，就地还原。"""
+        try:
+            if int(getattr(event, "state", 0)) & 0x100:   # Button1 还按着
+                return
+        except (TypeError, ValueError):
+            return
+        self._reset_cursor()
 
     # ------------------------------------------------------------ 主题
     def _xscroll_set(self, first, last) -> None:
@@ -326,6 +384,10 @@ class DataTable(tk.Frame):
         try:
             self.tree.tag_configure("odd", background=U.T.card, foreground=U.T.text)
             self.tree.tag_configure("even", background=U.T.alt, foreground=U.T.text)
+            # 组头：比正文淡一档、加粗，看起来才像「标题」而不是一条数据行
+            self.tree.tag_configure("grp", background=U.T.alt,
+                                    foreground=U.T.text_dim,
+                                    font=(U.FONT_FAMILY, 9, "bold"))
             for tone, key in _TONE_FG.items():
                 col = getattr(U.T, key)
                 self.tree.tag_configure("t_" + tone, foreground=col)
@@ -356,8 +418,112 @@ class DataTable(tk.Frame):
             self.tree.configure(columns=keys, displaycolumns=keys)
         except tk.TclError:
             return
+        self._apply_show()
         self._apply_columns()
         self._render()
+
+    def set_group(self, key: str | None, empty: str = "未分组",
+                  expanded: bool = True) -> None:
+        """按某个字段把行折叠成组；`key=None` 关掉，回到平表。
+
+        组头就是 Treeview 的父节点，所以折叠/展开是 Tk 自带的，不用自己画。
+        代价是 `show="headings"` 得改成 `show="tree headings"`：最左边多出
+        一列 `#0` 专门放组名与缩进，被分组的那一列本身则从 displaycolumns 里
+        摘掉（组名已经在左边了，再重复一遍纯属占地方）。
+        """
+        self._group_key = key or None
+        self._group_empty = empty or "未分组"
+        self._group_open_default = bool(expanded)
+        self._apply_show()
+        self._render()
+
+    def is_grouped(self) -> bool:
+        return bool(self._group_key)
+
+    def groups(self) -> list[str]:
+        """上回渲染出现过的组名（顺序 = 显示顺序）。"""
+        return list(self._groups_seen)
+
+    def set_all_open(self, open_: bool) -> None:
+        """全部展开 / 全部收起。记住整个组的名字，不只当前可见的那批。"""
+        for g in set(self._groups_seen) | set(self._open):
+            self._open[g] = bool(open_)
+        self._group_open_default = bool(open_)
+        self._render()
+
+    def _apply_show(self) -> None:
+        keys = [c.key for c in self.columns]
+        try:
+            if self._group_key:
+                self.tree.configure(show="tree headings",
+                                    displaycolumns=[k for k in keys
+                                                    if k != self._group_key])
+                self.tree.heading("#0", text="分组")
+                self.tree.column("#0", width=self._g0_w,
+                                 minwidth=U.px(96), stretch=False)
+            else:
+                self.tree.configure(show="headings", displaycolumns=keys)
+        except tk.TclError:
+            pass
+
+    def _remember_open(self, _e=None) -> None:
+        if not self._group_key:
+            return
+        try:
+            kids = self.tree.get_children("")
+        except tk.TclError:
+            return
+        for gid in kids:
+            name = self._gid_name.get(gid)
+            if name is None:
+                continue
+            try:
+                self._open[name] = bool(self.tree.item(gid, "open"))
+            except tk.TclError:
+                continue
+
+    def column_at(self, x: int) -> str:
+        """鼠标横坐标落在哪一列（返回列 key，分组列返回 "#0"）。
+
+        `identify_column` 只给 "#8" 这种显示序号，序号会随分组开关变化，
+        所以统一换成列 key —— 调用方按 key 判断才不会被分组与否带偏。
+        """
+        try:
+            cid = str(self.tree.identify_column(int(x)))
+        except (tk.TclError, TypeError, ValueError):
+            return ""
+        if not cid.startswith("#"):
+            return ""
+        try:
+            n = int(cid[1:])
+        except ValueError:
+            return ""
+        if n == 0:
+            return "#0"
+        keys = [c.key for c in self.columns
+                if not self._group_key or c.key != self._group_key]
+        return keys[n - 1] if 0 < n <= len(keys) else ""
+
+    def row_at(self, y: int) -> dict | None:
+        """鼠标纵坐标落在哪一行（组头返回 None）。"""
+        try:
+            iid = self.tree.identify_row(int(y))
+        except (tk.TclError, TypeError, ValueError):
+            return None
+        return self._iid_row.get(iid) if iid else None
+
+    def select_index(self, idx: int) -> dict | None:
+        """按 `_view` 下标选中一行。分组后 iid 不是序号，所以别再用 iid 猜。"""
+        iid = self._row_iid.get(idx)
+        if not iid:
+            return None
+        try:
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.see(iid)
+        except tk.TclError:
+            return None
+        return self._view[idx] if 0 <= idx < len(self._view) else None
 
     def set_rows(self, rows: list[dict]) -> None:
         self._rows = [r for r in (rows or []) if isinstance(r, dict)]
@@ -378,17 +544,12 @@ class DataTable(tk.Frame):
         sel = self.tree.selection()
         if not sel:
             return None
-        try:
-            i = int(sel[0])
-        except (TypeError, ValueError):
-            return None
-        return self._view[i] if 0 <= i < len(self._view) else None
+        # 分组后 iid 是 "r12"/"g3" 这种，不再是 _view 下标 —— 一律查表。
+        # 组头行不进 _iid_row，所以点组头取到的就是 None（它本来也没有行数据）。
+        return self._iid_row.get(sel[0])
 
     def select_first(self) -> None:
-        kids = self.tree.get_children()
-        if kids:
-            self.tree.selection_set(kids[0])
-            self.tree.focus(kids[0])
+        self.select_index(0)
 
     def select_row(self, pred) -> dict | None:
         """按谓词找第一行并选中它（改完规则后高亮新行用）。
@@ -410,12 +571,7 @@ class DataTable(tk.Frame):
                     continue
             except Exception:  # noqa: BLE001  谓词写错了就当没匹配上
                 return None
-            try:
-                iid = str(i)
-                self.tree.selection_set(iid)
-                self.tree.focus(iid)
-                self.tree.see(iid)
-            except tk.TclError:
+            if self.select_index(i) is None:
                 return None
             return row
         return None
@@ -459,13 +615,27 @@ class DataTable(tk.Frame):
             except (TypeError, ValueError):
                 return (1, str(v).lower())
 
+        if self._group_key:
+            # 分组时排序必须**只组内排** —— 否则一排序组就被拆散，
+            # 同一组的模型散落到列表各处，分组等于白做。
+            def grp(r):
+                return str(r.get(self._group_key) or self._group_empty).lower()
+            self._view.sort(key=lambda r: (grp(r), num(r.get(key, ""))),
+                            reverse=self._sort_desc)
+            return
         self._view.sort(key=lambda r: num(r.get(key, "")), reverse=self._sort_desc)
 
     def _render(self) -> None:
+        if self._group_key:
+            self._render_grouped()
+            return
         try:
             self.tree.delete(*self.tree.get_children())
         except tk.TclError:
             return
+        self._iid_row.clear()
+        self._row_iid.clear()
+        self._gid_name.clear()
         shown = self._view[:MAX_ROWS]
         for i, row in enumerate(shown):
             vals = [c.text(row) for c in self.columns]
@@ -477,15 +647,73 @@ class DataTable(tk.Frame):
                 tags.append("t_mute")
             try:
                 # iid 用序号：排序/过滤后仍能反查 _view
-                self.tree.insert("", "end", iid=str(i), values=vals, tags=tuple(tags))
+                iid = str(i)
+                self.tree.insert("", "end", iid=iid, values=vals, tags=tuple(tags))
             except tk.TclError:
-                pass
+                continue
+            self._iid_row[iid] = row
+            self._row_iid[i] = iid
+        self._render_tail("")
+
+    def _render_grouped(self) -> None:
+        """按 `_group_key` 折叠：一条组头（父节点）+ 若干模型行（子节点）。
+
+        手风琴是 Tk 自带的（父节点三角），不自己画；展开状态存在 `_open` 里，
+        rebuild 之后还原 —— 否则「收起一组 → 新增一个模型 → 组又弹开了」。
+        """
+        try:
+            self.tree.delete(*self.tree.get_children(""))
+        except tk.TclError:
+            return
+        self._iid_row.clear()
+        self._row_iid.clear()
+        self._gid_name.clear()
+        shown = self._view[:MAX_ROWS]
+        order: list[str] = []
+        buckets: dict[str, list[tuple[int, dict]]] = {}
+        for i, row in enumerate(shown):
+            g = str(row.get(self._group_key) or "").strip() or self._group_empty
+            if g not in buckets:
+                buckets[g] = []
+                order.append(g)
+            buckets[g].append((i, row))
+        for gi, g in enumerate(order):
+            gid = "g%d" % gi
+            is_open = self._open.get(g, self._group_open_default)
+            try:
+                self.tree.insert(
+                    "", "end", iid=gid, text=f"{g}　({len(buckets[g])})",
+                    values=[""] * len(self.columns), tags=("grp",), open=is_open)
+            except tk.TclError:
+                continue
+            self._gid_name[gid] = g
+            for i, row in buckets[g]:
+                vals = [c.text(row) for c in self.columns]
+                tags = ["even" if i % 2 else "odd"]
+                tone = row.get("_tone")
+                if tone in _TONE_FG:
+                    tags.append("t_" + tone)
+                if row.get("_strike"):
+                    tags.append("t_mute")
+                rid = "r%d" % i
+                try:
+                    self.tree.insert(gid, "end", iid=rid, values=vals,
+                                     tags=tuple(tags))
+                except tk.TclError:
+                    continue
+                self._iid_row[rid] = row
+                self._row_iid[i] = rid
+        self._groups_seen = list(order)
+        self._render_tail(f"　·　{len(order)} 个分组" if order else "")
+
+    def _render_tail(self, note: str) -> None:
+        """行插完之后共用的收尾：计数、空态、表头排序标记。"""
         if len(self._view) > MAX_ROWS:
             self.lb_count.configure(
                 text=f"{len(self._view)} 项（列表只渲染前 {MAX_ROWS} 条，用搜索缩小）")
         else:
             self.lb_count.configure(
-                text=f"{len(self._view)} 项" if self._view else "")
+                text=(f"{len(self._view)} 项{note}" if self._view else ""))
         self._refresh_empty()
         hdr = [(c.title, self._sort_key == c.key, self._sort_desc) for c in self.columns]
         for c, (title, active, desc) in zip(self.columns, hdr):

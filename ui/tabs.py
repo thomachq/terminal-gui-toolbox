@@ -79,7 +79,9 @@ class TabBar(tk.Frame):
             btn_close.pack(side="left", padx=(0, U.px(3)))
             btn_close.bind("<Button-1>", lambda e: (self.close(key), "break")[1])
 
-        for w in (box, inner, lb):
+        # 顶部那 2px 色条也要能点：它在 box 的最上沿，视觉上属于页签，
+        # 点上去没反应就成了「这个页签有时候点不动」。
+        for w in (box, bar, inner, lb):
             w.bind("<Button-1>", lambda e, k=key: self.select(k))
             w.bind("<Enter>", lambda e, k=key: self._hover(k, True))
             w.bind("<Leave>", lambda e, k=key: self._hover(k, False))

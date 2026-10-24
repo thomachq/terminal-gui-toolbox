@@ -127,9 +127,13 @@ DEFAULT_DESC = ("能直接操作这台设备：读系统状态、查日志、改
 
 
 def tool_catalog(enabled: list[str] | None = None) -> str:
-    """把启用的工具拼成给模型看的清单。enabled 为 None 表示全开。"""
+    """把启用的工具拼成给模型看的清单。enabled 为 None 表示全开。
+
+    MCP 工具是**动态**的：清单由 `core.mcp` 从各服务器列出来，条目多、
+    还带 JSON Schema，所以单独一段，不进 TOOLS 常量表。
+    """
     ids = DEFAULT_TOOLS if enabled is None else [i for i in enabled if i in TOOLS]
-    if not ids:
+    if not ids and not DYNAMIC:
         return "（本轮没有启用任何工具，只能用已有知识回答，不要提出任何操作）"
     out: list[str] = []
     for g in GROUPS:
@@ -142,7 +146,40 @@ def tool_catalog(enabled: list[str] | None = None) -> str:
             out.append(f"- {t.id}（{t.label}）{t.desc}{arg}")
             if t.sample:
                 out.append(f"  例：{t.sample}")
+    if DYNAMIC:
+        out.append("【MCP】这些是 MCP 服务器提供的工具，参数写在 args 里：")
+        for tid, r in DYNAMIC.items():
+            desc = str(r.get("desc") or "").strip().replace("\n", " ")
+            out.append(f"- {tid}（{r.get('name')}@{r.get('server')}）"
+                       f"{desc[:180]}　参数：{_schema_args(r.get('schema'))}")
     return "\n".join(out)
+
+
+# ------------------------------------------------------------------ 动态工具（MCP）
+#: 工具 id → {id, name, server, desc, schema}。由界面层在每轮开始前刷新，
+#: 不落盘也不进 TOOLS：MCP 的工具表是外部进程给的，随时会变。
+DYNAMIC: dict[str, dict] = {}
+
+
+def register_dynamic(rows: list[dict] | None) -> None:
+    """把这一轮可用的 MCP 工具登记进来（空列表 = 这轮没有）。"""
+    DYNAMIC.clear()
+    for r in rows or []:
+        tid = str(r.get("id") or "")
+        if tid:
+            DYNAMIC[tid] = r
+
+
+def _schema_args(schema) -> str:
+    """把 JSON Schema 的 properties 说成「a、b(可选)」。"""
+    if not isinstance(schema, dict):
+        return ""
+    props = schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return "（无）"
+    req = set(schema.get("required") or [])
+    rows = [k if k in req else f"{k}(可选)" for k in list(props)[:12]]
+    return "、".join(rows)
 
 
 def known_pages_hint(pages: list[str]) -> str:
@@ -277,6 +314,25 @@ def normalize_calls(items, allowed: list[str] | None = None) -> tuple[list[dict]
         tid = str(item.get("tool") or item.get("name") or "").strip()
         if not tid and _arg_value(item, "cmd"):
             tid = "exec"          # 老格式 {"cmd": ...} 当作 exec
+        # MCP 工具：参数是服务端给的 JSON Schema，不按 arg_keys 校验，
+        # 整包透传。允许列表里没有它就当没启用（和内置工具一个待遇）。
+        if tid.startswith("mcp__"):
+            if tid not in DYNAMIC:
+                bad.append(f"{tid}（不在本轮 MCP 工具里）")
+                continue
+            raw = item.get("args")
+            if raw is None:
+                raw = item.get("arguments")
+            if not isinstance(raw, dict):
+                raw = {k: v for k, v in item.items()
+                       if k not in ("tool", "name", "why", "reason", "risk")}
+            calls.append({
+                "tool": tid,
+                "args": raw,
+                "why": str(item.get("why") or item.get("reason") or "").strip()[:200],
+                "risk": str(item.get("risk") or "").strip().lower(),
+            })
+            continue
         if tid not in TOOLS:
             bad.append(tid or "未指定工具")
             continue
@@ -311,6 +367,9 @@ def default_risk(call: dict) -> str:
     tid = call.get("tool")
     if tid == "exec":
         return aiops.classify_risk(call.get("args", {}).get("cmd", ""))
+    if str(tid or "").startswith("mcp__"):
+        # MCP 工具能干什么只有它自己知道，一律当改动类：会在人眼前过一道
+        return "write"
     spec = TOOLS.get(tid or "")
     return spec.risk if spec else "read"
 
