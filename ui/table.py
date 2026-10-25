@@ -948,8 +948,16 @@ class KVGrid(tk.Frame):
 
     # ------------------------------------------------ 内容
     def set_items(self, items: list[tuple]) -> None:
-        """items: [(label, value, tone|None)]，整体重建。"""
-        self._items = [(i[0], i[1], i[2] if len(i) > 2 else None) for i in items]
+        """items: [(label, value, tone|None[, (按钮文字, 回调)])]，整体重建。
+
+        第 4 项必须原样保留 —— `_layout` 靠它画行尾按钮（令牌「复制」就是这么挂的），
+        早年这里只截到 3 项，按钮传进来会被静默吃掉。
+        """
+        self._items = [
+            (i[0], i[1], i[2] if len(i) > 2 else None,
+             i[3] if len(i) > 3 else None)
+            for i in items
+        ]
         self._laid_out = 0
         self._layout(self._fit_columns())
 
@@ -962,7 +970,12 @@ class KVGrid(tk.Frame):
         for i in range(ncol):
             self.columnconfigure(i * 2, weight=0)
             self.columnconfigure(i * 2 + 1, weight=1)
-        for i, (label, value, tone) in enumerate(self._items):
+        for i, item in enumerate(self._items):
+            label, value = item[0], item[1]
+            tone = item[2] if len(item) > 2 else None
+            # 第 4 项可选：(按钮文字, 回调)。给「看得见但不该露」的值配一个
+            # 复制按钮 —— 比如 API 令牌，屏幕上只有星号，要用就点一下复制。
+            action = item[3] if len(item) > 3 else None
             r, c = divmod(i, ncol)
             lb = U.wlabel(self, label, "mute", U.FONT_S, anchor="w",
                           width=max(6, self.label_w // 8))
@@ -970,9 +983,18 @@ class KVGrid(tk.Frame):
                     padx=(0, U.px(10)), pady=U.px(5))
             role = {"ok": "ok", "err": "pageerr", "warn": "warn",
                     "brand": "brand"}.get(tone or "", "card")
-            vl = U.wlabel(self, str(value), role, U.FONT_S, anchor="w")
-            vl.grid(row=r, column=c * 2 + 1, sticky="w",
-                    padx=(0, U.px(24)), pady=U.px(5))
+            cell = tk.Frame(self, bg=U.T.card, bd=0)
+            cell.grid(row=r, column=c * 2 + 1, sticky="w",
+                      padx=(0, U.px(24)), pady=U.px(5))
+            vl = U.wlabel(cell, str(value), role, U.FONT_S, anchor="w")
+            vl.pack(side="left")
+            if action:
+                try:
+                    U.RoundButton(cell, action[0], action[1], variant="ghost",
+                                  font=U.FONT_XS, height=22, padx=8
+                                  ).pack(side="left", padx=(U.px(6), 0))
+                except Exception:  # noqa: BLE001  按钮挂不上不该拖垮整块信息
+                    pass
             self._cells.append((lb, vl))
 
 

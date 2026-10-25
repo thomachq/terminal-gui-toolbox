@@ -156,8 +156,15 @@ class ApiConfig:
         return tok
 
     def token_masked(self) -> str:
+        """界面上只给星号 —— 令牌是「要就复制，别摊在屏幕上」的东西。
+
+        以前显示成 `ttb_AbCd12…wxyz`：前 8 后 4 全露着，截图、投屏、录屏
+        都等于把大半个令牌送出去了。现在只留前缀区分「这是什么」，
+        真要用的地方点旁边的「复制」。
+        """
         t = self.token()
-        return t[:8] + "…" + t[-4:] if len(t) > 14 else "…"
+        prefix = "ttb_" if t.startswith("ttb_") else ""
+        return prefix + "*" * 12
 
     def public(self) -> dict:
         return {

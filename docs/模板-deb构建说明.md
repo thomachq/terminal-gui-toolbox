@@ -159,6 +159,22 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * Fixed: Docker was reported as "not installed" on machines that do have
+    it, because the docker binary is not in the SSH PATH. Synology keeps the
+    real binary under /var/packages/ContainerManager/ and only a symlink in
+    /usr/local/bin, while the session PATH is /usr/bin:/bin:/usr/sbin:/sbin.
+    Known absolute locations are now probed in a single command.
+  * `sudo -n` is tried before giving up: Synology grants passwordless sudo to
+    the administrators group, and the old code only tried sudo when a sudo
+    password had been stored, so the working path was never reached.
+  * Container listings use a field template instead of `--format '{{json .}}'`
+    (on DSM `docker ps` went from 65s to 0.1s, `docker images` from 43.9s to
+    0.1s); the JSON form is still the fallback for older docker versions.
+  * The API token is masked in the UI as `ttb_************` and has a copy
+    button that puts the real token on the clipboard.
+  * Added an `ssh-toolbox` skill that drives this program's local HTTP API
+    for SSH sessions; it decrypts the stored token itself (pure Python
+    AES-256-GCM), so no token has to be copied by hand.
   * Fixed: "auto-elevate on connect" could not work at all, because the
     password prompt was never recognised. sudo prints
     "[sudo] password for <user>: " and the matcher required "password"

@@ -114,7 +114,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.17"
+APP_VER = "1.0.18"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -2284,7 +2284,11 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                         key_passphrase=self.v_keypw.get(),
                         # 本机 Windows 的执行外壳（cmd / powershell / 自动）
                         shell=(self.v_shell.get() if is_local else ""),
-                        sudo_password=self.v_sudopw.get().strip() if elevate else "",
+                        # 密码**总是**带上：勾了自动提权就用它进 root；没勾也留着，
+                        # 页面上的按需操作（Docker / 防火墙 / 路由）要用时才有得用。
+                        # 以前只在 elevate 时才传，于是「密码填了、框没勾」的用户
+                        # 一点 Docker 就报「无权访问 / 未安装」，白填一次密码。
+                        sudo_password=self.v_sudopw.get().strip(),
                         elevate=elevate)
 
         if proto == "ssh":
@@ -2327,6 +2331,16 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 s.bind_device(dev)
             except Exception:  # noqa: BLE001
                 pass
+            # 没勾「自动提权」也把 sudo 密码挂到会话上：页面上的按需操作
+            # （Docker、防火墙、路由表）本来就要 root，有这个密码就能直接过，
+            # 不用每次弹窗问。注意**只设密码、不设 elevated** —— 提权与否
+            # 是另一件事，终端该不该整条走 root 由 elevate_root 决定。
+            if not spec.elevate and spec.sudo_password and \
+                    getattr(dev, "os_family", "") != "network":
+                try:
+                    s.sudo_pw = spec.sudo_password
+                except Exception:  # noqa: BLE001
+                    pass
             elev = ""
             elev_why = ""
             used_login_pw = False

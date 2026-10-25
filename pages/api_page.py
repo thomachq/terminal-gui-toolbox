@@ -132,7 +132,7 @@ class ApiPage:
         self.lbl_api_url.configure(text=srv.url() if running else "")
         self.kk_api.set_items([
             ("监听地址", f"{cfg.data.get('host')}:{cfg.data.get('port')}", None),
-            ("令牌", cfg.token_masked(), "brand"),
+            ("令牌", cfg.token_masked(), "brand", ("复制", self.api_copy_token)),
             ("保活间隔", f"{int(cfg.data.get('keepalive') or 0)} 秒" if
              int(cfg.data.get("keepalive") or 0) else "关闭", None),
             ("连接数", str(len(srv.pool.list())), None),

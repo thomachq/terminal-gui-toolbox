@@ -600,9 +600,56 @@ def _json_lines(text: str) -> list[dict]:
     return out
 
 
+# docker 列表的字段清单（顺序即分隔符格式里的顺序）。
+# 为什么不用 `{{json .}}`：在群晖上实测 `docker ps -a --format '{{json .}}'`
+# 要 **65 秒**，而只取这几个字段只要 **0.1 秒** —— 差在 .Labels/.Mounts/
+# .Networks 这些字段上，daemon 要为每个容器多绕几圈。用自定义分隔符取字段，
+# 又不用放弃逐行解析。
+SEP = "\x1f"
+
+PS_FIELDS = ("ID", "Names", "Image", "State", "Status", "Ports",
+             "CreatedAt", "RunningFor")
+IMG_FIELDS = ("Repository", "Tag", "ID", "CreatedSince", "Size")
+STAT_FIELDS = ("Name", "CPUPerc", "MemUsage", "MemPerc", "NetIO", "BlockIO",
+               "PIDs")
+DF_FIELDS = ("Type", "TotalCount", "Active", "Size", "Reclaimable")
+
+
+def fmt_fields(fields) -> str:
+    """拼出 `{{.A}}<0x1f>{{.B}}` 这样的 docker --format 串。
+
+    `\\x1f` 是 Go 模板里的转义（docker 用 Go 的 text/template），
+    值里几乎不可能出现这个字符，比自己挑个 `|` 之类安全。
+    """
+    sep = '{{"\\x1f"}}'
+    return sep.join("{{." + f + "}}" for f in fields)
+
+
+def _records(text: str, fields) -> list[dict]:
+    """两种输出都认：逐行 JSON，或者按 SEP 分隔的定长行（见 fmt_fields）。"""
+    rows = []
+    for ln in _lines(text):
+        ln = ln.rstrip()
+        if not ln.strip():
+            continue
+        if ln.lstrip().startswith("{"):
+            try:
+                o = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(o, dict):
+                rows.append(o)
+            continue
+        parts = ln.split(SEP)
+        if len(parts) != len(fields):
+            continue
+        rows.append(dict(zip(fields, parts)))
+    return rows
+
+
 def docker_ps(text: str) -> list[dict]:
     rows = []
-    for o in _json_lines(text):
+    for o in _records(text, PS_FIELDS):
         state = str(o.get("State") or "").lower()
         rows.append({
             "id": (o.get("ID") or "")[:12],
@@ -621,7 +668,7 @@ def docker_ps(text: str) -> list[dict]:
 
 def docker_images(text: str) -> list[dict]:
     rows = []
-    for o in _json_lines(text):
+    for o in _records(text, IMG_FIELDS):
         rows.append({
             "repo": o.get("Repository") or "<none>",
             "tag": o.get("Tag") or "<none>",
@@ -636,7 +683,7 @@ def docker_images(text: str) -> list[dict]:
 
 def docker_stats(text: str) -> list[dict]:
     rows = []
-    for o in _json_lines(text):
+    for o in _records(text, STAT_FIELDS):
         cpu = str(o.get("CPUPerc") or "0%").rstrip("%")
         mem_pct = str(o.get("MemPerc") or "0%").rstrip("%")
         usage = str(o.get("MemUsage") or "")
@@ -659,9 +706,9 @@ def docker_stats(text: str) -> list[dict]:
 
 
 def docker_df(text: str) -> list[dict]:
-    """`docker system df --format '{{json .}}'`。"""
+    """`docker system df --format ...`。"""
     rows = []
-    for o in _json_lines(text):
+    for o in _records(text, DF_FIELDS):
         rows.append({"type": o.get("Type") or "", "total": o.get("TotalCount") or "",
                      "active": o.get("Active") or "", "size": o.get("Size") or "",
                      "reclaim": o.get("Reclaimable") or ""})

@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""终端与主程序集成：连本机 → 开终端 → 敲命令 → 主程序命令旁路 → 断开联动。"""
+"""终端与主程序集成：连本机 → 开终端 → 敲命令 → 主程序命令旁路 → 断开联动。
+
+终端早已不是独立窗口，而是工作区里的一个页签（`app._term_panes["term"]`，
+`app._term` 只在「拉出去」时才有值）。这个脚本原来按独立窗口写，
+`a._term` 恒为 None，于是从「终端窗口已出现」开始全线失败 —— 现在按页签测。
+"""
 from __future__ import annotations
 
 import sys
@@ -66,10 +71,14 @@ def main():
     print("\n3. 打开终端")
     a.open_terminal()
     pump(a, 0.6)
-    w = a._term
-    chk(w is not None and w.winfo_exists() == 1, "终端窗口已出现")
-    chk("终端" in w.title(), "标题栏", w.title())
-    chk("本机" in w.title() or "LOCAL" in w.title(), "标题带设备", w.title())
+    w = a._term_live()
+    chk(w is not None and w.winfo_exists() == 1, "终端页签已出现")
+    chk(a.TERM_TAB in a._term_panes, "页签登记在 _term_panes 里")
+    chk(a.TERM_TAB in a.tabbar.tabs, "页签栏上有终端")
+    chk(a._term is None, "默认是内嵌页签，不是独立窗口")
+    label = a._term_label()
+    chk("终端" in label, "页签标题", label)
+    chk("本机" in label or "LOCAL" in label, "标题带设备", label)
     chk(a.term_ready(), "term_ready 为真")
     ps = a.term_prompt()
     chk(ps.endswith("> ") or ps.endswith("$ "), "提示符成型", ps)
@@ -101,22 +110,25 @@ def main():
     a._disconnect()
     pump(a, 0.4)
     chk(a._term_cwd_val == "", "断开后目录缓存清空")
-    chk("未连接" in w.title(), "终端标题跟着变", w.title())
+    chk("未连接" in a._term_label(), "终端标题跟着变", a._term_label())
     w.v_in.set("echo nope")
     w._submit()
     pump(a, 0.5)
     chk("未连接" in w.text.get("1.0", "end"), "断开后敲命令被拦住")
 
-    print("\n8. 再开一次不重复建窗")
-    old = a._term
+    print("\n8. 再开一次不重复建页签")
+    old = w
     a.open_terminal()
     pump(a, 0.3)
-    chk(a._term is old, "已开着就只前置，不新建")
+    chk(a._term_live() is old, "已开着就只切过去，不新建")
+    chk(len(a._term_panes) == 1, "终端页签始终只有一个",
+        str(len(a._term_panes)))
 
     print("\n9. 关闭")
-    w.close()
+    a._tab_close(a.TERM_TAB)
     pump(a, 0.3)
-    chk(a._term is None, "关掉后主程序不再持有引用")
+    chk(a._term_live() is None, "关掉后主程序不再持有引用")
+    chk(a.TERM_TAB not in a._term_panes, "登记表里也清了")
 
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     if BAD:
