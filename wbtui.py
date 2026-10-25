@@ -302,13 +302,27 @@ def configure_ttk(root: tk.Misc) -> None:
     except tk.TclError:
         pass
 
+    # gripsize=0：clam 的滑块中间自带几条 grip 白纹，在浅色底上像一道
+    # 渲染错误的横杠（导航滚动条放大后特别明显）。三套滚动条一起关掉。
     st.configure("TScrollbar", background=T.border, troughcolor=T.page,
                  bordercolor=T.page, arrowcolor=T.text_mute, width=px(11),
-                 relief="flat", borderwidth=0)
+                 gripsize=0, relief="flat", borderwidth=0)
     st.map("TScrollbar", background=[("active", T.border2)])
     st.configure("Card.Vertical.TScrollbar", background=T.border,
                  troughcolor=T.card, bordercolor=T.card,
-                 arrowcolor=T.text_mute, width=px(11), relief="flat", borderwidth=0)
+                 arrowcolor=T.text_mute, width=px(11), gripsize=0,
+                 relief="flat", borderwidth=0)
+    # 侧边导航的滚动条：底槽要跟导航底色一致。用 Card 那套的话，
+    # 淡蓝导航上会贴一条纯白竖条，看着像没画完的边框。
+    # 滑块用 text_mute 而不是 border2：border2 在淡蓝底上几乎看不见，
+    # 用户会以为「滚动条还是没出来」。
+    # gripsize=0：clam 的滑块中间自带几条 grip 白纹（放大看很明显，
+    # 灰底上一道白杠像渲染坏了），这个选项才能把它关掉。
+    st.configure("Nav.Vertical.TScrollbar", background=T.text_mute,
+                 troughcolor=T.page, bordercolor=T.page,
+                 arrowcolor=T.text_dim, width=px(12), gripsize=0,
+                 relief="flat", borderwidth=0)
+    st.map("Nav.Vertical.TScrollbar", background=[("active", T.text_dim)])
 
     st.configure("TNotebook", background=T.page, borderwidth=0)
     st.configure("TNotebook.Tab", background=T.page, foreground=T.text_dim,
@@ -980,7 +994,7 @@ class Nav(tk.Frame):
                                  yscrollincrement=px(20))
         self._sb = ttk.Scrollbar(self, orient="vertical",
                                  command=self._canvas.yview,
-                                 style="Card.Vertical.TScrollbar")
+                                 style="Nav.Vertical.TScrollbar")
         self._sb_visible = False
         self._canvas.configure(yscrollcommand=self._on_scroll_set)
 
@@ -1022,9 +1036,11 @@ class Nav(tk.Frame):
                 for pair in subs or []:
                     if not pair or len(pair) < 2:
                         continue
-                    # 文字 + 标签左右 padx + 左侧 accent + 条目外边距
+                    # 文字 + 标签左右 padx + 左侧 accent + 条目外边距 +
+                    # 滚动条（px(12)，装不下时才出现，但宽度得先留出来，
+                    # 否则一出现就把长标题挤掉）
                     need = max(need, f.measure(str(pair[1]))
-                               + px(13 + ind) * 2 + px(16))
+                               + px(13 + ind) * 2 + px(16) + px(14))
             self.configure(width=max(px(base), min(px(220), need)))
         except Exception:  # noqa: BLE001  量不出来就用默认宽度，不该拖垮导航
             pass
@@ -1064,7 +1080,13 @@ class Nav(tk.Frame):
             return
         need = ih > ch + 1
         if need and not self._sb_visible:
-            self._sb.pack(side="right", fill="y")
+            # 顺序铁律：滚动条必须排在画布**之前**被 pack。
+            # 画布带 expand=True，先 pack 它就会把整条宽度吃光，滚动条只分到
+            # 1px —— 肉眼看不见、也点不到（实测 winfo_width()=1、is_mapped=0），
+            # 表现为「右侧那条滚动条根本没出来」。ScrollBox 当初踩的就是这个。
+            # 这里用 before= 把滚动条插到画布前面，pack_forget 之后重新 pack
+            # 也不会跑到队尾。
+            self._sb.pack(side="right", fill="y", before=self._canvas)
             self._sb_visible = True
         elif not need and self._sb_visible:
             self._sb.pack_forget()

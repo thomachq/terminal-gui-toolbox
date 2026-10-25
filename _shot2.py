@@ -32,6 +32,16 @@ g = ctypes.windll.gdi32
 page = sys.argv[1] if len(sys.argv) > 1 else "conn"
 extra = sys.argv[2:]
 dark = "--dark" in extra
+# 等待秒数可调：固定 2.4 秒在机器忙的时候会抓到「界面还没画完」的半成品
+# 截图（导航空着、表格空着），看上去像程序坏了。加 --wait 让调用方按页给。
+wait = 2.4
+if "--wait" in extra:
+    i = extra.index("--wait")
+    try:
+        wait = float(extra[i + 1])
+    except (IndexError, ValueError):
+        pass
+    extra = extra[:i] + extra[i + 2:]
 
 
 def kill_tree(p):
@@ -136,7 +146,7 @@ def capture(hwnd):
     return Image.frombuffer("RGB", (w, h), buf, "raw", "BGRX", 0, 1)
 
 
-time.sleep(2.4)
+time.sleep(wait)
 try:
     img = capture(hwnd)
     dst = OUT / f"{page}{'_dark' if dark else ''}.png"

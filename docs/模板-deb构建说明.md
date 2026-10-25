@@ -159,6 +159,20 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * The side navigation scrollbar is actually visible now. The canvas and the
+    scrollbar were both there, but packed in the wrong order: the canvas has
+    `expand=True`, so packing it first ate the whole width and left the
+    scrollbar 1px wide and unmapped - effectively invisible. On a short
+    window the lower entries (scheduled tasks, database) could not be reached
+    at all. The scrollbar is now packed before the canvas, is 21px wide and
+    clickable, hides itself again when everything fits, uses a darker thumb
+    (the old light blue was invisible on the light blue rail) and has clam's
+    built-in grip lines turned off - they drew a white bar across the thumb
+    that looked like a rendering glitch. All three scrollbar styles get the
+    same fix.
+  * `_shot2.py` takes `--wait N` instead of a hardcoded 2.4s delay, so a busy
+    machine no longer yields half-rendered screenshots.
+
   * Single instance actually limits multiple windows now. Test flags
     (`--page`, `--no-probe`, `--dark`) used to bypass the single-instance
     check entirely, so an instance launched for testing could coexist with
