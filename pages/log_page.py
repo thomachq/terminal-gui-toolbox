@@ -20,7 +20,7 @@ from tkinter import filedialog, messagebox
 import wbtui as U
 from core import audit as A
 from ui import forms
-from ui.table import Column, DataTable
+from ui.table import ROW_H_DENSE, Column, DataTable
 
 LOG_COLS = [
     Column("title", "事件标题", 230, stretch=True),
@@ -63,7 +63,7 @@ class LogPage:
         self.lbl_audit_sum.pack(side="right", padx=(0, U.px(10)))
 
         self.tbl_audit = DataTable(
-            pg, LOG_COLS, height=13,
+            pg, LOG_COLS, height=13, row_h=ROW_H_DENSE,
             search_hint="搜索事件、详情、设备",
             empty_title="还没有操作记录",
             empty_hint="运维工具跑的命令与输出、AI 执行的动作、审批、"

@@ -15,15 +15,20 @@ import tkinter as tk
 import wbtui as U
 
 GRIP_H = 5          # 顶部抓手的高度（逻辑像素）
-MIN_H = 200         # 拖到最矮也要能看见表头 + 三五行（原来 140，只剩个表头）
-DEFAULT_H = 280     # 默认高度：能看五六条 + 筛选条 + 分页（原来实际只有 160 太扁）
-USABLE_H = 240      # 低于这个数等于「没设置过」，按 DEFAULT_H 起
-RATIO = 0.72        # 最高不超过窗口高度的 72%，否则主界面就没地方了
-# 默认高度还要跟窗口高度挂钩。定死 280 在 1747×1136（逻辑 1165×757）的窗口上
-# 要吃掉 37%：左侧导航被挤到只剩 5 项（「运维工具」以下全都点不到），主机表格
-# 只剩 2 行。用户 2026-10-25 报的「界面显示不完整」里就有这一条。
-# 用户自己拖过的高度不受影响，只有「没设置过 / 老存档」才按比例算。
-AUTO_RATIO = 0.30
+MIN_H = 200         # 拖到最矮也要能看见表头 + 一两条
+# 默认高度按「看得见几条」倒推，不按窗口比例拍。日志表的行高是 26 逻辑像素
+# （ROW_H_DENSE：39 物理），表头 51 物理。实测（面板逻辑像素 → 完整/半截）：
+#   250 → 2/1、251 → 3/0、252 → 3/0、253 → 3/1、255 → 3/1
+# 用户 2026-10-25 的要求是「能展示 3 条就可以」，取 252：正好表头 + 整 3 行，
+# 第 4 条一点都不露（露半行看着像表格被裁坏了）。掉到 250 会变成 2 条，
+# 所以这里没有余量可加 —— 改行高时这条要重测（_logdocktest 会红）。
+DEFAULT_H = 252
+USABLE_H = 210      # 低于这个数等于「没设置过」，按 DEFAULT_H 起
+RATIO = 0.72        # 拖动的上限：不超过窗口高度的 72%，否则主界面就没地方了
+# 默认高度跟窗口高度的关系只用来**兜底**：窗口很矮时别把主界面挤没。
+# 原来这里按 0.30 收，结果 1080 高的窗口把默认值压成 216 逻辑（只露 1 条），
+# 反而是「越该看清越看不清」。
+FALLBACK_RATIO = 0.45
 
 
 class LogDock:
@@ -45,11 +50,18 @@ class LogDock:
             saved = int(pref.get("log_h") or 0) / max(1.0, float(U.S))
         except (TypeError, ValueError):
             saved = 0
-        if saved < USABLE_H or saved > 2000:
+        # 「这个高度是不是程序定的」靠存档里的标记判断，不靠数值猜：
+        #   · 老存档没这个字段（v1.0.21 及以前）→ None，一律按默认值重置。
+        #     用户机器上那份 320 就是这么来的，不重置的话改默认值等于白改。
+        #   · 升级后写回 True → 下次仍然跟着默认值走。
+        #   · 用户手动拖过 → 拖动结束时写 False，之后永远尊重。
+        # 顺带兜住明显不合理的值（太小 / 超过 2000 逻辑像素）。
+        auto = pref.get("log_h_auto")
+        if auto is not False or saved < USABLE_H or saved > 2000:
             saved = DEFAULT_H
             self._log_dock_auto = True      # 这个高度是「我们定的」，可以按窗口收
         else:
-            self._log_dock_auto = False     # 用户自己拖的，不许动
+            self._log_dock_auto = False     # 用户自己拖出来的，不许动
         self._log_dock_h = U.px(max(MIN_H, int(saved)))
         self.log_dock_host = tk.Frame(self.shell, bg=U.T.page, bd=0)
         self._log_want_open = bool(pref.get("log_open"))
@@ -98,16 +110,14 @@ class LogDock:
         host = self.log_dock_host
         host.pack_propagate(False)
         h = self._log_dock_h
-        # 窗口本身很矮时别把主界面挤没 —— 按 RATIO 收一收（winfo_height 在
-        # 未映射时是 1，那会儿不夹，等下次打开自然就对了）
+        # 窗口本身很矮时别把主界面挤没 —— 这里只做兜底，不做常态缩放。
+        # 以前这里是「默认值再按窗口高三成收」，结果 1080 高的窗口把 270
+        # 压成 216 逻辑（只露 1 条），越是大窗口越看不清日志，方向反了。
+        # （winfo_height 在未映射时是 1，那会儿不夹，等下次打开自然就对了）
         try:
             win_h = int(self.winfo_height())
             if win_h > U.px(MIN_H) * 2:
-                h = min(h, max(U.px(MIN_H), int(win_h * RATIO)))
-                # 用默认值的（不是用户拖的）再按窗口高三成收一次：
-                # 高度越大的窗口越不该让底栏按死数占地方。
-                if getattr(self, "_log_dock_auto", False):
-                    h = max(U.px(MIN_H), min(h, int(win_h * AUTO_RATIO)))
+                h = min(h, max(U.px(MIN_H), int(win_h * FALLBACK_RATIO)))
         except tk.TclError:
             pass
         self._log_dock_h = h
@@ -171,4 +181,6 @@ class LogDock:
             self._log_dock_h = self.log_dock_host.winfo_height()
         except tk.TclError:
             return
+        # 用户亲手拖过了 —— 从此这个数就是他自己的，改默认值也不许覆盖
+        self._log_dock_auto = False
         self._win_state_save()

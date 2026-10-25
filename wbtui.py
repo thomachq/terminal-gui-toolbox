@@ -859,12 +859,18 @@ class ScrollBox(tk.Frame):
       · 遇到 Text / Listbox / Treeview 直接让开 —— 它们自己能滚。
     """
 
-    def __init__(self, master, bg: str | None = None, **kw):
+    def __init__(self, master, bg: str | None = None, fill: bool = False,
+                 auto_hide: bool = False, shrink: bool = False, **kw):
         bg = T.page if bg is None else bg
         super().__init__(master, bg=bg, bd=0, **kw)
+        self._fill = bool(fill)
+        self._shrink = bool(shrink)
+        self._auto_hide = bool(auto_hide)
         self.cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
-        self.vs = tk.Scrollbar(self, orient="vertical", command=self.cv.yview,
-                               width=px(10), bd=0, relief="flat")
+        # 用 ttk + Nav 那套样式：原生 tk.Scrollbar 在浅色主题下几乎是白的，
+        # 页面右边一条「看不见的滚动条」等于没有（用户原话就是「缺少滚动条」）。
+        self.vs = ttk.Scrollbar(self, orient="vertical", command=self.cv.yview,
+                                style="Nav.Vertical.TScrollbar")
         self.cv.configure(yscrollcommand=self.vs.set)
         # 先 pack 滚动条、再 pack 画布：画布带 expand，先 pack 会把整条宽度吃光，
         # 滚动条只能分到 1px（表现为「滚动条不见了，滚轮也压不到它」）。
@@ -876,6 +882,10 @@ class ScrollBox(tk.Frame):
         self._win = self.cv.create_window((0, 0), window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", self._grow)
         self.cv.bind("<Configure>", self._fit)
+        # 页面切回来时 canvas 尺寸可能一点没变（Configure 不触发），但内容
+        # 已经换了一批 —— 不补这一次，DB / Web / 计划任务这些页切过去就没有
+        # 滚动条，看着像「只有安全中心那页修好了」。
+        self.cv.bind("<Map>", lambda _e: self.after_idle(self._refit), add="+")
         self.vs.bind("<MouseWheel>", self._wheel)
         self._wheel_ids: list[str] = []
         self._bind_wheel()
@@ -924,11 +934,74 @@ class ScrollBox(tk.Frame):
         try:
             self.cv.configure(scrollregion=self.cv.bbox("all") or (0, 0, 0, 0))
         except tk.TclError:
-            pass
+            return
+        self._autosb()
 
     def _fit(self, e) -> None:
+        self._apply_fit(e.width, e.height)
+
+    def _refit(self) -> None:
         try:
-            self.cv.itemconfigure(self._win, width=e.width)
+            w, h = self.cv.winfo_width(), self.cv.winfo_height()
+        except tk.TclError:
+            return
+        if w <= 1 or h <= 1:
+            return
+        self._apply_fit(w, h)
+
+    def _apply_fit(self, width: int, height: int) -> None:
+        try:
+            self.cv.itemconfigure(self._win, width=width)
+            if self._fill:
+                # 内胆高度怎么定，分两种页面：
+                #   · shrink=True（表格页）：直接用可视高。表格自己会滚动，
+                #     外层再套一条滚动条就是「双重滚动」，鼠标滚一下不知道
+                #     动的哪一层，体验比没有更差。压不下的时候表格变矮，
+                #     正好是想要的。
+                #   · shrink=False（卡片页）：取 max(内容需求, 可视高)。
+                #     这样表格页不会退化成「固定 13 行 + 下面大片空白」，
+                #     而安全中心 / API 这种卡片摞卡片的页面内容真超高时
+                #     才滚得动。
+                h = (height if self._shrink
+                     else max(self.inner.winfo_reqheight(), height))
+                self.cv.itemconfigure(self._win, height=h)
+        except tk.TclError:
+            return
+        self._autosb()
+
+    def _autosb(self) -> None:
+        """滚动条按需出现/收起（只有 auto_hide 的实例才管这事）。
+
+        判断依据是内胆的**实际**高度，不是 `winfo_reqheight()`：
+          · 表格页（shrink）内胆被压到可视高，但「需求」仍有 860 ——
+            拿需求判断就会给一个根本滚不动的页面挂上滚动条，拖到底还是
+            原样，用户只会以为又坏了。
+          · 卡片页内胆高度被设成需求高度，两者相等，用哪个都一样。
+        另外一律不看控件自己记的标记 —— v1.0.22 的教训：`_sb_visible=True`
+        不代表屏幕上看得见，`winfo_ismapped()` 才是真相。
+        """
+        if not self._auto_hide:
+            return
+        try:
+            ih = 0
+            try:
+                ih = int(float(self.cv.itemcget(self._win, "height") or 0))
+            except (tk.TclError, ValueError):
+                ih = 0
+            if ih <= 0:
+                ih = self.inner.winfo_reqheight()
+            need = ih > self.cv.winfo_height() + 1
+        except tk.TclError:
+            return
+        if need == bool(self.vs.winfo_ismapped()):
+            return
+        try:
+            if need:
+                # before=cv：画布带 expand，晚 pack 的滚动条只会分到 1px
+                self.vs.pack(side="right", fill="y", before=self.cv)
+            else:
+                self.vs.pack_forget()
+                self.cv.yview_moveto(0.0)
         except tk.TclError:
             pass
 

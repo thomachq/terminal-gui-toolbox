@@ -159,6 +159,24 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * Pages can actually be scrolled now. All 16 pages were gridded into the same
+    cell, and grid takes the largest requested width among its children as the
+    column width - so one page holding a wide table stretched the whole stack
+    to 1668px, every page grew with it, and the right-hand part was clipped by
+    the frame (what the user saw as "the 'undo' button in Firewall is gone").
+    Each page now lives in its own scroll host whose requested size is pinned
+    to 1x1 so it takes no part in size negotiation; a vertical scrollbar
+    appears when the content is taller than the viewport and hides itself again
+    when it fits, and switching pages returns to the top. Pages whose body is
+    one big table are only compressed, never given an outer scrollbar - the
+    table already scrolls itself and two nested scrollbars are worse than none.
+  * The log dock is shorter. Its default height was derived from window height
+    (30%) and is now derived from content: header plus exactly three rows
+    (252 logical px), with the row height reduced from 30 to 26. A new
+    `log_h_auto` flag separates "this is the program's default" from "the user
+    dragged this height" - the 320 in older profiles was a previous default,
+    and without that flag changing the default had no effect at all.
+
   * The side navigation scrollbar is actually visible now. The canvas and the
     scrollbar were both there, but packed in the wrong order: the canvas has
     `expand=True`, so packing it first ate the whole width and left the

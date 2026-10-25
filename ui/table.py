@@ -111,13 +111,49 @@ class EmptyState(tk.Frame):
 CUR_TAG = "TblCursorGuard"
 
 
+_TREE_SEQ = 0
+ROW_H_NORMAL = 30       # 常规行高（逻辑像素）：主机列表、工具输出这些页面
+ROW_H_DENSE = 26        # 紧凑行高：底部日志面板，一屏多看一行比留白重要
+
+
+def _ensure_tree_style(row_h: int | None = None, name: str | None = None) -> str:
+    """配好一套 Treeview 样式（正文 + 表头），返回样式名。
+
+    允许按实例建独立样式：日志底栏要的是「矮而密」的行，而主机列表、
+    工具输出用 30 更舒展。共用一套 `Table.Treeview` 的话，把日志调密就
+    等于把所有表格一起调密 —— 用户明确只要日志变矮，别的地方不该跟着动。
+
+    `name` 传进来就复用（重绘/切主题时重配同一套），不传才新建。
+    样式名必须全局唯一（同名会互相覆盖行高），所以用递增序号。
+    """
+    global _TREE_SEQ
+    if name is None:
+        if row_h is None:
+            name = "Table.Treeview"
+        else:
+            _TREE_SEQ += 1
+            name = f"TableR{_TREE_SEQ}.Treeview"
+    h = U.px(ROW_H_NORMAL if row_h is None else row_h)
+    style = ttk.Style()
+    style.configure(name, background=U.T.card, fieldbackground=U.T.card,
+                    foreground=U.T.text, rowheight=h, borderwidth=0,
+                    font=U.FONT_S)
+    # Treeview 的表头样式名固定是「<正文样式名>.Heading」
+    style.configure(name + ".Heading", background=U.T.alt,
+                    foreground=U.T.text_dim,
+                    font=(U.FONT_FAMILY, 9, "bold"),
+                    padding=(U.px(8), U.px(8)), relief="flat")
+    return name
+
+
 class DataTable(tk.Frame):
     """带工具条、搜索、排序、空态、右键菜单的列表。"""
 
     def __init__(self, master, columns: list[Column], *, height: int = 9,
                  searchable: bool = True, search_hint: str = "搜索…",
                  empty_title: str = "暂无数据", empty_hint: str = "",
-                 on_activate=None, on_select=None, bg_role: str = "card"):
+                 on_activate=None, on_select=None, bg_role: str = "card",
+                 row_h: int | None = None):
         super().__init__(master, bg=U.T.card, bd=0)
         self.columns = list(columns)
         self._rows: list[dict] = []
@@ -130,6 +166,11 @@ class DataTable(tk.Frame):
         self._empty_title = empty_title
         self._empty_hint = empty_hint
         self._search_var = tk.StringVar()
+        # 行高：None = 常规 30；给了数字就用独立样式（日志底栏用 26）。
+        # 样式名在构造时定下来，_paint() 只重配不新建 —— 每次重绘多一个
+        # 样式名的话，切主题切几次就攒出几十个没人用的条目。
+        self._row_h = row_h
+        self._style_name = _ensure_tree_style(row_h)
         # ---- 分组折叠（默认关闭，只有显式 set_group() 才开）
         # 为什么做成开关而不是默认：模型列表按「分组名称」折叠是对的
         # （对齐 Cherry Studio），但防火墙规则、进程表折叠没有任何意义，
@@ -446,15 +487,8 @@ class DataTable(tk.Frame):
         except tk.TclError:
             pass
         try:
-            style = ttk.Style(self)
-            style.configure("Table.Treeview", background=U.T.card,
-                            fieldbackground=U.T.card, foreground=U.T.text,
-                            rowheight=U.px(30), borderwidth=0, font=U.FONT_S)
-            style.configure("Table.Treeview.Heading", background=U.T.alt,
-                            foreground=U.T.text_dim,
-                            font=(U.FONT_FAMILY, 9, "bold"),
-                            padding=(U.px(8), U.px(8)), relief="flat")
-            self.tree.configure(style="Table.Treeview")
+            self.tree.configure(
+                style=_ensure_tree_style(self._row_h, self._style_name))
         except tk.TclError:
             pass
         self._render()

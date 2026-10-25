@@ -115,7 +115,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.22"
+APP_VER = "1.0.23"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -123,6 +123,9 @@ APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 ·
 # 以前的脚本、截图脚本都指着它），只是指到同一页。
 # 已合并/改名的页面：旧键继续可用，--page 与旧脚本不会突然断掉。
 NAV_ALIAS = {"fw": "sec", "conn": "hosts"}
+# 主体是「一个大表格 + 工具栏」的页面。这些页压缩而不是加外层滚动条 ——
+# 表格自己有内滚动，再套一层就成了双重滚动（滚轮不知道在滚哪一层）。
+_TABLE_PAGES = {"hosts", "tools", "sys", "files", "routes"}
 
 # 运维工具那一组：这些页打的命令都落在「当前活动设备」上，所以顶部要显示
 # 并允许切换「操作目标」。上面那组（主机管理 / 代理池 / 凭证 / 脚本）管的是
@@ -210,6 +213,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.log_model = LogModel()
         self.q: queue.Queue = queue.Queue()
         self._pages: dict[str, tk.Frame] = {}
+        # 每个页面的外层滚动宿主（Canvas + 按需滚动条）。_pages 里存的是内胆，
+        # 页面的 builder 往内胆里摆控件；切换页面时 grid 的是宿主。
+        self._page_host: dict[str, tk.Frame] = {}
         self._keypw_job = None
         self._lock_overlay = None
         self._last_active = time.time()
@@ -715,16 +721,33 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                              ("cron", self.build_cron),
                              ("vpn", self._build_vpn),
                              ("api", self.build_api)):
-            page = U.wframe(self.stack, "page")
-            page.grid(row=0, column=0, sticky="nsew")
+            # 每个页面套一层可滚宿主：内容比可视区高时出竖滚动条，装得下就收起。
+            # fill=True 让内胆吃满可视高度 —— 表格页靠 rowconfigure(weight=1)
+            # 撑满，内胆不给足高度的话，套上滚动层就会退回「固定 13 行 +
+            # 下方一大片空白」。
+            # shrink：主体是表格的页面只压缩、不加外层滚动条。表格自己有内滚动，
+            # 再套一层就是双重滚动，滚一下不知道动的是哪一层。
+            host = U.ScrollBox(self.stack, fill=True, auto_hide=True,
+                               shrink=key in _TABLE_PAGES)
+            # 页面容器不参与尺寸协商：16 个页面 grid 在 stack 的同一格里，
+            # grid 会取「所有子页请求宽度的最大值」当列宽 —— 只要有一页里
+            # 有张宽表（安全中心两张表列宽合计 1311），整个 stack 就被撑到
+            # 1668，每页都跟着变宽，右边那一截被外框直接裁掉（用户看到的
+            # 「撤销上一步按钮没了」就是这么来的）。请求宽度压到 1×1 之后，
+            # 由 paned 的实际分配决定，各页自己在该宽度内排版。
+            host.configure(width=1, height=1)
+            host.grid_propagate(False)
+            host.grid(row=0, column=0, sticky="nsew")
+            page = host.inner
             self._pages[key] = page
+            self._page_host[key] = host
             builder(page)
             # 建完立刻从布局里摘掉，只留当前页在场。
             # 16 个页面全 grid 在同一格里时，它们**都**处于 mapped 状态，
             # 拖动窗口边缘每改一像素就要重画 1100 多个控件 —— 实测一步
             # 1.5 秒，拖起来像卡死。摘掉之后其他页仍然存在（状态、滚动
             # 位置、输入框内容都不丢），只是不参与布局与重绘。
-            page.grid_remove()
+            host.grid_remove()
 
         # 右侧「命令日志」面板已撤（v1.0.6）：它和「日志管理」页记的是同一件事，
         # 两份记录只会让人纠结去哪查。命令与输出现在统一进「日志管理」，
@@ -758,18 +781,23 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         if tb is not None and tb.current not in ("hosts", ""):
             tb.select("hosts")
         for k, page in self._pages.items():
+            host = self._page_host.get(k, page)
             if k == key:
                 # 只把当前页放回布局（其余页在创建时已 grid_remove）。
                 # 曾经所有页都 grid 在同一格、靠 tkraise 分先后 —— 那样
                 # 被盖住的页照样参与重绘，缩放窗口会明显卡顿。
                 try:
-                    page.grid()
+                    host.grid()
+                    # 切页回到顶部：页面级滚动位置留着的话，切过去看到的是
+                    # 上次停在哪儿的中间一截，标题和第一个卡片都不在，
+                    # 比「显示不全」更让人困惑。
+                    host.cv.yview_moveto(0.0)
                 except tk.TclError:
                     pass
-                page.tkraise()
-            elif page.winfo_manager() == "grid":
+                host.tkraise()
+            elif host.winfo_manager() == "grid":
                 try:
-                    page.grid_remove()
+                    host.grid_remove()
                 except tk.TclError:
                     pass
         # 运维工具那组页面要显示「操作目标」条；资产类页面收起来。
@@ -1142,6 +1170,11 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             "nx": int(nx), "ny": int(ny), "nw": int(nw), "nh": int(nh),
             "zoomed": bool(zoomed), "scale": float(U.S),
             "log_open": log_open, "log_h": log_h,
+            # 这个高度是「程序按默认值定的」还是「用户自己拖出来的」。
+            # 只存数字的话，改默认值等于白改（老存档会一直把旧默认带下去，
+            # v1.0.19 和 v1.0.22 都栽在这上面）；只靠数值区间猜则会误伤
+            # 用户真的拖到那个高度的情况。存个标记最省事。
+            "log_h_auto": bool(getattr(self, "_log_dock_auto", False)),
         })
 
     def _cancel_timers(self) -> None:
