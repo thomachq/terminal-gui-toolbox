@@ -54,6 +54,23 @@ try:
     h1 = a.log_dock_host.winfo_height()
     chk(h1 > 100, "面板有高度", h1)
 
+    # 用户反馈「默认高度太小，显示都不完整」：截图里只剩表头和分页。
+    # 现在的判据是「表格本体要能露出至少 5 行」—— 只看面板总高会漏掉
+    # 工具栏吃掉的份额（面板 210px 时表格只剩 50px）。
+    from pages import log_dock as LD
+    row_h = 30 * LD.U.S if hasattr(LD.U, "S") else 45
+    chk(a.tbl_audit.winfo_height() >= row_h * 5,
+        "表格本体至少露出 5 行",
+        f"面板 {h1}px / 表格 {a.tbl_audit.winfo_height()}px")
+    chk(a._log_dock_h >= LD.U.px(LD.MIN_H), "默认高度不低于下限",
+        a._log_dock_h)
+
+    # 老版本存下来的「太扁」高度必须被抬上来（用户机器上就是 210）
+    chk(LD.USABLE_H > 160, "旧默认（≈160 逻辑像素）被判为不可用",
+        LD.USABLE_H)
+    chk(LD.DEFAULT_H >= LD.USABLE_H, "新默认高于可用下限",
+        f"{LD.DEFAULT_H} >= {LD.USABLE_H}")
+
     a.log_dock_toggle()
     pump(a, 0.3)
     chk(not a._log_dock_on, "再点一次能收起")

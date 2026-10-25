@@ -159,6 +159,15 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * Commands run by an agent through the local API are now visible: they are
+    echoed into the terminal (marked with an `[API]` prefix so they cannot be
+    confused with commands typed by a person) and recorded in the audit log as
+    `ai.command` / `ai.session` (group "AI", actor "智能体"). The session pool
+    had no tracer attached, and `run()` / `run_admin()` do not trace, so
+    previously nothing an agent did on a device left a trace.
+  * The bottom log panel default height was raised (280 logical px, floor 200);
+    saved heights below 240 are treated as "never configured" and reset,
+    because the old default left only a header row and the pager visible.
   * Fixed: Docker was reported as "not installed" on machines that do have
     it, because the docker binary is not in the SSH PATH. Synology keeps the
     real binary under /var/packages/ContainerManager/ and only a symlink in

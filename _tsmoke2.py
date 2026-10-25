@@ -16,6 +16,7 @@ from tkinter import ttk
 import lockmgr
 import app as A
 import wbtui as U
+from core import audit as audit_core
 
 ok_n = fail_n = 0
 FAILS: list[str] = []
@@ -186,6 +187,28 @@ conn = a.api_pool.open({"protocol": "local", "name": "本机"})
 chk(conn.id != "", "池里能开本机会话", conn.id)
 r = a.api_pool.exec(conn.id, "echo api-ok")
 chk(r["rc"] == 0 and "api-ok" in r["out"], "池里执行命令", f"{r['ms']}ms")
+
+# 智能体通过 API 跑的每条命令都要留痕 —— 用户的要求是
+# 「日志也要显示智能体通过 API 的操作」。这里从三处钉死：
+#   ① 会话挂上了 tracer（不挂的话 run/run_admin 根本没人听）
+#   ② 审计里出现 ai.command，详情带 [API] 前缀
+#   ③ 执行者记成「智能体」，分类是「AI」（不然和人敲的分不清）
+chk(getattr(conn.session, "tracer", None) is not None,
+    "池里的会话挂上了 tracer")
+pump(a, 0.6)
+a.audit.clear_cache()
+evs = [e for e in a.audit.load(limit=300) if e.get("event") == "ai.command"]
+hit = [e for e in evs if "[API] echo api-ok" in str(e.get("detail") or "")]
+chk(bool(hit), "API 命令进了操作日志", f"{len(evs)} 条 ai.command")
+if hit:
+    chk(hit[-1].get("actor") == "智能体", "执行者记成智能体", hit[-1].get("actor"))
+    chk(hit[-1].get("status") == "ok", "状态是成功", hit[-1].get("status"))
+    chk(audit_core.group_of("ai.command") == "AI", "分类是 AI",
+        audit_core.group_of("ai.command"))
+else:
+    chk(False, "执行者记成智能体", "没有 ai.command 事件")
+    chk(False, "状态是成功", "-")
+    chk(False, "分类是 AI", "-")
 m = a.api_pool.metrics(conn.id)
 chk("cpu_pct" in m, "池里能取性能采样", f"cpu={m.get('cpu_pct')}%")
 a.api_refresh()

@@ -106,7 +106,29 @@ def main():
     ok, msg = a.term_chdir("C:\\")
     chk(ok, "cd 到盘根", msg)
 
-    print("\n7. 断开联动")
+    print("\n7. 智能体通过 API 的操作也进终端")
+    # 用户要求：「这个同步命令也要能同步 AI 智能体通过 API 的操作」。
+    # 走的就是智能体那条路：api_pool.open → exec，不碰界面上任何按钮。
+    conn = a.api_pool.open({"protocol": "local", "name": "自测-API"})
+    w.clear()
+    r = a.api_pool.exec(conn.id, "echo from-api-agent")
+    pump(a, 1.6)
+    body = w.text.get("1.0", "end")
+    chk(r["rc"] == 0 and "from-api-agent" in r["out"], "API 命令自身有回显",
+        str(r.get("rc")))
+    chk("from-api-agent" in body, "API 命令同步进了终端", body.strip()[:60])
+    chk("[API]" in body, "终端里标出这是智能体干的", body.strip()[:60])
+    # 勾掉「同步命令」就该闭嘴（和手敲的命同一条规则）
+    w._sync.set(False)
+    w.clear()
+    a.api_pool.exec(conn.id, "echo muted-agent")
+    pump(a, 1.2)
+    body2 = w.text.get("1.0", "end")
+    chk("muted-agent" not in body2, "关掉同步后不再刷屏", body2.strip()[:40])
+    w._sync.set(True)
+    a.api_pool.close(conn.id)
+
+    print("\n8. 断开联动")
     a._disconnect()
     pump(a, 0.4)
     chk(a._term_cwd_val == "", "断开后目录缓存清空")
@@ -116,7 +138,7 @@ def main():
     pump(a, 0.5)
     chk("未连接" in w.text.get("1.0", "end"), "断开后敲命令被拦住")
 
-    print("\n8. 再开一次不重复建页签")
+    print("\n9. 再开一次不重复建页签")
     old = w
     a.open_terminal()
     pump(a, 0.3)
@@ -124,7 +146,7 @@ def main():
     chk(len(a._term_panes) == 1, "终端页签始终只有一个",
         str(len(a._term_panes)))
 
-    print("\n9. 关闭")
+    print("\n10. 关闭")
     a._tab_close(a.TERM_TAB)
     pump(a, 0.3)
     chk(a._term_live() is None, "关掉后主程序不再持有引用")

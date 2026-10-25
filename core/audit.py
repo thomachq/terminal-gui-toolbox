@@ -70,6 +70,10 @@ EVENTS: dict[str, tuple[str, str]] = {
     "site.bind": ("绑定站点域名", "Web"),
     "tls.issue": ("签发证书", "证书"),
     "backup.export": ("导出备份", "备份"),
+    # 智能体通过本地 API 的动作。和 terminal.command 分开是刻意的：
+    # 同一个命令，人点出来的和模型跑出来的，事后处理方式不一样。
+    "ai.command": ("智能体执行命令", "AI"),
+    "ai.session": ("智能体接入会话", "AI"),
 }
 
 # 前缀兜底：精确表没命中时按第一段归类，标题给个「某类操作」

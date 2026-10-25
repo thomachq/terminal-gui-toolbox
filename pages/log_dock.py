@@ -15,7 +15,9 @@ import tkinter as tk
 import wbtui as U
 
 GRIP_H = 5          # 顶部抓手的高度（逻辑像素）
-MIN_H = 140         # 拖到最矮也要能看见两行
+MIN_H = 200         # 拖到最矮也要能看见表头 + 三五行（原来 140，只剩个表头）
+DEFAULT_H = 280     # 默认高度：能看五六条 + 筛选条 + 分页（原来实际只有 160 太扁）
+USABLE_H = 240      # 低于这个数等于「没设置过」，按 DEFAULT_H 起
 RATIO = 0.72        # 最高不超过窗口高度的 72%，否则主界面就没地方了
 
 
@@ -29,11 +31,18 @@ class LogDock:
         self._log_dock_built = False
         self._log_drag: tuple[int, int] | None = None
         pref = getattr(self, "_win_pref", {}) or {}
+        # 上次存的是**物理像素**，除以缩放比才是逻辑像素。
+        # 老版本默认只有 240（缩放 1.5 的机器上实际显示 ≈ 160 逻辑像素），
+        # 面板里只剩一行表头和分页 —— 用户的原话是「显示都不完整」。
+        # 所以低于 USABLE_H 的一律当「没设置过」，直接用新的默认高度；
+        # 用户自己拖过、且拖到可用高度的，尊重他存的数。
         try:
-            self._log_dock_h = U.px(max(MIN_H, int(pref.get("log_h") or 240)
-                                        // max(1.0, float(U.S))))
+            saved = int(pref.get("log_h") or 0) / max(1.0, float(U.S))
         except (TypeError, ValueError):
-            self._log_dock_h = U.px(240)
+            saved = 0
+        if saved < USABLE_H or saved > 2000:
+            saved = DEFAULT_H
+        self._log_dock_h = U.px(max(MIN_H, int(saved)))
         self.log_dock_host = tk.Frame(self.shell, bg=U.T.page, bd=0)
         self._log_want_open = bool(pref.get("log_open"))
 
@@ -80,7 +89,16 @@ class LogDock:
         self._log_dock_built = True
         host = self.log_dock_host
         host.pack_propagate(False)
-        host.configure(height=self._log_dock_h)
+        h = self._log_dock_h
+        # 窗口本身很矮时别把主界面挤没 —— 按 RATIO 收一收（winfo_height 在
+        # 未映射时是 1，那会儿不夹，等下次打开自然就对了）
+        try:
+            win_h = int(self.winfo_height())
+            if win_h > U.px(MIN_H) * 2:
+                h = min(h, max(U.px(MIN_H), int(win_h * RATIO)))
+        except tk.TclError:
+            pass
+        host.configure(height=h)
 
         grip = tk.Frame(host, bg=U.T.border, height=U.px(GRIP_H),
                         bd=0, cursor="sb_v_double_arrow")

@@ -573,10 +573,10 @@ OPENAPI = {
 }
 
 
-def make_default(data_dir: Path, on_log=None) -> tuple[ApiConfig, SessionPool, ApiServer]:
+def make_default(data_dir: Path, on_log=None, on_cmd=None) -> tuple[ApiConfig, SessionPool, ApiServer]:
     cfg = ApiConfig(Path(data_dir) / "api.json")
     pool = SessionPool(keepalive_default=int(cfg.data.get("keepalive") or 25),
                        idle_ttl=int(cfg.data.get("idle_ttl") or 0),
-                       on_event=on_log)
+                       on_event=on_log, tracer=on_cmd)
     srv = ApiServer(cfg, pool, on_log=on_log)
     return cfg, pool, srv

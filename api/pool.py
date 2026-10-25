@@ -31,6 +31,25 @@ from core.session import ConnSpec, SessionError, open_session
 
 MAX_OUT_CHARS = 200_000        # 单条命令回传上限，防止把智能体上下文撑爆
 
+# 智能体通过 API 执行的命令，进日志/终端时统一带这个前缀。
+# 主程序靠它区分「人敲的」和「模型跑的」（事件名、actor 都不一样），
+# 所以两边必须用同一个常量，不要各自写死字符串。
+API_CMD_TAG = "[API] "
+
+
+def _tagged(tracer):
+    """把主程序的 tracer 包一层，给每条命令加上 API 标记。
+
+    挂在会话上（而不是只在 exec 里加），是为了让这个会话干的所有事都带标记 ——
+    包括 open() 时那几轮设备探测，否则日志里会冒出一串「谁也不知道是谁跑的」命令。
+    """
+    def wrapped(display, rc, out, err, ms):
+        text = str(display or "")
+        if not text.startswith(API_CMD_TAG):
+            text = API_CMD_TAG + text
+        return tracer(text, rc, out, err, ms)
+    return wrapped
+
 
 @dataclass
 class Conn:
@@ -93,12 +112,16 @@ class PoolError(Exception):
 
 class SessionPool:
     def __init__(self, keepalive_default: int = 25, idle_ttl: int = 0,
-                 on_event=None):
+                 on_event=None, tracer=None):
         self.conns: dict[str, Conn] = {}
         self.lock = threading.RLock()
         self.keepalive_default = max(0, int(keepalive_default))
         self.idle_ttl = max(0, int(idle_ttl))
         self.on_event = on_event            # on_event(kind, text)
+        # tracer(display, rc, out, err, ms) —— 和 session.tracer 同签名。
+        # 由主程序注入：智能体通过 API 跑的每条命令都要进「日志」、
+        # 也要同步到终端，所以池建的会话必须挂上它（见 open()）。
+        self.tracer = tracer
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -136,6 +159,17 @@ class SessionPool:
         sudo_pw = str(spec.get("sudo_password") or "")
         if sudo_pw and hasattr(sess, "sudo_pw"):
             sess.sudo_pw = sudo_pw
+
+        # ★ 挂 tracer：不挂的话，智能体在设备上跑的命令一条都不会进
+        # 「日志」，也不会同步到终端 —— 用户反馈「日志里看不到智能体的操作」
+        # 就是这个原因（池走的是 run()/run_admin()，不像主程序走 run_traced()）。
+        # 包一层加前缀：连 detect 阶段的探测命令也算「智能体干的」，
+        # 不然同一台设备谁在乱扫，事后看不出来。
+        if self.tracer is not None:
+            try:
+                sess.tracer = _tagged(self.tracer)
+            except Exception:  # noqa: BLE001
+                pass
 
         try:
             dev = detect(sess)
@@ -228,8 +262,30 @@ class SessionPool:
         if len(out) > MAX_OUT_CHARS:
             out = out[:MAX_OUT_CHARS] + f"\n…（已截断，原长 {len(out)} 字符）"
             truncated = True
+        # 记一次「谁执行的」：前缀 [API] 是刻意的 —— 人敲的命令和智能体跑的
+        # 命令在日志里长得一模一样，出事时根本分不清是谁干的。
+        self._trace(c, cmd, rc, out, err, ms)
         return {"rc": rc, "out": scrub(out), "err": scrub(err), "ms": ms,
                 "truncated": truncated, "session": c.id}
+
+    def _trace(self, c, cmd: str, rc: int, out: str, err: str, ms: int) -> None:
+        """把这条 API 命令交给上层 tracer（app._trace_cmd）。
+
+        一手托三家：写操作审计（「日志」底部面板读的就是它）、推给终端
+        （「同步命令」那个勾），以及内存流水。tracer 抛错绝不能把命令结果
+        弄丢 —— 智能体要的是 rc/out，不是日志。
+
+        `[API]` 前缀由 `_tagged()` 统一加，这里传原始命令。
+        exec() 必须显式走这一步：它用的是 run()/run_admin()，不像主程序
+        那样有 run_traced() 自动带 tracer。
+        """
+        trace = getattr(c.session, "_trace", None)
+        if not callable(trace):
+            return
+        try:
+            trace(cmd, rc, out, err, ms)
+        except Exception:  # noqa: BLE001
+            pass
 
     def metrics(self, cid: str) -> dict:
         c = self.get(cid)

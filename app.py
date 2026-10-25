@@ -34,6 +34,7 @@ from tkinter import messagebox, ttk
 import crypto_store
 import lockmgr
 import wbtui as U
+from api.pool import API_CMD_TAG
 from api.server import make_default as make_api
 from core import ai_skills, aitrace
 from core import aiops, parsers, routes
@@ -114,7 +115,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.18"
+APP_VER = "1.0.19"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -283,7 +284,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
         # ---- 本地 API（智能体接入）
         self.api_cfg, self.api_pool, self.api_server = make_api(
-            DATA_DIR, on_log=self._api_event)
+            DATA_DIR, on_log=self._api_event, on_cmd=self._trace_cmd)
 
         # ---- 自己的 AI（AI 运维页）：与「给别的智能体用的 API」是两件事
         self.ai_cfg = aiops.AIConfig(DATA_DIR / "ai.json")
@@ -1206,10 +1207,17 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.api_refresh()
 
     def _api_event(self, kind: str, text: str) -> None:
-        """池里的事件（建连 / 关闭 / 重连）走日志与状态栏。"""
+        """池里的事件（建连 / 关闭 / 重连）走日志与状态栏。
+
+        除了内存流水，还要落一条操作审计 —— 「日志」底部面板读的是审计库，
+        不落的话智能体自己建连、关连在日志里是空白（用户要求
+        「日志也要显示智能体通过 API 的操作」）。
+        """
         self.post(self._log_raw, kind, f"[API] {text}\n")
         if kind in ("ok", "warn", "bad"):
             self.post(self.status.set_state, text, kind)
+        st = {"ok": "ok", "warn": "warn", "bad": "fail"}.get(kind, "info")
+        self.post(self._audit, "ai.session", st, text, "", "智能体")
 
     def _api_log_line(self, kind: str, text: str) -> None:
         self._log_raw(kind, f"[API] {text}\n")
@@ -1444,7 +1452,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self.log_model.add(kind, text)
 
     def _audit_command(self, cmd: str, rc: int, out: str, err: str,
-                       ms: int) -> None:
+                       ms: int, by_api: bool = False) -> None:
         """把一条命令执行记进操作审计（「日志管理」页读的就是它）。
 
         用户的要求是「日志里能看到执行了什么命令、输出了什么」，同时
@@ -1455,6 +1463,10 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
           2. 输出过 scrub：私钥正文整块换成一行说明，内容不上日志；
           3. 输出截断到 4000 字：一条几兆的记录会把日志页拖垮，
              定位问题也用不着那么多。
+
+        by_api=True 表示这条命令是智能体通过本地 API 跑的：事件名用
+        `ai.command`（分类「AI」），执行者是「智能体」而不是「用户」。
+        混在一起的话，事后根本分不清那次改动是人点出来的还是模型跑出来的。
         """
         safe_cmd = redact.scrub_cmd(cmd or "")
         body = self._scrub(out or "")
@@ -1468,15 +1480,21 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             detail += "\n[stderr] " + errs[:1000]
         # 状态只能是 ok / fail / warn / info（audit.STATUS 里就这四个，
         # 传别的会被默默归一成 info —— 失败的命令就看不出来了）
-        self._audit("terminal.command", "fail" if rc != 0 else "ok", detail)
+        self._audit("ai.command" if by_api else "terminal.command",
+                    "fail" if rc != 0 else "ok", detail,
+                    actor="智能体" if by_api else "用户")
 
     def _trace_cmd(self, display, rc, out, err, ms):
         cmd = str(display or "")
+        # 会话池给智能体跑的每条命令都带这个前缀（见 api/pool.py::_trace）。
+        # 有它才分得清「人敲的」和「智能体跑的」—— 审计里连 actor 都不一样。
+        by_api = cmd.startswith(API_CMD_TAG)
+        shown = cmd
 
         def render():
             self._log_raw("meta", time.strftime("[%H:%M:%S] "))
             self._log_raw("ok" if rc == 0 else "bad", f"rc={rc}  {ms}ms\n")
-            self._log_raw("cmd", "$ " + redact.scrub_cmd(cmd) + "\n")
+            self._log_raw("cmd", "$ " + redact.scrub_cmd(shown) + "\n")
             o, e = self._scrub(out), self._scrub(err)
             if o.strip():
                 self._log_raw("out", o if o.endswith("\n") else o + "\n")
@@ -1484,9 +1502,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 self._log_raw("bad", e if e.endswith("\n") else e + "\n")
             self._log_raw("meta", "\n")
             # 落一条操作审计 —— 运维工具跑的每条命令都会出现在「日志管理」里
-            self._audit_command(cmd, rc, out, err, ms)
+            self._audit_command(cmd, rc, out, err, ms, by_api=by_api)
             # 终端开着就把同一条记录也送过去（终端自己敲的命令会被它标记跳过）
-            self._term_feed(display, rc, out, err, ms)
+            self._term_feed(shown, rc, out, err, ms)
         self.post(render)
 
     # ============================================================ 采样

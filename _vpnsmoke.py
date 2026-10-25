@@ -56,6 +56,12 @@ def main():
     a = APP.ToolboxApp()
     a.geometry("+60+40")
     pump(a, 0.8)
+    # 日志底栏会按 window.json 里的记忆自动展开（v1.0.19 起默认也更高）。
+    # 它占掉下半屏，控制台就只剩两百多像素高 —— 这里量的是「页面能拿到
+    # 多大地方」，所以先把底栏收起来，别让上一个用例留下的窗口状态干扰。
+    if getattr(a, "_log_dock_on", False):
+        a.log_dock_toggle(False)
+        pump(a, 0.5)
     chk("vpn" in a._pages, "vpn 页已构建", f"{len(a._pages)} 页")
 
     print("\n== 2. 切到 vpn 页，控制台内嵌 ==")
