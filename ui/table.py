@@ -915,22 +915,65 @@ class KVGrid(tk.Frame):
         except Exception:  # noqa: BLE001
             return len(str(text)) * 7
 
-    def _cell_width(self) -> int:
-        """一列（标签 + 值 + 两侧留白）需要多宽。"""
-        pad = U.px(10) + U.px(24)
-        widest = 0
-        for label, value, *_ in self._items:
-            widest = max(widest, self._measure(label) + self._measure(value) + pad)
-        return max(widest, self._measure("字" * 8) + pad)
+    def _label_chars(self) -> int:
+        """标签列该占几个字符宽 —— 按**这组实际最长的标签**算。
+
+        以前固定写死 `label_w // 8`（108//8 = 13 字符 ≈ 145px）。中文 4 个字
+        的标签也吃 145px，三列就是 435px 全给了留白，值那侧只能挤在剩下的
+        地方，看着就是「值被裁、按钮只剩一个字」。改成按实际最长标签算，
+        145 → 66，省出来的宽度全给值。
+        """
+        zero = max(1, self._measure("0"))
+        cap = max(6, self.label_w // 8)
+        widest = max((self._measure(str(i[0])) for i in self._items), default=0)
+        return max(4, min(cap, -(-widest // zero) + 1))
+
+    def _label_px(self) -> int:
+        """标签列实际占多宽 —— 必须和 `_layout` 里 width= 的字符数一致。"""
+        return self._measure("0" * self._label_chars())
+
+    def _action_px(self, action) -> int:
+        """行尾按钮占多宽（含它与值之间的间距）。"""
+        if not action:
+            return 0
+        return U.px(6) + self._measure(str(action[0])) + U.px(26)
+
+    def _cell_demand(self, ncol: int) -> list[int]:
+        """把 items 按 `divmod(i, ncol)` 分到各列，算**每列**的实际需求宽度。
+
+        为什么不能拿「全表最宽的那条」乘列数：标签列是固定字符宽的
+        （`label_w//8`），行尾按钮宽度也不在值文本里，这两块早先都没算。
+        于是 3 列在 860px 里被判成「放得下」，实际每列只分到 287px，
+        而令牌那条光值就要 200px —— tk 的 Label 不换行也不省略，直接裁字，
+        屏幕上就是 `ttb_*******` 加一个只剩「复」的按钮。
+        """
+        widths = [0] * ncol
+        gap, tail = U.px(10), U.px(24)
+        lab = self._label_px()
+        for i, item in enumerate(self._items):
+            c = i % ncol
+            need = lab + gap + self._measure(str(item[1])) + tail
+            if len(item) > 3 and item[3]:
+                need += self._action_px(item[3])
+            if need > widths[c]:
+                widths[c] = need
+        return widths
 
     def _fit_columns(self) -> int:
+        """能放得下的最大列数（含 1 列都放不下时的兜底）。
+
+        逐档试算而不是整除：各列需求并不相等（「令牌」那列带按钮、
+        「闲置回收」那列只有两个字），用总量比较才不会把某列单独挤爆。
+        """
         w = self.winfo_width()
+        # 列数不该超过条目数：2 条内容铺 3 列会留一整列空的，看着像排版坏了
+        top = max(1, min(self.ncol_max, len(self._items)))
         if w <= 1 or not self._items:
-            return self.ncol_max
-        need = self._cell_width()
-        if need <= 0:
-            return self.ncol_max
-        return max(1, min(self.ncol_max, int(w // need) or 1))
+            return top
+        for n in range(top, 1, -1):
+            if sum(self._cell_demand(n)) <= w:
+                return n
+        return 1
 
     def _on_configure(self, _e=None) -> None:
         if self._reflow_job:
@@ -967,9 +1010,21 @@ class KVGrid(tk.Frame):
         self._cells.clear()
         ncol = max(1, min(ncol, self.ncol_max))
         self.ncol = self._laid_out = ncol
+        # 降列时必须把**用不到的那些列**一起清干净：columnconfigure 的
+        # weight 是持久的，3 列降 1 列后第 2/3 组的 value 列还挂着 weight=1，
+        # 但里面已经没有控件 —— grid 照样把余量分给这些空列，于是内容挤在
+        # 左边一窄条、右边空一大片。早先只在需要的列上设值，反方向降列就露馅。
+        for i in range(self.ncol_max * 2):
+            self.columnconfigure(i, weight=0, minsize=0)
+        # 光判「总需求放得下」还不够：weight=1 的列是**平均分**余量的，
+        # 「令牌」那列要 350 却只分到 301，照样裁字。所以把每列的需求
+        # 落成 minsize —— grid 先满足 minsize，剩下的才按 weight 分。
+        demands = self._cell_demand(ncol)
+        lab_col = self._label_px() + U.px(10)
         for i in range(ncol):
-            self.columnconfigure(i * 2, weight=0)
-            self.columnconfigure(i * 2 + 1, weight=1)
+            self.columnconfigure(i * 2, weight=0, minsize=lab_col)
+            self.columnconfigure(i * 2 + 1, weight=1,
+                                 minsize=max(0, demands[i] - lab_col))
         for i, item in enumerate(self._items):
             label, value = item[0], item[1]
             tone = item[2] if len(item) > 2 else None
@@ -978,7 +1033,7 @@ class KVGrid(tk.Frame):
             action = item[3] if len(item) > 3 else None
             r, c = divmod(i, ncol)
             lb = U.wlabel(self, label, "mute", U.FONT_S, anchor="w",
-                          width=max(6, self.label_w // 8))
+                          width=self._label_chars())
             lb.grid(row=r, column=c * 2, sticky="w",
                     padx=(0, U.px(10)), pady=U.px(5))
             role = {"ok": "ok", "err": "pageerr", "warn": "warn",

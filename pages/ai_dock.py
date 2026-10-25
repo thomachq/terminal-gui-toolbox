@@ -501,8 +501,10 @@ class AiDockPage:
             if str(self.ai_dock) not in [str(p) for p in self.paned.panes()]:
                 self.paned.add(self.ai_dock, stretch="never",
                                minsize=U.px(300))
-            # 分隔条要能一眼看出「这里可以拖」：左右箭头光标 + 松手记宽度
-            self.paned.configure(sashcursor="sb_h_double_arrow")
+            # 分隔条要能一眼看出「这里可以拖」：手型光标 + 松手记宽度。
+            # 不用左右双箭头 —— 它和表格表头调列宽的光标一样，用户分不清
+            # 「哪里在调尺寸、哪里在调宽度」，扫过侧栏边界就闪一下很吵。
+            self.paned.configure(sashcursor="hand2")
             self.paned.bind("<ButtonRelease-1>", self._ai_sash_done, add="+")
         except tk.TclError:
             return

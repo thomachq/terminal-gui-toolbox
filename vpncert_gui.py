@@ -391,7 +391,9 @@ class App(tk.Frame):
             self.pill_ca = U.Pill(bar, "CA 未初始化", "mute")
             self.pill_ca.pack(side="right", padx=U.px(6))
             self.lbl_dev = U.wlabel(bar, "", "pagemute", U.FONT_XS)
+            self.lbl_dev.full_text = ""
             self.lbl_dev.pack(side="right", padx=(0, U.px(4)))
+            self.lbl_dev.bind("<Configure>", self._reelide_dev, add="+")
             self.btn_goto_hosts = U.RoundButton(
                 bar, "主机管理", self._goto_hosts, variant="ghost",
                 font=U.FONT_XS, height=24, padx=10)
@@ -443,6 +445,50 @@ class App(tk.Frame):
         except Exception:  # noqa: BLE001
             pass
 
+    def _set_dev_text(self, text: str, color: str) -> None:
+        """写设备状态。窄窗口下按剩余宽度省略，别让 tk 硬切半句话。"""
+        self.lbl_dev.full_text = text
+        self._reelide_dev()
+        try:
+            self.lbl_dev.configure(fg=color)
+        except tk.TclError:
+            pass
+
+    def _reelide_dev(self, _e=None) -> None:
+        """发现这条文字被压窄了就缩一次。
+
+        判据直接用最朴素的那条：`实际宽度 < 请求宽度` 就是正在被裁。
+        早先按「bar 宽 − 兄弟控件请求宽」倒推可用空间，各控件的 padx 与
+        fill 规则一堆例外，算出来永远比实际到手大，等于没做。
+
+        防自激：改文字会改请求宽度 -> 又触发 <Configure> -> 再改……
+        所以合并到 idle 里做，并留一个在跑标记，跑的时候不再排队。
+        """
+        if getattr(self, "_dev_busy", False):
+            return
+        self._dev_busy = True
+        try:
+            self.after_idle(self._apply_dev_elide)
+        except tk.TclError:
+            self._dev_busy = False
+
+    def _apply_dev_elide(self) -> None:
+        self._dev_busy = False
+        lbl = getattr(self, "lbl_dev", None)
+        text = getattr(lbl, "full_text", "") if lbl is not None else ""
+        if not text:
+            return
+        try:
+            w, req = int(lbl.winfo_width()), int(lbl.winfo_reqwidth())
+        except tk.TclError:
+            return
+        if w <= 40 or req <= w + 2:
+            return
+        try:
+            lbl.configure(text=U.elide(text, U.FONT_XS, w - U.px(2)))
+        except tk.TclError:
+            pass
+
     def _refresh_device(self) -> None:
         """头部显示「当前设备：root@192.168.3.12」，没会话就说清楚去哪连。"""
         c = self.nas
@@ -458,12 +504,11 @@ class App(tk.Frame):
             if live:
                 name = c.user and f"{c.user}@{c.host}" or (c.host or "当前设备")
                 self.pill_nas.set(name, "ok")
-                self.lbl_dev.configure(text=f"当前设备：{name}", fg=U.T.text_dim)
+                self._set_dev_text(f"当前设备：{name}", U.T.text_dim)
                 self.btn_goto_hosts.pack_forget()
             else:
                 self.pill_nas.set("未连接设备", "err")
-                self.lbl_dev.configure(text="先在主机管理里连接一台设备",
-                                       fg=U.T.warn)
+                self._set_dev_text("先在主机管理里连接一台设备", U.T.warn)
                 self.btn_goto_hosts.pack(side="right", padx=(0, U.px(4)))
         except tk.TclError:
             pass

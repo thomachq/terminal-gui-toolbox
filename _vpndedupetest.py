@@ -152,7 +152,20 @@ chk(not hasattr(con, "v_host"), "连接页的输入变量没有被创建")
 # 头部设备状态
 chk(getattr(con, "lbl_dev", None) is not None, "头部有设备状态文字")
 pump(root, 0.3)
-txt = str(con.lbl_dev.cget("text") or "")
+
+
+def dev_text():
+    """头部那句设备状态。
+
+    v1.0.21 起窄窗口下显示的是省略版（`先在主机管理里…`），全文留在
+    `full_text` 上 —— 屏幕上被裁成半句话比省略号难看得多。所以断言读全文，
+    不然窗口一窄测试就假红。
+    """
+    full = getattr(con.lbl_dev, "full_text", "") or ""
+    return str(full or con.lbl_dev.cget("text") or "")
+
+
+txt = dev_text()
 chk("主机管理" in txt, "没会话时提示去主机管理连", txt)
 chk(getattr(con, "btn_goto_hosts", None) is not None, "有「主机管理」跳转按钮")
 chk(con.nas.connected is False, "没有会话时 connected 是 False")
@@ -192,8 +205,8 @@ con._refresh_device()
 pump(root, 0.3)
 eq(con.nas.connected, True, "接上假会话后 connected 为 True")
 eq(con.nas.label(), "cloudadmin@192.168.3.12", "label 是 user@host")
-chk("192.168.3.12" in str(con.lbl_dev.cget("text") or ""),
-    "头部显示当前设备", str(con.lbl_dev.cget("text")))
+chk("192.168.3.12" in dev_text(),
+    "头部显示当前设备", dev_text())
 
 con.do_probe()
 pump(root, 1.2)

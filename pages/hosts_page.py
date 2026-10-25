@@ -344,8 +344,9 @@ class HostsPage:
                                            command=lambda _e: self._hosts_apply_filter())
         self._style_optionmenu(self.cb_host_group, width=13)
         self.cb_host_group.pack(side="right")
-        U.wlabel(bar, "分组", "pagedim", U.FONT_XS).pack(side="right",
-                                                        padx=(0, U.px(6)))
+        # 这里原本还有一个「分组」小标题。它和下拉里显示的值（全部分组 /
+        # 生产 / 未分组）语义重复，却要吃掉 34px —— 开着 AI 侧栏时工具栏
+        # 一窄，被挤到只剩 10px，屏幕上就是个「分」。直接去掉，下拉自己说话。
         U.RoundButton(bar, "刷新", self.host_refresh, variant="ghost",
                       font=U.FONT_S, height=30, padx=10).pack(side="right",
                                                               padx=(0, U.px(8)))

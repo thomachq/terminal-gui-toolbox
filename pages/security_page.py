@@ -69,6 +69,24 @@ class SecurityPage(FirewallPage):
             "mute", U.FONT_XS)
         self.lbl_sec_hint.pack(side="right")
 
+        # 这条只是补充说明，窗口一窄会被按钮挤成「本机与远端都…」这样的半截话。
+        # 挤不下就整条收起来 —— 显示半句话比不显示更像故障。
+        def _fit_sec_hint(_e=None):
+            try:
+                others = sum(w.winfo_reqwidth() for w in row.winfo_children()
+                             if w is not self.lbl_sec_hint)
+                room = int(row.winfo_width()) - others
+                want = U.px(230)
+                shown = bool(self.lbl_sec_hint.winfo_manager())
+                if room < want and shown:
+                    self.lbl_sec_hint.pack_forget()
+                elif room >= want and not shown:
+                    self.lbl_sec_hint.pack(side="right")
+            except tk.TclError:
+                pass
+
+        row.bind("<Configure>", _fit_sec_hint, add="+")
+
         # ---- 页签
         self.seg_sec = Segmented(pg, TABS, command=self._sec_tab)
         self.seg_sec.grid(row=1, column=0, sticky="w", pady=(U.px(10), 0))

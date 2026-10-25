@@ -96,10 +96,18 @@ def main() -> int:
             if w is None:
                 chk(False, f"页面 {key} 控件 {a} 存在", "属性缺失")
                 continue
-            try:
-                ok2 = w.winfo_exists() and w.winfo_width() > 1
-            except Exception:  # noqa: BLE001
-                ok2 = False
+            # 不能只量一次：tbl_sec（安全体检结果表）要等体检跑完才挂上去，
+            # 固定 0.4 秒在机器忙的时候不够 —— 批量连跑 56 个脚本时会撞上
+            # 「w=1」的假红（单跑永远过）。给它最多 3 秒，量到就停。
+            ok2 = False
+            for _ in range(10):
+                try:
+                    ok2 = bool(w.winfo_exists() and w.winfo_width() > 1)
+                except Exception:  # noqa: BLE001
+                    ok2 = False
+                if ok2:
+                    break
+                pump(app, 0.3)
             chk(ok2, f"页面 {key} · {a}", f"w={w.winfo_width()}")
 
     # ---------------- 状态栏

@@ -19,6 +19,11 @@ MIN_H = 200         # 拖到最矮也要能看见表头 + 三五行（原来 140
 DEFAULT_H = 280     # 默认高度：能看五六条 + 筛选条 + 分页（原来实际只有 160 太扁）
 USABLE_H = 240      # 低于这个数等于「没设置过」，按 DEFAULT_H 起
 RATIO = 0.72        # 最高不超过窗口高度的 72%，否则主界面就没地方了
+# 默认高度还要跟窗口高度挂钩。定死 280 在 1747×1136（逻辑 1165×757）的窗口上
+# 要吃掉 37%：左侧导航被挤到只剩 5 项（「运维工具」以下全都点不到），主机表格
+# 只剩 2 行。用户 2026-10-25 报的「界面显示不完整」里就有这一条。
+# 用户自己拖过的高度不受影响，只有「没设置过 / 老存档」才按比例算。
+AUTO_RATIO = 0.30
 
 
 class LogDock:
@@ -42,6 +47,9 @@ class LogDock:
             saved = 0
         if saved < USABLE_H or saved > 2000:
             saved = DEFAULT_H
+            self._log_dock_auto = True      # 这个高度是「我们定的」，可以按窗口收
+        else:
+            self._log_dock_auto = False     # 用户自己拖的，不许动
         self._log_dock_h = U.px(max(MIN_H, int(saved)))
         self.log_dock_host = tk.Frame(self.shell, bg=U.T.page, bd=0)
         self._log_want_open = bool(pref.get("log_open"))
@@ -96,12 +104,20 @@ class LogDock:
             win_h = int(self.winfo_height())
             if win_h > U.px(MIN_H) * 2:
                 h = min(h, max(U.px(MIN_H), int(win_h * RATIO)))
+                # 用默认值的（不是用户拖的）再按窗口高三成收一次：
+                # 高度越大的窗口越不该让底栏按死数占地方。
+                if getattr(self, "_log_dock_auto", False):
+                    h = max(U.px(MIN_H), min(h, int(win_h * AUTO_RATIO)))
         except tk.TclError:
             pass
+        self._log_dock_h = h
         host.configure(height=h)
 
+        # 抓手的光标用「手」而不是上下双箭头：这条只有 5px 高，鼠标扫过
+        # 日志面板顶部就会闪一下 ↕，看着像界面在提示什么却不知道提示什么。
+        # 手型表达的是「这里能抓住拖」，语义一样但不刺眼。
         grip = tk.Frame(host, bg=U.T.border, height=U.px(GRIP_H),
-                        bd=0, cursor="sb_v_double_arrow")
+                        bd=0, cursor="hand2")
         grip.pack(fill="x")
         U.register(grip, lambda: grip.configure(bg=U.T.border))
         grip.bind("<Button-1>", self._log_drag_start)

@@ -56,6 +56,52 @@ def px(n: float) -> int:
     """把 96 DPI 下的设计像素换算成当前缩放下的真实像素。"""
     return int(round(n * S))
 
+
+def elide(text: str, font, max_px: int, mode: str = "middle") -> str:
+    """把 text 压进 max_px 像素以内，超出部分用 … 顶替。
+
+    Tk 的 Label 既不换行也不省略 —— 宽度不够时直接从右边切掉，屏幕上就是
+    「本机 · C:\\Users\\Thomas · 178」这种断在半截的句子，看着像程序坏了。
+    这里在**写入文字之前**先按实测宽度缩短，至少让省略是看得见的。
+
+    mode="middle" 保留头尾（路径类信息头尾都有用），"tail" 只保留开头。
+    """
+    text = str(text)
+    if max_px <= 4 or not text:
+        return "" if max_px <= 4 else text
+    try:
+        f = tkfont.Font(font=font)
+    except Exception:  # noqa: BLE001  字体量不出来就别动原文
+        return text
+    if f.measure(text) <= max_px:
+        return text
+    dot = "\u2026"
+    dw = f.measure(dot)
+    if dw > max_px:
+        return ""
+    if mode == "tail":
+        lo, hi, best = 0, len(text), dot
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if f.measure(text[:mid]) + dw <= max_px:
+                best = text[:mid] + dot
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+    lo, hi, best = 0, len(text), dot
+    while lo <= hi:
+        keep = (lo + hi) // 2
+        head = (keep + 1) // 2
+        tail = keep - head
+        cand = text[:head] + dot + (text[-tail:] if tail else "")
+        if f.measure(cand) <= max_px:
+            best = cand
+            lo = keep + 1
+        else:
+            hi = keep - 1
+    return best
+
 # ---------------------------------------------------------------- 字体
 FONT_FAMILY = "Microsoft YaHei UI"
 FONT = (FONT_FAMILY, 10)
@@ -920,7 +966,7 @@ class Nav(tk.Frame):
       多一条灰条占地方。
     """
 
-    def __init__(self, master, items, on_change, width: int = 170,
+    def __init__(self, master, items, on_change, width: int = 180,
                  alias: dict | None = None):
         super().__init__(master, bg=T.page, bd=0, width=px(width))
         self.pack_propagate(False)
@@ -956,6 +1002,32 @@ class Nav(tk.Frame):
         register(self, lambda: self.configure(bg=T.page))
         register(self._canvas, lambda: self._canvas.configure(bg=T.page))
         register(self._inner, lambda: self._inner.configure(bg=T.page))
+        self._fit_width(items, width)
+
+    def _fit_width(self, items, base: int) -> None:
+        """宽度按**最长标题**自适应，别写死一个数。
+
+        固定 170 逻辑像素时「隧道客户端证书管理」差 7px 被 tk 直接裁字
+        （Label 不换行也不省略）。以后再加长标题还会撞同一堵墙，所以这里
+        按实际字体量一遍，取「默认宽度」和「量出来的需求」中的大者，
+        上限 220 —— 侧栏不能无限吃主区的宽度。
+        """
+        try:
+            f = tkfont.Font(font=FONT)
+            need = 0
+            for it in items:
+                grouped = bool(it) and it[0] == "group"
+                subs = it[2] if grouped else [it]
+                ind = 11 if grouped else 0
+                for pair in subs or []:
+                    if not pair or len(pair) < 2:
+                        continue
+                    # 文字 + 标签左右 padx + 左侧 accent + 条目外边距
+                    need = max(need, f.measure(str(pair[1]))
+                               + px(13 + ind) * 2 + px(16))
+            self.configure(width=max(px(base), min(px(220), need)))
+        except Exception:  # noqa: BLE001  量不出来就用默认宽度，不该拖垮导航
+            pass
 
     # ---------------------------------------------------------- 滚动
     def _sync(self, _e=None) -> None:

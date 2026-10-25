@@ -287,8 +287,32 @@ class StatusBar(tk.Frame):
         self.cell_dev.paint()
 
     def set_state(self, text: str, tone: str = "mute") -> None:
-        color = {"ok": U.T.ok, "err": U.T.err, "warn": U.T.warn}.get(tone, U.T.text_mute)
-        self.lb_state.configure(text=text, fg=color)
+        """写状态文字。太长就按当前可用宽度省略，别让它硬切。
+
+        状态栏右侧这一格是 pack 里最没话语权的 —— 左边设备/CPU/内存/网速
+        都按请求宽度占位，剩多少它就拿多少。窗口一窄，`本机 · C:\\Users\\
+        Thomas · 178 项` 就被切成半截。这里按实测宽度收一次，至少省略号
+        在明示「还有内容」，同时把全文留在属性里给以后做 tooltip 用。
+        """
+        color = {"ok": U.T.ok, "err": U.T.err, "warn": U.T.warn}.get(
+            tone, U.T.text_mute)
+        self._state_text = str(text)
+        self._state_tone = tone
+        try:
+            # 可用宽度 = 状态栏宽 − 这一格的起点 − 右侧留白。
+            # 不能直接拿 lb_state.winfo_width()：它 pack(side="right") 且不
+            # stretch，那个值就是「当前这段文字多宽」，永远不会说自己被挤。
+            avail = (int(self.winfo_width())
+                     - int(self.lb_state.winfo_x()) - U.px(22))
+        except tk.TclError:
+            avail = 0
+        shown = U.elide(self._state_text, U.FONT_XS, avail) if avail > 60 \
+            else self._state_text
+        self.lb_state.configure(text=shown, fg=color)
+        try:
+            self.lb_state.full_text = self._state_text
+        except tk.TclError:
+            pass
 
     def update_sample(self, s: Sample, hist: list[float] | None = None) -> None:
         if not s or not s.ok:

@@ -23,6 +23,13 @@ ENDPOINTS = [
     {"m": "GET", "path": "/v1/sessions/{id}/download", "desc": "SFTP 下载"},
     {"m": "POST", "path": "/v1/sessions/{id}/keepalive", "desc": "调整保活间隔"},
     {"m": "DELETE", "path": "/v1/sessions/{id}", "desc": "关闭连接"},
+    # ---- 工具箱的具体能力（不止是终端）
+    {"m": "GET", "path": "/v1/tools", "desc": "能力清单，智能体先读这个"},
+    {"m": "GET", "path": "/v1/hosts", "desc": "档案里的设备清单（不含口令）"},
+    {"m": "GET", "path": "/v1/tools/sysinfo", "desc": "系统概览：CPU / 内存 / 磁盘"},
+    {"m": "GET", "path": "/v1/tools/docker", "desc": "容器 / 镜像 / 卷 / 占用"},
+    {"m": "GET", "path": "/v1/tools/services", "desc": "监听端口与 Web 服务识别"},
+    {"m": "GET", "path": "/v1/tools/files", "desc": "列目录 / 读 / 写 / 删（SFTP）"},
 ]
 
 SESSION_COLS = [

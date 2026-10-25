@@ -159,6 +159,29 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * Single instance actually limits multiple windows now. Test flags
+    (`--page`, `--no-probe`, `--dark`) used to bypass the single-instance
+    check entirely, so an instance launched for testing could coexist with
+    the one the user was working in - the notification area ended up with
+    several icons nobody could tell apart. Those flags no longer bypass the
+    check; test runs get their own namespace via `--instance-key <name>`.
+  * The local API can now drive the toolbox itself, not just a shell. New
+    `/v1/tools` endpoints return structured results built on the very parsers
+    the GUI uses: `sysinfo` (CPU / memory / disks / uptime), `docker`
+    (containers / images / volumes / usage), `services` (listening ports with
+    service identification) and `files` (list / read / write / mkdir / remove /
+    rename over SFTP). `/v1/hosts` lists saved profiles without any secrets.
+    Every command behind them still goes through `SessionPool.exec`, so the
+    `[API]` audit trail keeps working.
+  * UI fixes: the key/value grid in "Agent access" no longer clips values.
+    Column count is now decided from each column's real demand (label width,
+    tail button included) and every column gets a `minsize`, so a token row
+    can no longer collapse into `ttb_***` plus a single-character button.
+    The side navigation sizes itself to its longest title, and the drag
+    handles of the log dock / assistant pane use a hand cursor instead of the
+    double-headed resize arrow.
+
+
   * Fixed: the local API service could never restart itself. `stop()`
     unconditionally persisted `enabled = false`, and quitting the app always
     calls `stop()`, so the "if it was running last time, bring it back" branch

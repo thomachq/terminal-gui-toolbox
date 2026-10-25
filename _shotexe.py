@@ -49,6 +49,32 @@ def kill_titled():
         k32.TerminateProcess(k32.OpenProcess(1, False, pid.value), 0)
 
 
+def kill_tree(p):
+    """连子进程一起收掉。
+
+    onefile 打包出来是 bootloader + 子进程两条同名进程，窗口在子进程里。
+    只 terminate bootloader 的话，子进程会带着窗口继续活着（2026-10-25 实测：
+    terminate 之后 20 秒，子进程、窗口、互斥量全都还在）。
+
+    原来这里还有一句 kill_titled()，是按窗口标题扫全桌面的 —— 用户自己开着的
+    那个实例标题一模一样，会被一起打死。现在只收本次起的这棵进程树。
+    """
+    if p is None or p.poll() is not None:
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                       capture_output=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        p.wait(timeout=12)
+    except Exception:  # noqa: BLE001
+        try:
+            p.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def grab(hwnd):
     class R(ctypes.Structure):
         _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
@@ -92,7 +118,8 @@ time.sleep(0.6)
 before = set(find_titled())
 
 t0 = time.time()
-proc = subprocess.Popen([str(EXE)], cwd=str(EXE.parent))
+proc = subprocess.Popen([str(EXE), "--instance-key", "shot"],
+                        cwd=str(EXE.parent))
 print(f"launched pid={proc.pid}")
 
 hwnd = None
@@ -128,9 +155,5 @@ data = EXE.parent / "data"
 print("data dir:", data, "exists =", data.exists(),
       "children =", [p.name for p in data.iterdir()] if data.exists() else [])
 
-proc.terminate()
-time.sleep(0.8)
-if proc.poll() is None:
-    proc.kill()
-kill_titled()
+kill_tree(proc)
 print("EXIT", proc.poll())

@@ -104,6 +104,38 @@ def wait_window(title, before, limit=30.0):
     return None
 
 
+def close(p, wait=12.0):
+    """关掉一个测试实例，连它的子进程一起收干净。
+
+    onefile 打包出来是「bootloader + 子进程」两条同名进程，**窗口和单实例锁都
+    在子进程里**。只 terminate bootloader，子进程会带着窗口活下来 —— 2026-10-25
+    实测：terminate 之后 20 秒，子进程还在、窗口还在、互斥量还被它握着。
+
+    后果有两层：
+      1. 后面想复用同一个 --instance-key 会被正确拦下（看着像"测试失败"，其实
+         是上一个实例压根没关）；
+      2. 每跑一遍就攒下一整套活实例，任务栏里一排托盘图标 —— 用户 2026-10-25
+         报的就是这个。
+
+    taskkill /T 按父进程连根杀才收得干净，而且必须赶在 bootloader 还活着的时候
+    调：它一死，pid 就没了，子进程再也认不回来。
+    """
+    if p is None or p.poll() is not None:
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                       capture_output=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        p.wait(timeout=wait)
+    except Exception:  # noqa: BLE001
+        try:
+            p.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def main():
     chk(EXE.is_file(), "exe 存在", EXE.name)
     if not EXE.is_file():
@@ -128,7 +160,8 @@ def main():
 
     # ---- 3. 起主窗口 + 截图
     before = set(find_titled("Terminal GUI Toolbox"))
-    proc = subprocess.Popen([str(EXE), "--page", "tools"], cwd=str(HERE))
+    proc = subprocess.Popen([str(EXE), "--page", "tools",
+                                "--instance-key", "exe1"], cwd=str(HERE))
     try:
         hwnd = wait_window("Terminal GUI Toolbox", before)
         chk(hwnd is not None, "exe 起出主窗口")
@@ -149,15 +182,12 @@ def main():
                 chk(len(nb or []) > 5, "底部状态栏有内容",
                     f"{len(nb or [])} 色")
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=8)
-        except Exception:  # noqa: BLE001
-            proc.kill()
+        close(proc)
 
     # ---- 4. --page vpn：证书控制台现在是内嵌页，不再另起子进程
     before2 = set(find_titled("Terminal GUI Toolbox"))
-    p2 = subprocess.Popen([str(EXE), "--page", "vpn"], cwd=str(HERE))
+    p2 = subprocess.Popen([str(EXE), "--page", "vpn",
+                                "--instance-key", "exe2"], cwd=str(HERE))
     try:
         hwnd2 = wait_window("Terminal GUI Toolbox", before2)
         chk(hwnd2 is not None, "--page vpn 起出主窗口")
@@ -174,15 +204,12 @@ def main():
             extra = [h for h in find_titled("Client Cert Console")]
             chk(not extra, "没有多余的证书控制台窗口", f"{len(extra)} 个")
     finally:
-        p2.terminate()
-        try:
-            p2.wait(timeout=8)
-        except Exception:  # noqa: BLE001
-            p2.kill()
+        close(p2)
 
     # ---- 5. --page web：新加的 Web 服务页（core.webstack / pages.web_page 有没有打进去）
     before3 = set(find_titled("Terminal GUI Toolbox"))
-    p3 = subprocess.Popen([str(EXE), "--page", "web"], cwd=str(HERE))
+    p3 = subprocess.Popen([str(EXE), "--page", "web",
+                                "--instance-key", "exe3"], cwd=str(HERE))
     try:
         hwnd3 = wait_window("Terminal GUI Toolbox", before3)
         chk(hwnd3 is not None, "--page web 起出主窗口")
@@ -196,16 +223,13 @@ def main():
                 chk(len(img3.getcolors(maxcolors=1 << 22) or []) > 50,
                     "Web 服务页不是空白")
     finally:
-        p3.terminate()
-        try:
-            p3.wait(timeout=8)
-        except Exception:  # noqa: BLE001
-            p3.kill()
+        close(p3)
 
     # ---- 6. --page ai：AI 运维页（core.aiops / ai_skills / ai_skills_builtin 有没有打进去）
     # 技能正文是打进 exe 的常量，这一页能起来且不空白，说明那 8 份 SKILL.md 也在包里。
     before4 = set(find_titled("Terminal GUI Toolbox"))
-    p4 = subprocess.Popen([str(EXE), "--page", "ai"], cwd=str(HERE))
+    p4 = subprocess.Popen([str(EXE), "--page", "ai",
+                                "--instance-key", "exe4"], cwd=str(HERE))
     try:
         hwnd4 = wait_window("Terminal GUI Toolbox", before4)
         chk(hwnd4 is not None, "--page ai 起出主窗口")
@@ -219,18 +243,15 @@ def main():
                 chk(len(img4.getcolors(maxcolors=1 << 22) or []) > 50,
                     "AI 运维页不是空白")
     finally:
-        p4.terminate()
-        try:
-            p4.wait(timeout=8)
-        except Exception:  # noqa: BLE001
-            p4.kill()
+        close(p4)
 
     # ---- 7. 点 × 必须真退出（2026-10-24 修的那个 bug）
     # 以前 close_to_tray 默认 True，WM_CLOSE 只 withdraw，进程留在后台；Win11 又把
     # 托盘图标塞进「︿」溢出区，用户既看不到图标也只能去任务管理器强杀。
     # 这里直接给主窗口发 WM_CLOSE，等价于点 ×，然后看进程有没有自己走掉。
     before5 = set(find_titled("Terminal GUI Toolbox"))
-    p5 = subprocess.Popen([str(EXE), "--page", "tools"], cwd=str(HERE))
+    p5 = subprocess.Popen([str(EXE), "--page", "tools",
+                                "--instance-key", "exe5"], cwd=str(HERE))
     try:
         hwnd5 = wait_window("Terminal GUI Toolbox", before5)
         chk(hwnd5 is not None, "退出检查：主窗口起出来了")
@@ -247,12 +268,9 @@ def main():
             chk(gone, "点 × 后进程自己退出（不再残留后台）",
                 "rc=%r" % p5.poll())
     finally:
-        if p5.poll() is None:
-            p5.kill()
-            try:
-                p5.wait(timeout=8)
-            except Exception:  # noqa: BLE001
-                pass
+        # 这一段本来就是「点 × 该自己退出」，poll 只反映 bootloader；万一子进程
+        # 还赖着，close() 会按进程树连根收掉，不给任务栏留托盘图标。
+        close(p5)
 
     npass = sum(1 for ok, _, _ in RESULTS if ok)
     nfail = len(RESULTS) - npass

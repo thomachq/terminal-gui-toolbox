@@ -102,15 +102,57 @@ chk(not SI.bring_to_front("这个标题的窗口绝对不存在 8f3a2b"), "不�
 chk(not SI.bring_to_front(""), "空标题：False")
 
 
-# ================================================================== 5. 放行
-sec("5. app.main() 对测试参数放行")
+# ================================================================== 5. 策略
+sec("5. main() 的单实例策略（测试实例不许绕过去）")
+
+import re  # noqa: E402
 
 src = (HERE / "app.py").read_text(encoding="utf-8")
-for a in ("--smoke", "--page", "--no-probe", "--dark", "--version"):
-    chk(f'"{a}"' in src, f"跳过名单里有 {a}")
-chk("singleinstance.acquire()" in src, "main() 里确实调了抢锁")
-chk("singleinstance.wake()" in src, "抢不到时会叫醒已有实例")
-chk("_wake_poll" in src, "已有实例有轮询唤醒的入口")
+m = re.search(r"_NO_SINGLETON\s*=\s*\(([^)]*)\)", src)
+names = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+# 2026-10-25 用户反馈「任务栏都是终端工具箱的托盘」：根因就是原来把
+# --page / --no-probe / --dark 一起放进放行名单，于是测试实例能和用户那个
+# 并存，托盘里堆出好几个图标。现在只有「根本不出窗口」的参数才放行。
+chk(names == ["--smoke", "--version"],
+    f"只放行不出窗口的参数（实际 {names}）", str(names))
+for a in ("--page", "--no-probe", "--dark"):
+    chk(a not in names, f"{a} 不再绕过单实例检查")
+chk("key_from_argv" in src, "main() 按 --instance-key 取命名空间")
+chk("singleinstance.acquire(key)" in src, "抢锁带上了 key")
+chk("singleinstance.wake(key)" in src, "叫醒用的是同一个 key")
+chk("key_from_argv(sys.argv)" in src, "唤醒轮询也用同一个 key（不会串台）")
+
+sec("5b. 被拦下时只叫醒、不自己再开一个")
+# 「把已有窗口叫到前台」是按标题找的，不认命名空间 —— 测试实例要是也走这条
+# 就会把用户正在用的窗口拉到前面。只有默认命名空间才准动别人的窗口。
+chk("is_default = key == singleinstance.DEFAULT_KEY" in src,
+    "认得「这是默认命名空间」")
+chk(re.search(r"if not singleinstance\.acquire\(key\):\s*\n"
+              r"\s*singleinstance\.wake\(key\)", src) is not None,
+    "抢不到锁时先叫醒对面")
+chk(re.search(r"if is_default:\s*\n\s*(?:#[^\n]*\n\s*)*"
+              r"singleinstance\.bring_to_front\(APP_NAME\)", src) is not None,
+    "只有默认命名空间才去动别人的窗口")
+# 被拦下之后必须退出。原来 onefile 的 terminate 只杀 bootloader、真正的子
+# 进程带着窗口活下来（2026-10-25 实测：杀完 20 秒仍持锁），所以「对面还活着」
+# 是常态而不是异常 —— 这里不需要也不应该等锁重试，否则用户重复双击要白等。
+chk(re.search(r"singleinstance\.bring_to_front\(APP_NAME\)\s*\n\s*return", src)
+    is not None, "叫醒之后自己退出，不再开第二个窗口")
+
+sec("6. key_from_argv 解析")
+
+chk(SI.key_from_argv(["app.py"]) == SI.DEFAULT_KEY,
+    "没有 --instance-key 时用默认命名空间")
+chk(SI.key_from_argv(["app.py", "--instance-key", "exe"])
+    == SI.DEFAULT_KEY + "-exe", "带值时拼成 <默认>-<值>")
+chk(SI.key_from_argv(["app.py", "--instance-key"]) == SI.DEFAULT_KEY,
+    "给了开关没给值：回退默认")
+chk(SI.key_from_argv(["app.py", "--instance-key", "--page"]) == SI.DEFAULT_KEY,
+    "值位置上是另一个开关时不当值")
+chk(SI.key_from_argv(["app.py", "--instance-key", " "]) == SI.DEFAULT_KEY,
+    "空白值回退默认")
+chk(SI.key_from_argv(["app.py", "--instance-key", "exe"]) != SI.DEFAULT_KEY,
+    "测试命名空间和用户那个不是同一个（不会互相挡）")
 
 
 # ================================================================== 汇总

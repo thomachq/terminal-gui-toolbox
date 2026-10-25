@@ -37,6 +37,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import crypto_store
+from api.tools import ToolKit
 from api.pool import PoolError, SessionPool
 
 API_VERSION = "1.0"
@@ -188,6 +189,8 @@ class ApiServer:
         self.requests = 0
         self.last_error = ""
         self.started_at = 0.0
+        # 能力接口（/v1/tools/*）。由 make_default 挂上来，测试里可以手动塞。
+        self.tools = None
 
     # ---------------------------------------------------------- 生命周期
     @property
@@ -398,6 +401,18 @@ class _Handler(BaseHTTPRequestHandler):
         if parts[:1] != ["v1"]:
             raise ApiError(404, "未知路径", "所有接口都在 /v1 下")
 
+        # /v1/tools/* 与 /v1/hosts：工具箱的具体功能（docker/文件/系统/服务）
+        if parts[1:2] == ["tools"]:
+            if app.tools is None:
+                raise ApiError(503, "能力接口没装配", "重启一次程序")
+            return app.tools.route(method, parts[2:], qs, body)
+        if parts[1:2] == ["hosts"]:
+            if app.tools is None:
+                raise ApiError(503, "能力接口没装配", "重启一次程序")
+            if method != "GET":
+                raise ApiError(405, "/v1/hosts 只支持 GET")
+            return 200, app.tools.hosts()
+
         # /v1/sessions...
         if parts[1:2] == ["sessions"]:
             rest = parts[2:]
@@ -519,6 +534,50 @@ OPENAPI = {
         "/v1/openapi.json": {
             "get": {"summary": "本文件（无需令牌）", "security": []}
         },
+        "/v1/hosts": {
+            "get": {"summary": "本机档案里的设备清单（不含口令），按名字连接用"}
+        },
+        "/v1/tools": {
+            "get": {"summary": "工具箱能力清单（建议先读这个）",
+                    "description": "返回 docker / 文件 / 系统 / 服务 等具体能力，"
+                                   "全部支持 ?session=<id>，不给就用最近活跃的连接"}
+        },
+        "/v1/tools/sysinfo": {
+            "get": {"summary": "系统概览：设备、CPU、内存、磁盘、运行时长"}
+        },
+        "/v1/tools/services": {
+            "get": {"summary": "监听端口 + 服务识别（nginx/mysql/redis…）"}
+        },
+        "/v1/tools/docker": {
+            "get": {"summary": "Docker 状态 + 容器/镜像/卷/网络/占用",
+                    "parameters": [{"name": "what", "in": "query",
+                                    "schema": {"type": "string",
+                                               "enum": ["all", "containers",
+                                                        "images", "volumes",
+                                                        "networks", "df",
+                                                        "stats"]}}]}
+        },
+        "/v1/tools/docker/logs": {
+            "post": {"summary": "容器日志 {session,id,tail}"}
+        },
+        "/v1/tools/files": {
+            "get": {"summary": "列目录（?path=，不给就是 home）"}
+        },
+        "/v1/tools/files/read": {
+            "get": {"summary": "读文件（?path=&max=；二进制给 base64）"}
+        },
+        "/v1/tools/files/write": {
+            "post": {"summary": "写文件 {path, text|content_b64}"}
+        },
+        "/v1/tools/files/mkdir": {
+            "post": {"summary": "建目录 {path}"}
+        },
+        "/v1/tools/files/remove": {
+            "post": {"summary": "删文件/目录 {path, dir?}"}
+        },
+        "/v1/tools/files/rename": {
+            "post": {"summary": "改名/移动 {path, to}"}
+        },
         "/v1/sessions": {
             "get": {"summary": "列出所有会话（含 idle 秒数、设备信息）"},
             "post": {
@@ -588,4 +647,6 @@ def make_default(data_dir: Path, on_log=None, on_cmd=None) -> tuple[ApiConfig, S
                        idle_ttl=int(cfg.data.get("idle_ttl") or 0),
                        on_event=on_log, tracer=on_cmd)
     srv = ApiServer(cfg, pool, on_log=on_log)
+    # 能力层要读 profiles.dat（主机档案），所以得知道 data_dir
+    srv.tools = ToolKit(pool, Path(data_dir))
     return cfg, pool, srv

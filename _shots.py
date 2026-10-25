@@ -29,6 +29,31 @@ SETTINGS = HERE / "data" / "settings.json"
 SHOT_DATA_DIR = None
 
 
+def kill_tree(p):
+    """连子进程一起收掉。
+
+    onefile 打包出来是 bootloader + 子进程两条同名进程，窗口在子进程里。
+    只 terminate bootloader 的话，子进程会带着窗口继续活着（2026-10-25 实测：
+    terminate 之后 20 秒，子进程、窗口、互斥量全都还在），任务栏里就攒出一排
+    托盘图标。taskkill /T 按父进程连根杀，且必须在 bootloader 还活着时调 ——
+    它一死 pid 就没了，子进程再也认不回来。
+    """
+    if p is None or p.poll() is not None:
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                       capture_output=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        p.wait(timeout=12)
+    except Exception:  # noqa: BLE001
+        try:
+            p.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def isolate(prefix="tbshot_", skip=("ca", "logs", "agent_sessions", "output")):
     """把 app 的 data 目录切到「临时副本」，跑完自动删。
 
@@ -160,7 +185,8 @@ def client_offset(hwnd):
 
 def shoot(tag, args, wait):
     before = set(find_titled())
-    proc = subprocess.Popen([PY, str(HERE / "app.py"), *args], cwd=str(HERE))
+    proc = subprocess.Popen([PY, str(HERE / "app.py"), *args,
+                             "--instance-key", "shot"], cwd=str(HERE))
     hwnd = None
     t0 = time.time()
     while time.time() - t0 < 25:
@@ -170,7 +196,7 @@ def shoot(tag, args, wait):
             hwnd = fresh[0]
             break
     if not hwnd:
-        proc.terminate()
+        kill_tree(proc)
         print(f"  {tag:8s} 窗口没起来")
         return False
     time.sleep(wait)
@@ -184,11 +210,7 @@ def shoot(tag, args, wait):
         print(f"  {tag:8s} OK  {img.size[0]}x{img.size[1]}  -> {dst.name}")
         return True
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=6)
-        except Exception:  # noqa: BLE001
-            proc.kill()
+        kill_tree(proc)
 
 
 def main():

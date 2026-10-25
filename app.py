@@ -115,7 +115,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.20"
+APP_VER = "1.0.21"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -981,7 +981,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         而不是默默多开一份（多开会各自写一套 data，托盘里还两个图标）。
         """
         try:
-            if singleinstance.consume():
+            # key 必须和 main() 里 acquire 用的一致，否则测试实例（另一个
+            # 命名空间）被人双击时，用户那个实例会收到跟自己无关的唤醒信号。
+            if singleinstance.consume(singleinstance.key_from_argv(sys.argv)):
                 self._show_from_tray()
                 try:
                     self.status.set_state(
@@ -3735,13 +3737,25 @@ def main():
     # 想单独调它可以直接 `python vpncert_gui.py`（它自己能独立跑）。
 
     # 单实例（参考微信）：已经有一套在跑，就把那个窗口叫到前台，自己退出。
-    # 测试/截图参数一律跳过 —— _texe 会连着起好几次窗口，_shot_* 也常常和
-    # 用户自己开着的那个并存，加了限制就互相挡死了。
-    _NO_SINGLETON = ("--smoke", "--page", "--no-probe", "--dark", "--version")
+    #
+    # 早先的做法是「带 --page / --no-probe / --dark 就整个跳过单实例」，
+    # 因为 _texe 要连着起好几次窗口。代价是测试实例能和用户那个并存 ——
+    # 托盘里堆出两三个图标，用户分不清哪个是自己开的。
+    # 现在只让 `--smoke` / `--version`（根本不出窗口的那种）跳过，
+    # 其余情况一律走单实例；测试脚本改用 `--instance-key <名字>` 换命名空间，
+    # 例如 `--instance-key exe`，各测各的，谁也不挡谁。
+    _NO_SINGLETON = ("--smoke", "--version")
     if not any(a in sys.argv for a in _NO_SINGLETON):
-        if not singleinstance.acquire():
-            singleinstance.wake()           # 叫醒它（本版本起会自己弹到前台）
-            singleinstance.bring_to_front(APP_NAME)  # 老版本收不到事件，兜底
+        key = singleinstance.key_from_argv(sys.argv)
+        # 「把已有那个窗口叫到前台」这条兜底是按**窗口标题**找的，不认命名空间。
+        # 测试实例（--instance-key exeN）被拦时要是也走这条路，就会把用户正在
+        # 用的那个窗口拉到前面来 —— 测试不该碰用户的东西。
+        is_default = key == singleinstance.DEFAULT_KEY
+        if not singleinstance.acquire(key):
+            singleinstance.wake(key)        # 叫醒它（本版本起会自己弹到前台）
+            if is_default:
+                # 老版本收不到事件，兜底直接动它的窗口，然后自己退出。
+                singleinstance.bring_to_front(APP_NAME)
             return
 
     if "--dark" in sys.argv:

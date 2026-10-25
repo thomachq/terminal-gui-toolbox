@@ -34,6 +34,31 @@ extra = sys.argv[2:]
 dark = "--dark" in extra
 
 
+def kill_tree(p):
+    """连子进程一起收掉。
+
+    onefile 打包出来是 bootloader + 子进程两条同名进程，窗口在子进程里。
+    只 terminate bootloader 的话，子进程会带着窗口继续活着（2026-10-25 实测：
+    terminate 之后 20 秒，子进程、窗口、互斥量全都还在），任务栏里就攒出一排
+    托盘图标。taskkill /T 按父进程连根杀，且必须在 bootloader 还活着时调 ——
+    它一死 pid 就没了，子进程再也认不回来。
+    """
+    if p is None or p.poll() is not None:
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                       capture_output=True)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        p.wait(timeout=12)
+    except Exception:  # noqa: BLE001
+        try:
+            p.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def find_titled():
     hits = []
 
@@ -54,7 +79,8 @@ def find_titled():
 OUT.mkdir(parents=True, exist_ok=True)
 before = set(find_titled())
 
-proc = subprocess.Popen([PY, str(HERE / "app.py"), "--page", page, *extra],
+proc = subprocess.Popen([PY, str(HERE / "app.py"), "--page", page, *extra,
+                         "--instance-key", "shot"],
                         cwd=str(HERE))
 
 hwnd = None
@@ -65,7 +91,7 @@ for _ in range(100):
         hwnd = fresh[0]
         break
 if not hwnd:
-    proc.terminate()
+    kill_tree(proc)
     raise SystemExit(f"窗口没起来（page={page}）")
 
 class BIH(ctypes.Structure):
@@ -120,8 +146,4 @@ try:
         img.save(dst)
         print(f"saved {dst}  {img.size}")
 finally:
-    proc.terminate()
-    try:
-        proc.wait(timeout=6)
-    except Exception:  # noqa: BLE001
-        proc.kill()
+    kill_tree(proc)

@@ -33,6 +33,31 @@ def _event_name(key: str) -> str:
     return rf"Local\{key}-wake"
 
 
+DEFAULT_KEY = "TerminalToolbox"
+
+
+def key_from_argv(argv, default: str = DEFAULT_KEY) -> str:
+    """从命令行取实例命名空间。
+
+    为什么要这个东西：`--page` / `--no-probe` 这些测试参数早先是**直接跳过
+    单实例检查**的（_texe 要连着起好几个窗口，不跳就互相挡死）。代价是测试
+    实例和用户开着的那个可以并存 —— 托盘里就多出两三个图标，用户根本分不清
+    哪个是自己开的（2026-10-25 用户反馈「任务栏都是终端工具箱的托盘」）。
+
+    现在改成：默认还是同一个命名空间（用户双击永远只有一个），测试脚本用
+    `--instance-key exe` 换一个命名空间 —— 既不挡用户，自己之间也不互相挡。
+    """
+    try:
+        i = list(argv).index("--instance-key")
+    except ValueError:
+        return default
+    nxt = list(argv)[i + 1] if i + 1 < len(argv) else ""
+    suffix = str(nxt).strip()
+    # 加前缀而不是直接用 suffix：随便传个空串/怪字符也不会撞上用户那个
+    return f"{default}-{suffix}" if suffix and not suffix.startswith("-") \
+        else default
+
+
 if _IS_WIN:
     from ctypes import wintypes
 
