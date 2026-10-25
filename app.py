@@ -115,7 +115,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.19"
+APP_VER = "1.0.20"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -1185,7 +1185,9 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         except Exception:  # noqa: BLE001
             pass
         try:
-            self.api_server.stop()
+            # 退出时的停服不是用户的意思，别把 enabled 落成 false，
+            # 否则下次启动 _boot_api() 不会自动恢复
+            self.api_server.stop(keep_enabled=True)
         except Exception:  # noqa: BLE001
             pass
         # MCP 是本机起的子进程，退出得收干净，否则会留下一堆孤儿进程

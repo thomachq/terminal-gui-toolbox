@@ -292,7 +292,7 @@ print(r["out"])
         if new_port == 0:
             new_port = pick_free_port(host)
         if was_running:
-            srv.stop()
+            srv.stop(keep_enabled=True)
         if new_port != old_port and port_busy(new_port, host):
             self.toast(f"端口 {new_port} 现在被占用，启动时会自动换一个空闲的", "warn")
         cfg.data["port"] = new_port

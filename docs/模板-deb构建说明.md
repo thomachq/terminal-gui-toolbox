@@ -159,6 +159,16 @@ StartupWMClass=TerminalToolbox
 ```
 terminal-gui-toolbox ({{VER}}) unstable; urgency=medium
 
+  * Fixed: the local API service could never restart itself. `stop()`
+    unconditionally persisted `enabled = false`, and quitting the app always
+    calls `stop()`, so the "if it was running last time, bring it back" branch
+    in `_boot_api()` was unreachable - every launch needed a manual click on
+    "start API". `stop(keep_enabled=True)` now separates "stopping in order to
+    restart or on exit" (do not persist) from "the user switched it off"
+    (persist). Locked down by the new `_apiboottest.py`.
+  * Note when driving this program over the API: `sudo` does not change PATH,
+    so `sudo docker ...` still fails with rc=127 on DSM. Use the full path
+    (/var/packages/ContainerManager/target/usr/bin/docker).
   * Commands run by an agent through the local API are now visible: they are
     echoed into the terminal (marked with an `[API]` prefix so they cannot be
     confused with commands typed by a person) and recorded in the audit log as

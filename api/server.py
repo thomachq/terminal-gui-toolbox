@@ -250,7 +250,7 @@ class ApiServer:
         """
         was = self.running
         if was:
-            self.stop()
+            self.stop(keep_enabled=True)
         old = self.port
         new = pick_free_port(self._host())
         self.config.data["port"] = new
@@ -264,7 +264,15 @@ class ApiServer:
             return False, f"{base}，但重启没成功：{msg}"
         return True, f"{base}，已在新端口起来：{self.url()}"
 
-    def stop(self) -> None:
+    def stop(self, keep_enabled: bool = False) -> None:
+        """停服务。
+
+        `keep_enabled=True` 表示「这次停不是用户的意思」—— 程序退出、换端口
+        重启前都会先停一下，这时候**不能**把 `enabled` 落成 false，
+        否则 `_boot_api()` 那句「上次退出前是开着的就自动恢复」永远不成立
+        （退出必然走 stop，等于每次启动都被判成「上次是关着的」）。
+        用户自己点开关关掉，才落盘记成「关」。
+        """
         httpd = self._httpd
         self._httpd = None
         if httpd:
@@ -275,8 +283,9 @@ class ApiServer:
                 pass
         self.pool.stop()
         self.pool.close_all()
-        self.config.data["enabled"] = False
-        self.config.save()
+        if not keep_enabled:
+            self.config.data["enabled"] = False
+            self.config.save()
         self._log("dim", "API 服务已停止")
 
     def _host(self) -> str:
