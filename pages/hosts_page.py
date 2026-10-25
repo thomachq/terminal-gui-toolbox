@@ -24,6 +24,11 @@ from ui import forms
 from ui.table import Column, DataTable, Segmented
 
 HOST_COLS = [
+    # 最左两列是动作列：连接 / 编辑。
+    # 表格单元格只能是文字（ttk.Treeview 没法给单个格子塞真按钮），
+    # 所以这两列靠 _host_row_click 按列名分发点击 —— 点哪列就是哪个动作。
+    Column("act", "", 54, anchor="center"),
+    Column("edit", "", 34, anchor="center"),
     Column("status", "状态", 74),
     Column("name", "名称", 150, stretch=True),
     Column("addr", "地址", 176, mono=True),
@@ -33,7 +38,6 @@ HOST_COLS = [
     Column("tags", "标签", 84),
     Column("cred", "凭证", 72),
     Column("last_used", "最近连接", 100),
-    Column("edit", "", 34),
 ]
 
 # ---------------------------------------------------------------- 连通性探测
@@ -323,7 +327,7 @@ class HostsPage:
         U.RoundButton(bar, "＋ 添加主机", self.host_add, variant="primary",
                       font=U.FONT_S, height=30, padx=13).pack(side="left")
         # 头部也放一个「编辑」：右键菜单有人点不到（触控板 / 触摸屏），
-        # 每行末尾还有 ✎，三个入口都干同一件事。
+        # 每行行首还有「连接」和 ✎，四个入口都干同一件事。
         U.RoundButton(bar, "编辑", self.host_edit_sel, variant="secondary",
                       font=U.FONT_S, height=30, padx=12).pack(side="left",
                                                                padx=(U.px(6), 0))
@@ -386,7 +390,9 @@ class HostsPage:
             (None, None, None),
             ("删除", lambda: self.host_del(self._host_pick()), None),
         ])
-        # 行尾那个 ✎：点一下就编辑这一行，不用先选中再点按钮。
+        # 行首那两列（连接 / ✎）：点一下就动这一行，不用先选中再点按钮。
+        # 用 bind 到 tree 的 <Button-1> 而不是 class 绑定，所以不用插 bindtags
+        # —— 这里只是「点完之后拦一下」，不需要盖过 Treeview 自己的选中逻辑。
         self.tbl_host.tree.bind("<Button-1>", self._host_row_click, add="+")
         self.tbl_host.entry_search.bind(
             "<KeyRelease>", lambda _e: self._hosts_apply_filter(), add="+")
@@ -426,25 +432,30 @@ class HostsPage:
         """头部那个「编辑」按钮：作用于选中行。"""
         rec = self._host_pick()
         if not rec:
-            self.toast("先选一行再编辑（也可以点行尾的 ✎）", "warn")
+            self.toast("先选一行再编辑（也可以点行首的 ✎）", "warn")
             return
         self.host_edit(rec)
 
     def _host_row_click(self, event):
-        """点行尾的 ✎ 直接开编辑。
+        """点行首的动作列：左起第一列「连接」，第二列「✎」编辑。
 
-        返回 "break" 是为了不让同一次点击再去改选中态、也别让双击当成「连接」。
+        返回 "break" 是为了不让同一次点击再去改选中态、也别让第二下被当成
+        双击「连接」—— 点 ✎ 时尤其明显：不拦的话会先开编辑、再顺手连一台。
         """
         try:
-            if self.tbl_host.column_at(event.x) != "edit":
-                return None
+            col = self.tbl_host.column_at(event.x)
         except (AttributeError, tk.TclError):
+            return None
+        if col not in ("act", "edit"):
             return None
         row = self.tbl_host.row_at(event.y)
         rec = (row or {}).get("_raw") or {}
         if not rec:
             return None
-        self.host_edit(dict(rec))
+        if col == "act":
+            self.host_connect_row(dict(row))
+        else:
+            self.host_edit(dict(rec))
         return "break"
 
     def _hosts_tab(self, key: str) -> None:

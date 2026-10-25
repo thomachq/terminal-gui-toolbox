@@ -213,6 +213,33 @@ a.seg_fl.select("both")
 pump(a, 0.25)
 chk(a._fl_card_l.winfo_manager() == "grid", "双栏模式下两张卡都在")
 
+# 双栏必须是**左右**（用户 2026-10-25 明确要求，参考 FileZilla）：
+# 同一个 row、不同 column 才是并排；上下分栏会变成同一个 column 的 row 0/1。
+gi_l = a._fl_card_l.grid_info()
+gi_r = a._fl_card_r.grid_info()
+chk(int(gi_l.get("row", -1)) == int(gi_r.get("row", -2)),
+    "双栏两张卡在同一行（左右并排）",
+    f"本机 row={gi_l.get('row')} 设备 row={gi_r.get('row')}")
+chk(int(gi_l.get("column", -1)) != int(gi_r.get("column", -1)),
+    "双栏两张卡在不同列", f"本机 col={gi_l.get('column')} 设备 col={gi_r.get('column')}")
+chk(int(gi_l.get("column", -1)) < int(gi_r.get("column", -1)),
+    "本机在左、设备在右（跟 FileZilla 一致）",
+    f"本机 col={gi_l.get('column')} 设备 col={gi_r.get('column')}")
+pump(a, 0.4)
+chk(a._fl_card_l.winfo_width() > 100 and a._fl_card_r.winfo_height() > 100,
+    "双栏时两栏都拿到了实际尺寸",
+    f"本机 {a._fl_card_l.winfo_width()}x{a._fl_card_l.winfo_height()} "
+    f"设备 {a._fl_card_r.winfo_width()}x{a._fl_card_r.winfo_height()}")
+# 切回单栏时右列的 weight 必须清掉，否则卡片只占半宽
+a.seg_fl.select("remote")
+pump(a, 0.4)
+chk(int(a._fl_holder.grid_columnconfigure(1)["weight"]) == 0,
+    "单栏时右列 weight 已清零",
+    a._fl_holder.grid_columnconfigure(1)["weight"])
+# 后面的传输用例要在双栏里点本地栏，测完必须切回去
+a.seg_fl.select("both")
+pump(a, 0.3)
+
 print("== 8. 界面里真的传一次 ==")
 src_dir = ROOT / "gui_src"
 dst_dir = ROOT / "gui_dst"

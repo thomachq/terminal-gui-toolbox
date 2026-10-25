@@ -25,7 +25,7 @@ from datetime import date
 from email.utils import formatdate
 from pathlib import Path
 
-VER = "1.0.25"
+VER = "1.0.26"
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "_release" / f"v{VER}"
 STAMP = (2026, 10, 24, 17, 0, 0)

@@ -115,7 +115,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.25"
+APP_VER = "1.0.26"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 

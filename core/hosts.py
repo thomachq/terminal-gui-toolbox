@@ -209,6 +209,9 @@ def host_view(p: dict, cred_name: str = "", proxy_name: str = "",
         "last_used": fmt_ts(p.get("last_used")) or "从未连接",
         "created": fmt_ts(p.get("created")),
         "status": "未检测",
+        # 行首两个动作列（表格单元格只能是文字，点击由 hosts_page 按列名分发）：
+        # 「连接」走 host_connect_row，「✎」走 host_edit。
+        "act": "连接",
         "edit": "✎",
         "_raw": p,
     }

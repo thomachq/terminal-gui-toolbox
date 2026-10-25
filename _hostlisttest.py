@@ -209,7 +209,7 @@ deleted = win.profiles.remove("根本没有这台")
 chk(deleted is False, "删不存在的名字返回 False（界面据此提示失败）")
 
 # ================================================================== 4. 编辑入口
-sec("4. 头部「编辑」按钮与行尾 ✎")
+sec("4. 头部「编辑」按钮与行首 ✎ / 连接")
 
 chk(hasattr(win, "host_edit_sel"), "头部有「编辑」入口")
 win.profiles.upsert({"name": "gitlab", "host": "10.0.0.20", "port": "22",
@@ -242,12 +242,35 @@ tbl.column_at = lambda x: "name"          # type: ignore[assignment]
 res = win._host_row_click(types.SimpleNamespace(x=1, y=1))
 chk(res is None and not calls, "点名称列不会弹编辑", f"res={res} calls={calls}")
 
+# ---- 行首「连接」列：点一下就连接这一行
+tbl.column_at = lambda x: "act"           # type: ignore[assignment]
+tbl.row_at = lambda y: tgt                # type: ignore[assignment]
+applied: list[dict] = []
+conns: list[int] = []
+win._host_apply = lambda rec, _a=applied: _a.append(dict(rec or {}))  # type: ignore[assignment]
+win.do_connect = lambda _c=conns: _c.append(1)  # type: ignore[assignment]
+res = win._host_row_click(types.SimpleNamespace(x=1, y=1))
+pump(win, 0.2)
+eq(res, "break", "点「连接」也把事件吃掉（别再顺带开编辑/切选中）")
+chk(bool(applied) and applied[-1].get("name") == "winsrv",
+    "点「连接」把那台灌进连接表单", [a.get("name") for a in applied])
+eq(len(conns), 1, "并且真的发起了连接")
+
+# 列顺序：连接 / ✎ 必须在最左，且都在「状态」之前
+keys = [c.key for c in tbl.columns]
+eq(keys[:2], ["act", "edit"], "最左两列是「连接」和「✎」")
+chk(keys.index("status") > 1, "状态列排在这两个动作列之后", keys)
+
+# 已经连接的那台：连接列文案不变（点它等于重连，别让文案跟着状态跳）
+chk("act" in row_of("winsrv"), "行模型里有动作列取值")
+eq(row_of("winsrv").get("act"), "连接", "动作列文字是「连接」")
+
 # ================================================================== 5. 状态列
 sec("5. 状态列")
 
 chk("status" in [c.key for c in tbl.columns], "表里有「状态」列")
 chk("os" in [c.key for c in tbl.columns], "表里有「系统」列")
-chk("edit" in [c.key for c in tbl.columns], "表里有行尾编辑列")
+chk("edit" in [c.key for c in tbl.columns], "表里有编辑列")
 
 win._host_probe = {}
 win.host_refresh()

@@ -6,10 +6,14 @@ MobaXterm 的取法是「一个远端浏览器 + 上传 / 下载按钮」，WinS
 
   设备  只看远端（默认，列表能占满高度，跟 MobaXterm 一样）
   本机  只看本机
-  双栏  上下各一半（跟 WinSCP 一样，可以对着挑、双击即传）
+  双栏  **左右**各一半（本机在左、设备在右，跟 FileZilla / WinSCP 一致，
+        双击即传）
 
-为什么不是左右分栏：这一页和命令日志并排，横向只剩半屏，
-左右分栏后每边塞不下文件名；上下分栏每栏都能用满宽度。
+双栏最初做的是上下分栏，理由是「这一页横向只剩半屏，左右分栏每边塞不下
+文件名」。用户 2026-10-25 明确要求改成左右，并给了 FileZilla 的截图 ——
+上下分栏两栏各占一半高度，长目录两边都只能露四五条，对着挑文件要来回滚；
+左右分栏至少每边有一整屏高。列宽不够时表格自己出横向滚动条（DataTable
+的 `_xscroll_set` 早就实现了），不会把内容挤成一条缝。
 
 传输全在后台线程跑，进度用自绘细条（ttk.Progressbar 在 Windows
 原生主题下不给改颜色）。可以一次排多个任务，按队列顺序传。
@@ -27,10 +31,14 @@ from ui import forms
 from ui.table import Column, DataTable, Segmented
 
 COLS = [
-    Column("name", "名称", 240, stretch=True),
-    Column("size", "大小", 92, anchor="e"),
-    Column("mtime", "修改时间", 132),
-    Column("mode", "权限", 108, mono=True),
+    # 名称是填充列（stretch），这里的 width 只在挤到极限时当最小宽度用。
+    # 其它三列压得比较紧：双栏时每边只有半屏，按原来的宽松宽度（合计 572
+    # 逻辑像素）两条列表都会挂上横向滚动条，「大小 / 修改时间 / 权限」得靠
+    # 拖才能看见。现在合计 384，双栏也放得下。
+    Column("name", "名称", 120, stretch=True),
+    Column("size", "大小", 72, anchor="e"),
+    Column("mtime", "修改时间", 110),
+    Column("mode", "权限", 82, mono=True),
 ]
 
 UP_LABEL = ".. 上一级"
@@ -53,41 +61,38 @@ class FilesPage:
         self._fl_win = fl.find_winscp()
         self._fl_mode = "remote"
 
-        # ---- 概况 + 动作
-        c = U.Card(pg, title="文件管理",
-                   hint="SFTP · 双击即传 · 目录递归")
-        c.grid(row=0, column=0, sticky="we")
-        b = c.body
-        head = U.wframe(b, "card")
-        head.pack(fill="x")
-        self.lbl_fl_side = U.wlabel(head, "未连接设备", "card", U.FONT_B)
-        self.lbl_fl_side.pack(side="left")
-        self.badge_fl = U.Pill(head, "未连接", "mute", height=24)
-        self.badge_fl.pack(side="left", padx=(U.px(10), 0))
-        self.lbl_fl_hint = U.wlabel(head, "", "mute", U.FONT_XS)
-        self.lbl_fl_hint.pack(side="right")
+        # ---- 顶部动作条
+        #
+        # 这一页的正事是下面两栏列表，所以顶部只留一条动作条，不再压一整张
+        # 卡片：原来「标题 + 状态行 + 按钮行 + 进度行」实测 222 逻辑像素，
+        # 日志面板一升起页面只剩 386，两栏各分到 95 —— 连表头都露不全，
+        # 双栏等于没有。收成一条 38 像素的条之后，剩下的全给列表。
+        bar = U.wframe(pg, "page")
+        bar.grid(row=0, column=0, sticky="we", pady=(0, U.px(8)))
 
-        row = U.wframe(b, "card")
-        row.pack(fill="x", pady=(U.px(10), 0))
-        self.btn_fl_up = U.RoundButton(row, "上传 →", self.fl_upload,
-                                       variant="primary", height=32, padx=14)
-        self.btn_fl_up.pack(side="left")
-        self.btn_fl_down = U.RoundButton(row, "← 下载", self.fl_download,
-                                         variant="primary", height=32, padx=14)
-        self.btn_fl_down.pack(side="left", padx=(U.px(8), 0))
-        self.btn_fl_win = U.RoundButton(row, "WinSCP", self.fl_winscp,
-                                        variant="ghost", height=32, padx=12)
-        self.btn_fl_win.pack(side="left", padx=(U.px(8), 0))
+        self.lbl_fl_side = U.wlabel(bar, "未连接设备", "page", U.FONT_B)
+        self.lbl_fl_side.pack(side="left")
+        self.badge_fl = U.Pill(bar, "未连接", "mute", height=24)
+        self.badge_fl.pack(side="left", padx=(U.px(10), 0))
+
+        self.btn_fl_up = U.RoundButton(bar, "上传 →", self.fl_upload,
+                                       variant="primary", height=30, padx=13)
+        self.btn_fl_up.pack(side="left", padx=(U.px(14), 0))
+        self.btn_fl_down = U.RoundButton(bar, "← 下载", self.fl_download,
+                                         variant="primary", height=30, padx=13)
+        self.btn_fl_down.pack(side="left", padx=(U.px(6), 0))
+        self.btn_fl_win = U.RoundButton(bar, "WinSCP", self.fl_winscp,
+                                        variant="ghost", height=30, padx=10)
+        self.btn_fl_win.pack(side="left", padx=(U.px(6), 0))
         if not self._fl_win:
             self.btn_fl_win.set_enabled(False)
 
-        # 进度条跟按钮共用一行：这一页要塞两个列表，纵向一寸都不能浪费。
         # 顺序很要紧：先左后右再中间伸展，否则「取消」会被伸展条挤没。
-        self.btn_fl_stop = U.RoundButton(row, "取消", self._fl_abort,
+        self.btn_fl_stop = U.RoundButton(bar, "取消", self._fl_abort,
                                          variant="danger", height=26, padx=10)
         self.btn_fl_stop.pack(side="right")
         self.btn_fl_stop.set_enabled(False)
-        self._fl_track = tk.Frame(row, bg=U.T.alt, height=U.px(6), bd=0)
+        self._fl_track = tk.Frame(bar, bg=U.T.alt, height=U.px(6), bd=0)
         self._fl_track.pack(side="left", fill="x", expand=True,
                             padx=(U.px(12), U.px(10)))
         self._fl_fill = tk.Frame(self._fl_track, bg=U.T.brand, height=U.px(6), bd=0)
@@ -95,15 +100,17 @@ class FilesPage:
         self._fl_track.bind("<Configure>", lambda _e: self._fl_paint_bar())
         U.register(self, self._fl_theme)
 
-        self.lbl_fl_prog = U.wlabel(b, "空闲", "dim", U.FONT_XS)
-        self.lbl_fl_prog.pack(anchor="w", pady=(U.px(6), 0))
-
         seg_row = U.wframe(pg, "page")
         seg_row.grid(row=1, column=0, sticky="we", pady=(U.px(10), 0))
         self.seg_fl = Segmented(
             seg_row, [("remote", "设备"), ("local", "本机"), ("both", "双栏")],
             command=self._fl_set_mode)
         self.seg_fl.pack(side="left")
+        # 传输进度文字跟在段切换后面：它只占一行，没必要单独占一层。
+        self.lbl_fl_prog = U.wlabel(seg_row, "空闲", "pagedim", U.FONT_XS)
+        self.lbl_fl_prog.pack(side="left", padx=(U.px(14), 0))
+        self.lbl_fl_hint = U.wlabel(seg_row, "", "pagemute", U.FONT_XS)
+        self.lbl_fl_hint.pack(side="right")
 
         holder = U.wframe(pg, "page")
         holder.grid(row=2, column=0, sticky="nsew", pady=(U.px(8), 0))
@@ -136,17 +143,32 @@ class FilesPage:
         self._fl_sync_buttons()
 
     def _fl_place(self):
-        """按当前模式摆两张卡。单栏时另一张整块 grid_forget，不留空条。"""
+        """按当前模式摆两张卡。单栏时另一张整块 grid_forget，不留空条。
+
+        双栏是**左右**（本机在左、设备在右，跟 FileZilla 一致）。
+        摆成上下的话，两栏各占一半高度，长目录两边都只能露四五条，
+        对着挑文件时来回滚；左右分栏至少各有一整屏高。
+        """
         for card in (self._fl_card_r, self._fl_card_l):
             card.grid_forget()
-        if self._fl_mode == "remote":
-            self._fl_card_r.grid(row=0, column=0, rowspan=2, sticky="nsew")
-        elif self._fl_mode == "local":
-            self._fl_card_l.grid(row=0, column=0, rowspan=2, sticky="nsew")
+        h = self._fl_holder
+        # grid 的 weight / uniform 是**持久**的：从双栏切回单栏时不清掉，
+        # 右列仍占一半宽度，卡片看起来「只长了半截」。（KVGrid 那次同样的坑）
+        if self._fl_mode == "both":
+            h.columnconfigure(0, weight=1, uniform="fl")
+            h.columnconfigure(1, weight=1, uniform="fl")
+            h.rowconfigure(0, weight=1)
+            h.rowconfigure(1, weight=0)
+            self._fl_card_l.grid(row=0, column=0, sticky="nsew")
+            self._fl_card_r.grid(row=0, column=1, sticky="nsew",
+                                 padx=(U.px(8), 0))
         else:
-            self._fl_card_r.grid(row=0, column=0, sticky="nsew")
-            self._fl_card_l.grid(row=1, column=0, sticky="nsew",
-                                 pady=(U.px(8), 0))
+            h.columnconfigure(0, weight=1, uniform="")
+            h.columnconfigure(1, weight=0, uniform="")
+            h.rowconfigure(0, weight=1)
+            h.rowconfigure(1, weight=0)
+            card = self._fl_card_l if self._fl_mode == "local" else self._fl_card_r
+            card.grid(row=0, column=0, sticky="nsew")
 
     def _fl_local_visible(self) -> bool:
         return self._fl_mode in ("local", "both")
