@@ -116,7 +116,7 @@ def main():
     print("\n2. 窗口构建")
     from ui.terminal import TerminalWindow
 
-    w = TerminalWindow(root, ctrl)
+    w = TerminalWindow(root, ctrl, mode="box")
     pump(root, 0.4)
     chk(w.winfo_exists() == 1, "窗口已创建")
     chk(w.lbl_dev.cget("text").endswith("LOCAL"), "标题栏带设备名",
@@ -230,7 +230,7 @@ def main():
     print("\n8. 未连接状态")
     ctrl.s = None
     pump(root, 0.2)
-    w2 = TerminalWindow(root, ctrl)
+    w2 = TerminalWindow(root, ctrl, mode="box")
     pump(root, 0.4)
     chk("未连接" in w2.title(), "标题写未连接", w2.title())
     chk("当前未连接" in w2.text.get("1.0", "end"), "正文提示先连设备")
@@ -248,7 +248,7 @@ def main():
     # 长输出不卡死
     print("\n10. 长输出")
     from ui import terminal as T
-    w3 = TerminalWindow(root, ctrl)
+    w3 = TerminalWindow(root, ctrl, mode="box")
     pump(root, 0.3)
     for i in range(120):
         w3.write(f"line {i}\n", "out")

@@ -17,12 +17,20 @@
 自己敲的命令走 `run_traced()` 时会再触发一次 tracer，造成重复回显，
 所以渲染期间用一个 `_own` 标志让旁路跳过这次。
 
-手动输入有两种形态，用户自己选（窗口右上角「输入框 / 行内」）：
+手动输入有两种形态，用户自己选（窗口右上角「行内 / 输入框」）：
 
+  · 行内（默认）：像真终端那样，提示符直接落在正文里，命令和结果混排在
+    一条流里。光标被限制在提示符之后，输出插到提示符之前，正在敲的内容
+    不会被冲掉。默认它是因为**没有独立输入行**，正文自己会随窗口高低伸缩，
+    不存在「输入行被别的东西挤掉」这种可能。
   · 输入框：底部一条独立的输入行 + 提示符标签，输出在大框里滚。
-    这是默认，也是最好用的 —— 编辑器行为、不会误改上面的输出。
-  · 行内：像真终端那样，提示符直接落在正文里，命令和结果混排在一条流里。
-    光标被限制在提示符之后，输出插到提示符之前，正在敲的内容不会被冲掉。
+    编辑器行为、不会误改上面的输出，代价是多占一条高度。
+
+底部日志面板升起时，终端区会被压矮。输入行的 pack 顺序必须是
+「头部 → 输入行(底部) → 正文(吃剩余)」——反过来的话正文（expand=True）
+先按自己的请求高度（Text 默认 24 行）拿走空间，输入行最后一个 pack，
+空间不够时第一个被压成 0 高、连 ismapped 都变 0（v1.0.24 用户报的
+「升起日志后输入框被覆盖」就是这个）。见 `_build()` 里的 `before=self.wrap`。
 """
 from __future__ import annotations
 
@@ -37,10 +45,12 @@ from core.redact import scrub, scrub_cmd
 MAX_LINES = 4000          # 超过就从头砍，长跑一晚也不会把内存吃光
 HIST_MAX = 300
 
-# 记住用户上次选的输入形态（本进程内有效，重开窗口不跳回去）
-_LAST_MODE = "box"
+# 记住用户上次选的输入形态（本进程内有效，重开窗口不跳回去）。
+# 默认行内：没有独立输入行，就不会被底部日志面板挤掉（用户 2026-10-25 要求
+# 「直接在界面里输入，而不是弄输入框」）。
+_LAST_MODE = "inline"
 
-MODES = [("box", "输入框"), ("inline", "行内")]
+MODES = [("inline", "行内"), ("box", "输入框")]
 
 BANNER = (
     "终端已就绪。命令直接跑在当前会话上，跟主界面用的是同一个连接。\n"
@@ -179,10 +189,18 @@ class _TermShell:
         self.text.tag_configure("warn", foreground=U.T.warn)
         self.text.configure(state="disabled")
 
-        # 输入行
+        # 输入行。
+        # `side="bottom" + before=self.wrap` 这两样缺一不可：
+        #   · side="bottom" 让它贴着底边（切到行内模式时正文才会自然接管整块）；
+        #   · before=self.wrap 把它排在正文**前面**分配空间。pack 是按顺序
+        #     切的，正文带 expand=True、请求高度又是 Text 默认的 24 行，排在
+        #     它后面就只能在剩余空间里捡 —— 日志面板一升起、终端区一矮，
+        #     输入行直接拿到 0 高（`winfo_ismapped()` 变 0，但代码里
+        #     `winfo_manager()` 仍然是 "pack"，从返回值完全看不出问题）。
         row = tk.Frame(self, bg=U.T.card, bd=0, highlightthickness=1,
                        highlightbackground=U.T.border)
-        row.pack(fill="x", padx=U.px(12), pady=(U.px(6), U.px(12)))
+        row.pack(side="bottom", fill="x", padx=U.px(12),
+                 pady=(U.px(6), U.px(12)), before=self.wrap)
         self.row = row
         self.lbl_ps1 = tk.Label(row, text="$", bg=U.T.card, fg=U.T.ok,
                                 font=(U.MONO[0], 10), bd=0, padx=U.px(8),
@@ -261,8 +279,10 @@ class _TermShell:
                 self._drop_prompt()
                 self.text.configure(state="disabled", insertwidth=1)
                 if not self.row.winfo_manager():
-                    self.row.pack(fill="x", padx=U.px(12),
-                                  pady=(U.px(6), U.px(12)))
+                    # 顺序必须跟 _build() 一致：贴底 + 排在正文前面。
+                    # 只写 pack(fill="x") 会排到队尾，空间一紧又被挤掉。
+                    self.row.pack(side="bottom", fill="x", padx=U.px(12),
+                                  pady=(U.px(6), U.px(12)), before=self.wrap)
                 self.lbl_ps1.configure(text=self._safe_prompt())
         except tk.TclError:
             pass
@@ -296,10 +316,28 @@ class _TermShell:
             except tk.TclError:
                 pass
 
-    def _clamp_key(self, _e=None):
-        """行内模式：光标和删除都不许越过提示符。"""
+    def _clamp_key(self, e=None):
+        """行内模式：光标和删除都不许越过提示符。
+
+        光把光标拽回末尾是不够的：用户先点在输出区（光标在 input_start
+        之前），再按退格，默认处理会删掉「新光标位置的**前一个**字符」——
+        输入区为空时那就是提示符自己的最后一个字（`root@h:~$ ` 的空格），
+        删几次提示符就没了。所以删除键要单独判，越界就 return "break"。
+        """
+        keysym = getattr(e, "keysym", "")
         try:
-            if self.text.compare("insert", "<", "input_start"):
+            before = self.text.compare("insert", "<", "input_start")
+            at = self.text.compare("insert", "<=", "input_start")
+            if keysym == "BackSpace" and at:
+                # 退格是删前一个字符，光标贴在 input_start 上就已经越界
+                if before:
+                    self.text.mark_set("insert", "end-1c")
+                return "break"
+            if keysym == "Delete":
+                if before:
+                    self.text.mark_set("insert", "end-1c")
+                    return "break"
+            if before:
                 self.text.mark_set("insert", "end-1c")
         except tk.TclError:
             pass

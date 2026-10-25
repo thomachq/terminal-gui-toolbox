@@ -45,6 +45,116 @@ class NeedElevation(SessionError):
         self.target = target      # 显示给用户看的目标（user@host 或 本机）
 
 
+def load_private_key(path: str, passphrase: str | None = None):
+    """读私钥，返回 paramiko.PKey。**口令一律转成 bytes 再交给 paramiko。**
+
+    为什么不用 `SSHClient.connect(key_filename=...)`：paramiko 5 内部走
+    `PKey.from_path`，遇到传统 PEM（`-----BEGIN RSA PRIVATE KEY-----`）
+    且口令是 str 时会抛 `encountered RSA key, expected OPENSSH key`。
+    这条报错完全不提"加密/口令"，看着像文件格式不对，实际把口令转成
+    bytes 就能正常解密 —— 群晖那把 `chromas_openssh_ppk` 就是这么被卡住的，
+    GUI 里看起来像"连不上群晖"，真因是口令类型。
+
+    错误一律翻成人话，别再让 cryptography 的术语漏到界面上。
+    """
+    from pathlib import Path
+
+    import paramiko
+
+    p = Path(str(path or "").strip())
+    if not str(path or "").strip():
+        raise SessionError("没指定私钥文件")
+    if not p.exists():
+        raise SessionError(f"私钥文件不存在：{p}")
+    if not p.is_file():
+        raise SessionError(f"私钥路径不是普通文件：{p}")
+    try:
+        head = p.open("rb").read(120)
+    except OSError as e:
+        raise SessionError(f"私钥读不出来：{e}") from e
+    if b"PuTTY-User-Key-File" in head:
+        raise SessionError("这是 PuTTY 的 .ppk 私钥，请先用 PuTTYgen 另存为 "
+                           "OpenSSH 或 PEM 格式再选")
+
+    pw = passphrase.encode("utf-8") if isinstance(passphrase, str) else passphrase
+    pw = pw or None                      # 空口令 == 没给
+    try:
+        return paramiko.PKey.from_path(str(p), pw)
+    except FileNotFoundError as e:
+        raise SessionError(f"私钥文件不存在：{p}") from e
+    except Exception as e:  # noqa: BLE001
+        # paramiko 只吃 OpenSSH 容器与传统 PEM 两路；PKCS#8
+        # （`BEGIN ENCRYPTED PRIVATE KEY`，openssl 默认就是它）它读不了，
+        # 但 cryptography 可以 —— 先自己解一遍，能解就包成 paramiko 的 key。
+        key, why = _load_with_crypto(p, pw)
+        if key is not None:
+            return key
+        if why:
+            raise SessionError(why) from e
+        msg = str(e)
+        if "encrypt" in msg.lower():
+            # paramiko 在"加密但没给口令"时抛的是 TypeError，不是专用异常
+            raise SessionError("私钥已加密：请在档案里填「私钥密码」") from e
+        if "Incorrect password" in msg or "Bad password" in msg:
+            raise SessionError("私钥密码不对（私钥文件本身可能也坏了）") from e
+        if "OPENSSH key" in msg:
+            raise SessionError("私钥格式 paramiko 读不了，请转成 OpenSSH 格式") from e
+        raise SessionError(f"私钥读不出来：{type(e).__name__}: {msg}") from e
+
+
+def _load_with_crypto(path, password: bytes | None):
+    """兜底：用 cryptography 解 PKCS#8 / PKCS#1 / OpenSSH，再包成 paramiko key。
+
+    返回 (key, 人话错误)。key 为 None 且错误为 None 表示"说不清，交给上层"。
+    """
+    import paramiko
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+    from cryptography.hazmat.primitives.serialization import (
+        load_pem_private_key, load_ssh_private_key)
+
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None, None
+    key, why = None, None
+    for fn in (load_ssh_private_key, load_pem_private_key):
+        try:
+            key = fn(data, password)
+            break
+        except TypeError:                # 加密但没给口令
+            return None, "私钥已加密：请在档案里填「私钥密码」"
+        except ValueError as e:
+            if "Incorrect password" in str(e):
+                return None, "私钥密码不对（私钥文件本身可能也坏了）"
+            continue
+        except Exception:  # noqa: BLE001
+            continue
+    if key is None:
+        return None, why
+    # 解出来的对象怎么变回 paramiko key：不要 `Cls(key=obj)` ——
+    # paramiko 5 的 Ed25519Key 根本没这个参数（`__init__() got an unexpected
+    # keyword argument 'key'`）。统一重序列化成内存里的 OpenSSH 容器再喂回去，
+    # RSA / ECDSA / Ed25519 三种都走同一条路，也不会在磁盘上留明文。
+    import io
+
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, NoEncryption, PrivateFormat)
+
+    try:
+        pem = key.private_bytes(Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption())
+    except Exception:  # noqa: BLE001
+        return None, None
+    for attr in ("Ed25519Key", "ECDSAKey", "RSAKey"):
+        cls = getattr(paramiko, attr, None)
+        if cls is None:
+            continue
+        try:
+            return cls.from_private_key(io.StringIO(pem.decode("ascii"))), None
+        except Exception:  # noqa: BLE001
+            continue
+    return None, None
+
+
 # ------------------------------------------------------------------ 编码
 def _ansi_enc() -> str:
     """Windows 下控制台输出的默认编码（中文系统是 cp936/GBK）。"""
@@ -377,16 +487,24 @@ class SSHSession(BaseSession):
         self.close()
         cli = paramiko.SSHClient()
         cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # 私钥自己读、自己给：口令类型 / 加密 / 格式 三类错误都能翻成人话，
+        # 交给 connect(key_filename=...) 只会得到一句 misleading 的格式报错。
+        pkey = load_private_key(key_path, key_passphrase) if key_path else None
+        # pkey 已解好就不要再传 passphrase：paramiko 只在按文件名读钥匙时才用它，
+        # 同时给两个反而是自找麻烦（顺序一变就得重调）。
+        extra: dict = {}
+        if pkey is None and key_passphrase:
+            extra["passphrase"] = key_passphrase.encode("utf-8")
         try:
             cli.connect(
                 hostname=host, port=int(port), username=user,
                 password=password or None,
-                key_filename=str(key_path) if key_path else None,
-                passphrase=key_passphrase or None,
+                pkey=pkey,
                 timeout=timeout,
                 # 指定私钥就只认这把，避免静默落到 ssh-agent 的其它钥匙上
                 allow_agent=(not key_path),
                 look_for_keys=(not key_path and not password),
+                **extra,
             )
         except paramiko.AuthenticationException:
             raise SessionError("认证失败：检查用户名 / 密码 / 私钥（及私钥口令）")

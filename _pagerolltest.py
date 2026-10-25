@@ -89,9 +89,16 @@ def main() -> int:
                 f"{key} 内容超高时滚动条可见可点", f"w={sb.winfo_width()}")
 
             # 3. 滚到底必须真到底（不是「滚了但还有一半看不到」）
+            # 内容可能是懒加载的（DB 列表、Web 站点、计划任务），滚的途中
+            # 又长高一截 —— 用户遇到这种情况会再滚一把。所以给两次机会：
+            # 两次都到底才是「真滚不动」，一次不行两次行不算缺陷。
             host.cv.yview_moveto(1.0)
-            pump(app, 0.25)
+            pump(app, 0.35)
             first, last = host.cv.yview()
+            if last < 0.98:
+                host.cv.yview_moveto(1.0)
+                pump(app, 0.35)
+                first, last = host.cv.yview()
             chk(abs(last - 1.0) < 0.02, f"{key} 能滚到最底部",
                 f"yview={first:.2f}~{last:.2f}")
             kids = [c for c in body.winfo_children() if c.winfo_ismapped()]

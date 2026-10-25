@@ -145,15 +145,46 @@ def inspect_key(path: str, passphrase: str | None = None) -> dict:
     import paramiko
     from paramiko.ssh_exception import PasswordRequiredException
 
+    # 统一走 core.session.load_private_key：它会把口令转 bytes。
+    # 之前这里直接 `password=passphrase`（str），cryptography 一律抛
+    # `TypeError: password must be bytes`，界面上显示成「无法解析：TypeError」，
+    # 用户只会以为私钥坏了。
+    try:
+        from core.session import load_private_key
+    except Exception:  # noqa: BLE001
+        load_private_key = None
+
+    if load_private_key is not None:
+        try:
+            k = load_private_key(str(p), passphrase or None)
+            fp = str(k.fingerprint)
+            if not fp.startswith("SHA256:"):
+                fp = "SHA256:" + fp
+            return {
+                "ok": True,
+                "type": k.get_name(),
+                "bits": k.get_bits(),
+                "fingerprint": fp,
+                "encrypted": encrypted,
+                # 传统 PEM 与 OpenSSH 两种容器都能读，格式名只做展示
+                "format": "openssh" if b"OPENSSH PRIVATE KEY" in head else "pem",
+            }
+        except Exception as e:  # noqa: BLE001
+            from core.session import SessionError
+            if isinstance(e, SessionError):
+                return {"ok": False, "encrypted": encrypted, "error": str(e)}
+            # 其它异常交给下面的兜底循环再试一遍
+
     classes = []
     for attr in ("Ed25519Key", "ECDSAKey", "RSAKey", "DSSKey"):
         cls = getattr(paramiko, attr, None)
         if cls is not None:
             classes.append(cls)
     last = None
+    pw = passphrase.encode("utf-8") if passphrase else None   # 见上：必须是 bytes
     for cls in classes:
         try:
-            k = cls.from_private_key_file(str(p), password=passphrase or None)
+            k = cls.from_private_key_file(str(p), password=pw)
             # paramiko 的 PKey.fingerprint 本身已经带 `SHA256:` 前缀，
             # 再拼一次就成了 `SHA256:SHA256:xxx` —— 这里去掉重复的前缀。
             fp = str(k.fingerprint)

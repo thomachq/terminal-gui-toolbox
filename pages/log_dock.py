@@ -24,11 +24,13 @@ MIN_H = 200         # 拖到最矮也要能看见表头 + 一两条
 # 所以这里没有余量可加 —— 改行高时这条要重测（_logdocktest 会红）。
 DEFAULT_H = 252
 USABLE_H = 210      # 低于这个数等于「没设置过」，按 DEFAULT_H 起
-RATIO = 0.72        # 拖动的上限：不超过窗口高度的 72%，否则主界面就没地方了
-# 默认高度跟窗口高度的关系只用来**兜底**：窗口很矮时别把主界面挤没。
-# 原来这里按 0.30 收，结果 1080 高的窗口把默认值压成 216 逻辑（只露 1 条），
-# 反而是「越该看清越看不清」。
-FALLBACK_RATIO = 0.45
+RATIO = 0.72        # 拖动的上限：不超过窗口高度的 72%
+# 主区（页签内容）的最低高度：日志再怎么拖，也不许把它压没。
+# 用户 2026-10-25 报「升起日志后输入框被覆盖」，一半是终端里 pack 顺序，
+# 另一半是这里 —— 日志能拖到窗口的 72%，1080 高的屏幕上主区只剩 36 逻辑像素，
+# 连终端头部都塞不进去，这时候输入行摆哪儿都看不见。
+# （原来还有一个 FALLBACK_RATIO=0.45 的独立兜底，现在并进 `_log_dock_top()`。）
+MAIN_MIN_H = 200
 
 
 class LogDock:
@@ -114,12 +116,9 @@ class LogDock:
         # 以前这里是「默认值再按窗口高三成收」，结果 1080 高的窗口把 270
         # 压成 216 逻辑（只露 1 条），越是大窗口越看不清日志，方向反了。
         # （winfo_height 在未映射时是 1，那会儿不夹，等下次打开自然就对了）
-        try:
-            win_h = int(self.winfo_height())
-            if win_h > U.px(MIN_H) * 2:
-                h = min(h, max(U.px(MIN_H), int(win_h * FALLBACK_RATIO)))
-        except tk.TclError:
-            pass
+        top = self._log_dock_top()
+        if top:
+            h = min(h, top)
         self._log_dock_h = h
         host.configure(height=h)
 
@@ -156,6 +155,29 @@ class LogDock:
         self.log_dock_body = body
         self.build_log(body)
 
+    def _log_dock_top(self) -> int:
+        """日志面板最高能到多少（物理像素）。0 表示窗口尺寸还没出来，不夹。
+
+        两条约束取小：
+          · 不超过窗口高的 RATIO；
+          · 主区至少留 MAIN_MIN_H。
+        `shell` 是 paned 与日志宿主**共同的父**，所以 shell 的高度就是
+        「主区 + 日志」能用的全部高度，减去 MAIN_MIN_H 就是日志的上限。
+        不能写成 `win - shell_h - log_h` —— 那样等于把日志高度抠了两次，
+        fixed 会被算成 0，上限退化成 RATIO，日志照样能把主区压到 36 像素。
+        """
+        try:
+            win = int(self.winfo_height())
+            if win <= U.px(MIN_H) * 2:
+                return 0                    # 窗口还太小 / 没映射，先别夹
+            shell_h = int(self.shell.winfo_height())
+            if shell_h <= U.px(MAIN_MIN_H) * 1.5:
+                return 0                    # shell 还没铺开，夹了反而算出个极小值
+            top = min(int(win * RATIO), shell_h - U.px(MAIN_MIN_H))
+            return max(U.px(MIN_H), top)
+        except (tk.TclError, AttributeError):
+            return 0
+
     # ================================================================ 拖动
     def _log_drag_start(self, event) -> None:
         try:
@@ -168,7 +190,8 @@ class LogDock:
             return
         y0, h0 = self._log_drag
         want = h0 - (event.y_root - y0)
-        top = max(U.px(MIN_H), int(self.winfo_height() * RATIO))
+        top = self._log_dock_top() or max(
+            U.px(MIN_H), int(self.winfo_height() * RATIO))
         want = max(U.px(MIN_H), min(want, top))
         try:
             self.log_dock_host.configure(height=want)

@@ -886,6 +886,10 @@ class ScrollBox(tk.Frame):
         # 已经换了一批 —— 不补这一次，DB / Web / 计划任务这些页切过去就没有
         # 滚动条，看着像「只有安全中心那页修好了」。
         self.cv.bind("<Map>", lambda _e: self.after_idle(self._refit), add="+")
+        # 内容懒加载回来的页面（DB 列表、API 配置、计划任务）会在几百毫秒后
+        # 长高，而内胆高度被 `_apply_fit` 钉死了 —— 盯一眼需求高度才跟得上。
+        self._req_seen = 0
+        self._watch_req()
         self.vs.bind("<MouseWheel>", self._wheel)
         self._wheel_ids: list[str] = []
         self._bind_wheel()
@@ -968,6 +972,32 @@ class ScrollBox(tk.Frame):
         except tk.TclError:
             return
         self._autosb()
+
+    def _watch_req(self) -> None:
+        """盯内胆的「需求高度」是否变了，变了就重算一次。
+
+        `_apply_fit` 会用 `itemconfigure(height=...)` 把内胆高度钉住（表格页
+        要压到可视高、卡片页要至少铺满），副作用是：**内容后来长高了，内胆
+        自己不会跟着长**，`<Configure>` 也就不触发 —— scrollregion 停在旧值，
+        拖到底还差一截。DB / API 这类内容是懒加载的（列表、配置项几百毫秒后
+        才回来），正好踩这个坑：实测内胆钉在 1134，内容实际要 1175，
+        那 41 像素永远滚不到，用户看到的就是「滚到底了但下面还有东西」。
+
+        Tk 没有「请求尺寸变了」的事件，只能自己盯 reqheight。200ms 一次，
+        而且只查当前真的在屏幕上的容器（没显示的页面完全跳过）。
+        """
+        try:
+            if self.winfo_ismapped():
+                need = self.inner.winfo_reqheight()
+                if need != self._req_seen:
+                    self._req_seen = need
+                    self._refit()
+        except tk.TclError:
+            return                          # 已经销毁，不再排下一次
+        try:
+            self.after(200, self._watch_req)
+        except tk.TclError:
+            pass
 
     def _autosb(self) -> None:
         """滚动条按需出现/收起（只有 auto_hide 的实例才管这事）。

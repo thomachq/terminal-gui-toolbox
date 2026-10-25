@@ -37,6 +37,13 @@ def body(w) -> str:
     return w.text.get("1.0", "end")
 
 
+class _Key:
+    """假的按键事件 —— 只带 keysym，够 _clamp_key 判退格/删除用。"""
+
+    def __init__(self, keysym: str):
+        self.keysym = keysym
+
+
 def main() -> int:
     root = tk.Tk()
     root.withdraw()
@@ -47,9 +54,20 @@ def main() -> int:
 
     import ui.terminal as T
     print("\n== 1. 默认形态 ==")
+    # 不传 mode：看模块默认值。用户 2026-10-25 的要求是「直接在界面里输入，
+    # 而不是弄输入框」——默认就该是行内，没有独立输入行可被挤掉。
+    d = T.TerminalWindow(root, ctrl)
+    pump(root, 0.4)
+    chk(d.mode == "inline", "默认是行内（直接在正文里敲）", d.mode)
+    chk(d.row.winfo_manager() == "", "默认形态下不占输入行的高度",
+        repr(d.row.winfo_manager()))
+    chk(str(d.text.cget("state")) == "normal", "默认形态正文可编辑")
+    d.close()
+    pump(root, 0.2)
+
     w = T.TerminalWindow(root, ctrl, mode="box")
     pump(root, 0.4)
-    chk(w.mode == "box", "默认是输入框", w.mode)
+    chk(w.mode == "box", "显式指定时仍是输入框", w.mode)
     chk(w.row.winfo_manager() == "pack", "输入行可见")
     chk(str(w.text.cget("state")) == "disabled", "正文只读")
     chk("prompt" not in w.text.mark_names(), "正文里没有提示符行")
@@ -94,16 +112,25 @@ def main() -> int:
     w.text.delete("input_start", "end-1c")       # 收拾干净
 
     print("\n== 5. 光标与退格不许越过提示符 ==")
+    ps_before = w.text.get("prompt", "input_start")
     w.text.mark_set("insert", "1.0")
-    w._clamp_key()
+    w._clamp_key(_Key("a"))
     chk("光标被拉回输入区",
         w.text.compare("insert", ">=", "input_start") == 1,
         w.text.index("insert"))
+    # 光把光标拽回来还不够：退格删的是「光标前一个字符」，在 input_start
+    # 上按退格会把提示符自己的最后一个字吃掉。必须直接 break。
     w.text.mark_set("insert", "input_start")
-    r = w._clamp_key()
-    chk("退格在输入区起点被挡住", w.text.compare("insert", ">=", "input_start") == 1)
-    chk("提示符正文没被删", w.text.get("prompt", "input_start") != "",
+    r = w._clamp_key(_Key("BackSpace"))
+    chk("在输入区起点按退格被拦下", r == "break", repr(r))
+    chk("提示符一个字符都没少",
+        w.text.get("prompt", "input_start") == ps_before,
         repr(w.text.get("prompt", "input_start")))
+    snap = w.text.get("1.0", "end-1c")
+    w.text.mark_set("insert", "1.5")
+    r = w._clamp_key(_Key("BackSpace"))
+    chk("光标在输出区时退格也不许落到正文上", r == "break", repr(r))
+    chk("正文一个字没变", w.text.get("1.0", "end-1c") == snap)
 
     print("\n== 6. 历史 / 内建 / cd ==")
     w.text.insert("input_start", "echo SECOND")
@@ -183,6 +210,43 @@ def main() -> int:
     w2.seg_mode.select("box")
     pump(root, 0.2)
     w2.close()
+
+    # -------------------------------------------------------------- 10
+    # 用户报的 bug：底部日志面板升起 → 终端区被压矮 → 输入行整条不见了
+    # （`winfo_ismapped()` 变 0，位置落在可视区外）。真因是输入行最后才
+    # pack，正文（expand=True、请求 24 行）先把空间拿走。这条钉住 pack 顺序。
+    print("\n== 10. 终端区被压矮时，输入不許被挤掉 ==")
+    root.deiconify()
+    pump(root, 0.3)
+    holder = tk.Frame(root)
+    holder.place(x=0, y=0, width=U.px(700), height=U.px(520))
+    heights = (520, 420, 340, 260, 200, 160)
+    for mode in ("box", "inline"):
+        for ch in holder.winfo_children():
+            ch.destroy()
+        pane = T.TerminalPane(holder, ctrl, mode=mode)
+        pane.pack(fill="both", expand=True)
+        pump(root, 0.35)
+        bad = []
+        for h in heights:
+            holder.place_configure(height=U.px(h))
+            pump(root, 0.12)
+            ph = pane.winfo_height()
+            # withdraw 过的窗口 ismapped 恒为 0，所以判「可见」用几何：
+            # 控件自己的底边落在面板内 + 有实际高度。
+            tgt = pane.row if mode == "box" else pane.wrap
+            inside = (tgt.winfo_y() + tgt.winfo_height()) <= ph + 1
+            if not inside or tgt.winfo_height() <= 1:
+                bad.append(f"{h}→y{tgt.winfo_y()}+h{tgt.winfo_height()}/面板{ph}")
+        chk(f"{mode}：{len(heights)} 档高度都完整留在面板内", not bad, "; ".join(bad))
+        if mode == "box":
+            chk("输入框形态下输入行没被正文压掉",
+                pane.row.winfo_y() >= 0 and pane.row.winfo_height() > U.px(20),
+                f"y={pane.row.winfo_y()} h={pane.row.winfo_height()}")
+        pane.close()
+        pump(root, 0.2)
+    holder.destroy()
+    root.withdraw()
 
     try:
         root.destroy()
