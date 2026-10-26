@@ -22,6 +22,7 @@ SW_RESTORE = 9
 _IS_WIN = sys.platform == "win32"
 _held: list = []          # 句柄保活：进程退出时由系统回收
 _ev: dict = {}            # key → 唤醒事件句柄（只对它 Wait，别去 Wait 互斥量）
+_mx: dict = {}            # key → 互斥量句柄（release() 要用它主动放锁）
 
 
 def _mutex_name(key: str) -> str:
@@ -102,9 +103,78 @@ def acquire(key: str = "TerminalToolbox") -> bool:
     if not h:
         return True
     _held.append(h)
+    _mx[key] = h
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        # 没抢到的那份句柄也要留着：release() 时一起关掉，
+        # 否则句柄泄漏，进程活着就一直占着锁。
         return False
     return True
+
+
+def release(key: str = DEFAULT_KEY) -> None:
+    """主动放掉本进程持有的锁。
+
+    提权重启必须调用：`ShellExecuteW(runas)` 之后老进程还会活 200~400ms，
+    这段时间里新进程 `acquire()` 一定拿到「已存在」→ 走 `wake()` 那条路
+    直接 `return` 退出 —— 用户看到的就是「UAC 点了是，然后什么都没了」。
+    先放锁，新进程才抢得到；`wait_acquire()` 再兜一层，防止时序没赶上。
+    """
+    if not _IS_WIN:
+        return
+    try:
+        h = _mx.pop(key, None)
+        if h:
+            try:
+                _k32.ReleaseMutex(h)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _k32.CloseHandle(h)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _held.remove(h)
+            except ValueError:
+                pass
+        ev = _ev.pop(key, None)
+        if ev:
+            try:
+                _k32.CloseHandle(ev)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _held.remove(ev)
+            except ValueError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def wait_acquire(key: str = DEFAULT_KEY, timeout: float = 20.0) -> bool:
+    """等老实例把锁放掉再抢（提权重启专用）。
+
+    每 0.15 秒试一次；每次失败都要把刚建的句柄关掉，否则一轮就是两个句柄。
+    """
+    if not _IS_WIN:
+        return True
+    deadline = _now() + float(timeout)
+    while True:
+        if acquire(key):
+            return True
+        release(key)
+        if _now() >= deadline:
+            return False
+        _sleep(0.15)
+
+
+def _now() -> float:
+    import time
+    return time.time()
+
+
+def _sleep(sec: float) -> None:
+    import time
+    time.sleep(sec)
 
 
 def wake(key: str = "TerminalToolbox") -> bool:

@@ -286,8 +286,11 @@ class FirewallPage:
                  else "TCP"},
                 {"key": "port", "label": "本地端口", "default": d("port"),
                  "hint": "22 或 80,443 或 1000-2000；any 协议留空"},
-                {"key": "src", "label": "远程 IP", "default": d("src") or "any",
-                 "hint": "any 或 192.168.1.0/24"},
+                {"key": "src", "label": "远程 IP", "kind": "iplist", "lines": 2,
+                 "default": d("src") or "any",
+                 "hint": "一个框可以填多个（逗号或换行分隔），IPv4/IPv6 都行；"
+                         "点「地址库…」按省份/国家成批选",
+                 "hint_below": True, "width": 32},
             ]
         if key == "ufw":
             return [
@@ -298,8 +301,11 @@ class FirewallPage:
                 {"key": "proto", "label": "协议", "kind": "select",
                  "options": [("", "不限"), ("tcp", "TCP"), ("udp", "UDP")],
                  "default": (row or {}).get("proto") or ""},
-                {"key": "src", "label": "来源地址", "default": d("src") or "any",
-                 "hint": "any 或 192.168.1.0/24"},
+                {"key": "src", "label": "来源地址", "kind": "iplist", "lines": 2,
+                 "default": d("src") or "any",
+                 "hint": "any 或 192.168.1.0/24；填多个会拆成多条命令；"
+                         "IPv6 也认；点「地址库…」按省份/国家成批选",
+                 "hint_below": True, "width": 32},
                 {"key": "comment", "label": "备注", "default": d("comment")},
             ]
         if key == "firewalld":
@@ -318,8 +324,11 @@ class FirewallPage:
                 {"key": "name", "label": "服务名", "default": d("_name") if is_svc else "",
                  "hint": "http / https / ssh（firewalld 自带的服务）",
                  "show_if": {"mode": ["service"]}},
-                {"key": "src", "label": "来源地址", "default": d("src") or "any",
-                 "hint": "any 或 192.168.1.0/24（填了会生成 rich rule）"},
+                {"key": "src", "label": "来源地址", "kind": "iplist", "lines": 2,
+                 "default": d("src") or "any",
+                 "hint": "any 或 192.168.1.0/24（填了会生成 rich rule）；"
+                         "可以填多个，IPv4/IPv6 自动分 family",
+                 "hint_below": True, "width": 32},
             ]
         if key == "iptables":
             chain = (row or {}).get("chain") or "INPUT"
@@ -340,8 +349,15 @@ class FirewallPage:
                  "default": (row or {}).get("proto") or "tcp"},
                 {"key": "port", "label": "目标端口", "default": d("port"),
                  "hint": "22 或 80,443 或 1000-2000"},
-                {"key": "src", "label": "来源地址", "default": d("src") or "any"},
-                {"key": "dst", "label": "目标地址", "default": d("dst") or "any"},
+                {"key": "src", "label": "来源地址", "kind": "iplist", "lines": 2,
+                 "default": d("src") or "any",
+                 "hint": "any 或 192.168.1.0/24；可以填多个（逗号/换行分隔），"
+                         "会拆成多条命令；点「地址库…」按省份/国家成批选",
+                 "hint_below": True, "width": 32},
+                {"key": "dst", "label": "目标地址", "kind": "iplist", "lines": 2,
+                 "default": d("dst") or "any",
+                 "hint": "IPv4 / IPv6 都行；填多个会按地址族自动走 ip6tables",
+                 "hint_below": True, "width": 32},
                 {"key": "comment", "label": "备注", "default": d("comment")},
             ]
         if key == "ipfw":
@@ -351,8 +367,12 @@ class FirewallPage:
                 {"key": "proto", "label": "协议", "kind": "select",
                  "options": ["tcp", "udp", "ip"],
                  "default": (row or {}).get("proto") or "tcp"},
-                {"key": "src", "label": "来源", "default": d("src") or "any"},
-                {"key": "dst", "label": "目标", "default": d("dst") or "any"},
+                {"key": "src", "label": "来源", "kind": "iplist", "lines": 2,
+                 "default": d("src") or "any",
+                 "hint": "可以填多个，会拆成多条命令", "hint_below": True,
+                 "width": 32},
+                {"key": "dst", "label": "目标", "kind": "iplist", "lines": 2,
+                 "default": d("dst") or "any", "width": 32},
                 {"key": "port", "label": "目标端口", "default": d("port")},
             ]
         # nftables
@@ -370,8 +390,13 @@ class FirewallPage:
              "default": (row or {}).get("proto") or "tcp"},
             {"key": "port", "label": "目标端口", "default": d("port"),
              "hint": "22 或 80,443"},
-            {"key": "src", "label": "来源地址", "default": d("src") or "any"},
-            {"key": "dst", "label": "目标地址", "default": d("dst") or "any"},
+            {"key": "src", "label": "来源地址", "kind": "iplist", "lines": 2,
+             "default": d("src") or "any",
+             "hint": "IPv4 / IPv6 都行（会按地址族自动写 ip / ip6）；"
+                     "可以填多个，一条网段一条规则；点「地址库…」成批选",
+             "hint_below": True, "width": 32},
+            {"key": "dst", "label": "目标地址", "kind": "iplist", "lines": 2,
+             "default": d("dst") or "any", "width": 32},
         ]
 
     # ------------------------------------------------------------ 写

@@ -182,7 +182,8 @@ import app as A
 a = A.ToolboxApp()
 pump(a, 0.6)
 # v1.0.7 T1：日志改成底边栏，页面数 16 → 15
-chk(len(a._pages) == 15, "十五个页面都已构建（日志已到底边栏）",
+# v1.0.27 T1：新增「远程管理」页 → 16
+chk(len(a._pages) == 16, "十六个页面都已构建（日志已到底边栏）",
     f"{list(a._pages)}")
 a.nav.select("files")
 pump(a, 0.4)

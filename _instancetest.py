@@ -113,7 +113,7 @@ names = re.findall(r'"([^"]+)"', m.group(1)) if m else []
 # 2026-10-25 用户反馈「任务栏都是终端工具箱的托盘」：根因就是原来把
 # --page / --no-probe / --dark 一起放进放行名单，于是测试实例能和用户那个
 # 并存，托盘里堆出好几个图标。现在只有「根本不出窗口」的参数才放行。
-chk(names == ["--smoke", "--version"],
+chk(names == ["--smoke", "--version", "--elev-serve"],
     f"只放行不出窗口的参数（实际 {names}）", str(names))
 for a in ("--page", "--no-probe", "--dark"):
     chk(a not in names, f"{a} 不再绕过单实例检查")
@@ -121,23 +121,36 @@ chk("key_from_argv" in src, "main() 按 --instance-key 取命名空间")
 chk("singleinstance.acquire(key)" in src, "抢锁带上了 key")
 chk("singleinstance.wake(key)" in src, "叫醒用的是同一个 key")
 chk("key_from_argv(sys.argv)" in src, "唤醒轮询也用同一个 key（不会串台）")
+# `--elev-serve` 是 UAC 提权助手（core/elev.py）：它以管理员身份常驻、
+# 代主程序跑命令，不能去抢主程序那把锁，也不能再建一个窗口。
+i_srv = src.find('if "--elev-serve" in sys.argv:')
+i_sing = src.find("_NO_SINGLETON")
+chk(0 < i_srv < i_sing, "提权助手在单实例检查之前就分流出去",
+    f"{i_srv} vs {i_sing}")
+chk("raise SystemExit(elev.serve" in src, "分流后直接跑 serve 并退出")
 
 sec("5b. 被拦下时只叫醒、不自己再开一个")
 # 「把已有窗口叫到前台」是按标题找的，不认命名空间 —— 测试实例要是也走这条
 # 就会把用户正在用的窗口拉到前面。只有默认命名空间才准动别人的窗口。
 chk("is_default = key == singleinstance.DEFAULT_KEY" in src,
     "认得「这是默认命名空间」")
-chk(re.search(r"if not singleinstance\.acquire\(key\):\s*\n"
-              r"\s*singleinstance\.wake\(key\)", src) is not None,
-    "抢不到锁时先叫醒对面")
+chk(re.search(r"if not got:\s*\n\s*singleinstance\.wake\(key\)", src)
+    is not None, "抢不到锁时先叫醒对面")
 chk(re.search(r"if is_default:\s*\n\s*(?:#[^\n]*\n\s*)*"
               r"singleinstance\.bring_to_front\(APP_NAME\)", src) is not None,
     "只有默认命名空间才去动别人的窗口")
 # 被拦下之后必须退出。原来 onefile 的 terminate 只杀 bootloader、真正的子
 # 进程带着窗口活下来（2026-10-25 实测：杀完 20 秒仍持锁），所以「对面还活着」
 # 是常态而不是异常 —— 这里不需要也不应该等锁重试，否则用户重复双击要白等。
+# **唯一例外**是 --elev-restart（UAC 提权重启）：老进程刚放锁、还要几百毫秒
+# 才退，这时候必须等，一撞就退正是「点完 UAC 闪退」那条路。
 chk(re.search(r"singleinstance\.bring_to_front\(APP_NAME\)\s*\n\s*return", src)
     is not None, "叫醒之后自己退出，不再开第二个窗口")
+chk(re.search(r'if "--elev-restart" in sys\.argv:\s*\n'
+              r"\s*got = singleinstance\.wait_acquire\(key", src) is not None,
+    "只有提权重启才等锁（普通双击仍然立刻退）")
+chk(src.find("wait_acquire") < src.find("singleinstance.wake(key)"),
+    "等锁在叫醒之前（顺序反了等于没等）")
 
 sec("6. key_from_argv 解析")
 

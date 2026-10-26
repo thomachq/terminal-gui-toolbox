@@ -77,10 +77,23 @@ def main() -> int:
                 f"{key} 页面宽度没被内容撑破",
                 f"内胆 {body.winfo_width()} / 可视 {view_w}")
 
-            # 2. 需要滚的必须真有滚动条；表格页不许双重滚动
+            # 2. 需要滚的必须真有滚动条。
+            # 表格页（shrink）本来靠表格内滚，外层不该再挂一条 —— 但 v1.0.27
+            # 起每页有 min_h 下限：窗口矮到连「工具条 + 表头 + 两行」都装不下时，
+            # 内胆会比视口高，这时**必须**出外层条，否则下面那截永远看不到。
+            # 所以判据改成：内胆放得下 → 不出条；内胆超出 → 出条（放不下就滚）。
             if key in TABLE_PAGES:
-                chk(not sb.winfo_ismapped(),
-                    f"{key} 表格页不叠外层滚动条（避免双重滚动）")
+                try:
+                    ih = int(float(host.cv.itemcget(host._win, "height") or 0))
+                except Exception:      # noqa: BLE001
+                    ih = 0
+                if ih <= view_h + 1:
+                    chk(not sb.winfo_ismapped(),
+                        f"{key} 表格页放得下时不叠外层滚动条")
+                else:
+                    chk(sb.winfo_ismapped(),
+                        f"{key} 表格页被压到底线时靠外层条兜底",
+                        f"内胆 {ih} / 可视 {view_h}")
                 continue
             if need <= view_h + 1:
                 chk(not sb.winfo_ismapped(), f"{key} 装得下时不出滚动条")

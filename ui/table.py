@@ -313,6 +313,10 @@ class DataTable(tk.Frame):
             return
         if avail <= 1 or not self.columns:
             return
+        # 留一道 2 逻辑像素的缝：ttk 自己算「可视宽度」时会把这一两像素算成
+        # 不可见，于是列宽**正好等于**树宽也会弹出一条根本滚不动的横向滚动条
+        # （实测 tree 1016 / 列合计 1016 / 横条照样出现）。补满不留缝就是病因。
+        avail -= U.px(2)
         # 分组模式下最左边那列（#0）是实打实占宽的，不算进来的话
         # 一组模型就会平白多出一条横向滚动条。
         if self._group_key:
@@ -434,7 +438,9 @@ class DataTable(tk.Frame):
         except tk.TclError:
             return
         try:
-            need = bool(self._view) and (float(first) > 0.001 or float(last) < 0.999)
+            # 0.997 而不是 0.999：最后 0.1% 是 ttk 的边框误差，不是真的超宽。
+            # 拿 0.999 判会把「刚好放得下」也算成需要横条。
+            need = bool(self._view) and (float(first) > 0.001 or float(last) < 0.997)
         except (TypeError, ValueError):
             need = bool(self._view)
         if need == self._sbx_need:

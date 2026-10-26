@@ -36,6 +36,7 @@ hidden = [
     'core.parsers', 'core.routes', 'core.firewall', 'core.docker',
     'core.files', 'core.redact', 'core.webstack', 'core.aiops',
     'core.secscan', 'core.dbscan', 'core.cronjob',
+    'core.ipaddr', 'core.iplib',
     # 主机资源四件套 + 操作审计 + AI 活动流（v1.0.4）
     'core.hosts', 'core.creds', 'core.proxies', 'core.scripts',
     'core.audit', 'core.aitrace',
@@ -64,7 +65,10 @@ a = Analysis(
     binaries=[],
     # 图标打进 exe 里：用户只拷一个 exe 也能有托盘/窗口图标。
     # 程序里会先找 exe 同级的 assets\，找不到才回落 sys._MEIPASS。
-    datas=[('assets/app.ico', 'assets'), ('assets/app.png', 'assets')],
+    # 地址库（常用网段/省级/国家）也在这里：~3.8 MB，离线可用，
+    # 用户点「更新地址库」时写的是 data/iplib（覆盖内置这份）。
+    datas=[('assets/app.ico', 'assets'), ('assets/app.png', 'assets'),
+           ('assets/iplib', 'assets/iplib')],
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},

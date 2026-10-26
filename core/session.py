@@ -341,6 +341,9 @@ class LocalSession(BaseSession):
         # 允许外部指定「这次当自己是不是管理员」：自测要模拟普通用户，
         # 界面上「以管理员身份运行」勾选后也可以先假定提权成功再重启。
         self._admin_override: bool | None = None
+        # 走不走提权助手：Windows 没有 sudo，普通权限的进程要跑管理员命令，
+        # 只能另起一个管理员进程代跑（见 core/elev.py）。True = 命令交给它。
+        self.use_helper = False
         # Windows 本机用哪种外壳："" = 自动（认命令前缀）/ "cmd" / "powershell"
         self.shell = ""
         self.is_root = self.is_admin
@@ -398,7 +401,97 @@ class LocalSession(BaseSession):
             return 126, "", str(e)
 
     def run(self, cmd: str, timeout: int = 30) -> tuple[int, str, str]:
+        if self.is_windows and self.use_helper:
+            h = self._helper()
+            if h is None:
+                # 通道没了（助手被杀 / 崩了）：立刻降级并说明，
+                # 否则界面还挂着「已提权」，用户以为命令是管理员跑的。
+                self.use_helper = False
+                self.elevated = False
+                self.elev_method = ""
+                self.elev_msg = "提权通道已断开（助手不在了），已退回普通权限"
+            else:
+                # 勾了「以管理员身份运行」之后，本机所有命令都从这个通道走 ——
+                # 终端里手敲的、页面按需跑的，全都真的带管理员权限，而不是
+                # 只有 run_admin() 那几条。进程自身权限没变，界面不用重开。
+                try:
+                    return h.exec(cmd, timeout, self.shell)
+                except Exception as e:  # noqa: BLE001
+                    self.elev_msg = f"提权通道断开：{e}"
+                    self.use_helper = False
+                    self.elevated = False
+                    self.elev_method = ""
         return self._exec(self.argv_for(cmd), timeout)
+
+    # ---------------- 提权助手（Windows 一次性 UAC，不重启应用）
+    def _helper(self):
+        """能用的提权助手；没有就 None（调用方据此决定直连还是报错）。"""
+        if not (self.is_windows and self.use_helper):
+            return None
+        from core import elev
+        return elev.current()
+
+    def set_helper(self, on: bool = True) -> None:
+        """接上 / 断开提权通道。接上即视为「已提权」。"""
+        self.use_helper = bool(on)
+        if on:
+            self.elevated = True
+            self.elev_method = "uac"
+            self.elev_msg = ""
+        else:
+            self.elevated = False
+            self.elev_method = ""
+
+    def elevate_root(self, pw: str = "") -> bool:
+        """Windows 本机：点一次 UAC 拉起提权助手（**不重启程序**）。
+
+        `pw` 在 Windows 上用不到（没有 sudo），保留参数是为了与 SSH 同签名。
+        """
+        if not self.is_windows:
+            return self.sudo_ok(pw)
+        self.elev_msg = ""
+        if self.is_admin:
+            # 进程本来就是管理员，不需要助手
+            self.elevated = True
+            self.elev_method = "uac"
+            return True
+        from core import elev
+        h = elev.helper()
+        if h.alive or h.start():
+            self.set_helper(True)
+            return True
+        self.elev_msg = h.last_error or "UAC 授权没通过"
+        self.elevated = False
+        return False
+
+    def verify_root(self) -> tuple[bool, str]:
+        """连上之后实测一次「命令是不是真的带管理员权限」。
+
+        和 SSH 那条同一条道理：`elevate_root()` 返回 True 只代表 UAC 点了
+        「是」，命令实际跑在哪条通道得验 —— 用户看到提示符变成 `#` 了，
+        这里就不能再猜。
+        """
+        if not self.is_windows:
+            return bool(self.elevated), (self.elev_method or "本机")
+        ps = ("powershell -NoProfile -NonInteractive -Command \""
+              "([Security.Principal.WindowsPrincipal]"
+              "[Security.Principal.WindowsIdentity]::GetCurrent())"
+              ".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)\"")
+        try:
+            rc, out, err = self.run(ps, timeout=30)
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+        txt = (out or "").strip().lower()
+        if rc == 0 and txt.startswith("true"):
+            self.elevated = True
+            self.elev_method = self.elev_method or "uac"
+            return True, "True"
+        if not txt:
+            # 回显读不到（编码/被杀软吞了）：按通道在不在判，别把一次怪回显
+            # 当成「没提权」，那会把用户已经点过的 UAC 白费掉。
+            return bool(self.elevated), "读不到 IsInRole 回显"
+        self.elevated = False
+        return False, f"IsInRole = {txt[:40]}"
 
     def argv_for(self, cmd: str) -> list[str]:
         """把一条命令变成 argv。抽出来是为了能单独测（不必真起进程）。"""
@@ -429,12 +522,14 @@ class LocalSession(BaseSession):
 
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
         if self.is_windows:
-            # Windows 没有 sudo：要么整个进程以管理员启动，要么命令自己失败。
+            # Windows 没有 sudo：要么进程本身是管理员，要么命令交给提权助手。
             # 这里必须先判断，否则报错会伪装成「系统找不到路径」这种误导信息。
+            if self._helper() is not None:
+                return self.run_traced(cmd, timeout)
             if not self.is_admin:
                 raise NeedElevation(
-                    "这一步要管理员权限：请以管理员身份运行本程序，"
-                    "或在「连接与设备」里勾选「以管理员身份运行」。",
+                    "这一步要管理员权限：勾「以管理员身份运行」点一次 UAC 就行，"
+                    "程序不用重启。",
                     kind="uac", target="本机")
             return self.run_traced(cmd, timeout)
 
@@ -454,10 +549,10 @@ class LocalSession(BaseSession):
         return rc, out, err
 
     def can_admin(self) -> tuple[bool, str]:
-        if self.is_admin:
+        if self.is_admin or self._helper() is not None:
             return True, ""
         if self.is_windows:
-            return False, "需要以管理员身份运行"
+            return False, "点「以管理员身份运行」弹一次 UAC 即可，不用重启程序"
         if self.sudo_pw:
             return True, ""
         return False, "需要 sudo 密码"

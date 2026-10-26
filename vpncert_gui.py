@@ -27,6 +27,7 @@ import wbtui as U
 import crypto_store
 import lockmgr
 from core import redact
+from core import tunnels
 from nasops import MainSessionClient, NasError, NasSession
 from pkilib import PLATFORMS, PLATFORM_ORDER, PKI, PKIError
 from profiles import (ProfileStore, chmod_600_warning,
@@ -94,6 +95,7 @@ class App(tk.Frame):
         self.q: queue.Queue = queue.Queue()
         self.status = tk.StringVar(value="就绪")
         self._pages: dict[str, tk.Frame] = {}
+        self._page_host: dict[str, object] = {}
         self._key_cache: list[dict] = []
         self._lock_overlay: tk.Frame | None = None
         self._last_active = time.time()
@@ -143,7 +145,7 @@ class App(tk.Frame):
         left = U.wframe(bar, "page")
         left.pack(side="left")
         U.wlabel(left, "Client Cert Console", "page", U.FONT_H).pack(anchor="w")
-        U.wlabel(left, "隧道客户端证书管理 · 建 CA / 签证书 / 多平台打包 / 吊销",
+        U.wlabel(left, "隧道服务管理 · 服务与连接 / OpenVPN 客户端证书",
                  "pagedim", U.FONT_S).pack(anchor="w", pady=(2, 0))
 
         right = U.wframe(bar, "page")
@@ -373,7 +375,7 @@ class App(tk.Frame):
         # 内嵌时不要「连接」页签 —— 主机管理里已经能连了，两处填同样的参数
         # 只会让人怀疑是不是要再连一次（用户原话：「这个连接功能重复了」）。
         items = ([] if self.embedded else [("conn", "连接")]) + [
-            ("cert", "证书"), ("pack", "打包"),
+            ("svc", "服务"), ("cert", "证书"), ("pack", "打包"),
             ("deploy", "部署"), ("cons", "命令日志")]
 
         if self.embedded:
@@ -415,13 +417,22 @@ class App(tk.Frame):
         self.stack.rowconfigure(0, weight=1)
         self.stack.columnconfigure(0, weight=1)
 
-        builders = {"conn": self._build_conn, "cert": self._build_cert,
+        builders = {"conn": self._build_conn, "svc": self._build_svc,
+                    "cert": self._build_cert,
                     "pack": self._build_pack, "deploy": self._build_deploy,
                     "cons": self._build_console}
         for key, _label in items:
-            page = U.wframe(self.stack, "page")
-            page.grid(row=0, column=0, sticky="nsew")
+            # 每个子页套一层可滚宿主：证书 / 打包 / 部署这几页内容都比可视区高，
+            # 直接 grid 在 stack 里（stack 又 grid_propagate(False)）会被裁掉
+            # 下面那一截，而且没有任何滚动条能带用户去看 —— 实测一页 36 个控件
+            # 落在视口外，怎么点都摸不到。
+            host = U.ScrollBox(self.stack, fill=True, auto_hide=True)
+            host.configure(width=1, height=1)      # 不参与外层尺寸协商
+            host.grid_propagate(False)
+            host.grid(row=0, column=0, sticky="nsew")
+            page = host.inner
             self._pages[key] = page
+            self._page_host[key] = host
             builders[key](page)
 
         self.nav.select(items[0][0])
@@ -429,9 +440,24 @@ class App(tk.Frame):
     def _show(self, key: str):
         pg = self._pages.get(key)
         if pg is not None:
-            pg.tkraise()
+            # 抬的是外面那个滚动宿主：内胆在画布窗口里，raise 它等于没动
+            host = getattr(self, "_page_host", {}).get(key)
+            (host or pg).tkraise()
+            if host is not None:
+                try:
+                    host.cv.yview_moveto(0.0)
+                except tk.TclError:
+                    pass
         if self.embedded:
             self._refresh_device()
+        # 切到「服务」页时自动探一次：那页的一切（启停、连接、证书认证开关）
+        # 都建立在「设备上到底装了什么」之上，让用户先点一次检测纯属多一步。
+        if key == "svc" and not getattr(self, "_svc", None):
+            try:
+                if self.nas.connected:
+                    self.after(200, self.svc_refresh)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---------------------------------------------------- 当前设备（内嵌）
     def _goto_hosts(self):
@@ -1143,6 +1169,343 @@ class App(tk.Frame):
         self.status.set("已断开")
 
     # ============================================================ 2 · 证书
+    # ---------------------------------------------------- 隧道服务（服务与连接）
+    def _build_svc(self, pg: tk.Frame):
+        """设备上实际装了什么隧道服务、在不在跑、谁连着、证书认证开没开。
+
+        这个页签替代了原来「隧道客户端证书管理」这个名字下的半张脸：
+        证书只是 OpenVPN 的一种认证手段，用户真正要管的是**全部入站隧道**。
+        """
+        pg.columnconfigure(0, weight=1)
+        # 不设 row weight：三块卡片按内容高度排，超出可视区交给外层 ScrollBox。
+        # 给表格所在的 row 加 weight 会把表格拉到满屏高，3 条连接下面留一大片
+        # 空白，看着像「数据丢了」。
+        self._svc: list[dict] = []
+        self._svc_init = ""
+        self._svc_os = ""
+        self._svc_rows: dict[str, dict] = {}
+        self._svc_sel = ""
+
+        head = U.Card(pg, title="设备上的隧道服务",
+                      hint="按设备实际安装的显示，没装的不列")
+        head.grid(row=0, column=0, sticky="we")
+        b = head.body
+        r = U.wframe(b, "card")
+        r.pack(fill="x")
+        U.RoundButton(r, "检测", self.svc_refresh, variant="primary",
+                      height=32, padx=17).pack(side="left")
+        self.lbl_svc_sys = U.wlabel(r, "还没检测", "dim", U.FONT_XS)
+        self.lbl_svc_sys.pack(side="left", padx=(12, 0))
+        self.svc_host = U.wframe(b, "card")
+        self.svc_host.pack(fill="x", pady=(10, 0))
+        U.wlabel(self.svc_host, "点「检测」看这台设备装了什么隧道服务",
+                 "dim", U.FONT_S).pack(anchor="w")
+
+        cls = U.Card(pg, title="在线连接", hint="选中服务后点「看连接」")
+        cls.grid(row=1, column=0, sticky="we", pady=(10, 0))
+        cb = cls.body
+        tw = U.wframe(cb, "card")
+        tw.pack(fill="both", expand=True)
+        cols = (("name", "名称", 140), ("remote", "远端", 180),
+                ("virtual", "虚拟地址", 120), ("since", "接入时间", 150),
+                ("rx", "收", 80), ("tx", "发", 80), ("state", "状态", 70))
+        self.tree_cli = ttk.Treeview(tw, columns=[c[0] for c in cols],
+                                     show="headings", height=3)
+        sb = ttk.Scrollbar(tw, orient="vertical", command=self.tree_cli.yview)
+        self.tree_cli.configure(yscrollcommand=sb.set)
+        for k, t, w in cols:
+            self.tree_cli.heading(k, text=t)
+            self.tree_cli.column(k, width=U.px(w), anchor="w")
+        self.tree_cli.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.lbl_cli = U.wlabel(cb, "", "dim", U.FONT_XS)
+        self.lbl_cli.pack(anchor="w", pady=(6, 0))
+
+        cert = U.Card(pg, title="OpenVPN 客户端证书认证",
+                      hint="要求证书 = 没证书连不上")
+        cert.grid(row=2, column=0, sticky="we", pady=(10, 0))
+        cb2 = cert.body
+        r2 = U.wframe(cb2, "card")
+        r2.pack(fill="x")
+        self.v_certmode = tk.StringVar(value="require")
+        self.cb_certmode = ttk.Combobox(
+            r2, textvariable=self.v_certmode, state="readonly", width=42,
+            values=[f"{k} —— {lab}" for k, lab in tunnels.CERT_MODES])
+        self.cb_certmode.pack(side="left")
+        U.RoundButton(r2, "读取当前", self.svc_read_certmode,
+                      variant="secondary", height=30, padx=14).pack(
+            side="left", padx=8)
+        U.RoundButton(r2, "应用", self.svc_apply_certmode, variant="primary",
+                      height=30, padx=16).pack(side="left")
+        self.lbl_cert = U.wlabel(cb2, "", "dim", U.FONT_XS)
+        self.lbl_cert.pack(anchor="w", pady=(8, 0))
+
+    # ---- 检测
+    def svc_refresh(self):
+        if not self.nas.connected:
+            return messagebox.showinfo(
+                "先连接设备",
+                "这个页签要读设备上的进程和配置。\n先去「主机管理」连上一台设备。",
+                parent=self)
+        self.status.set("正在检测隧道服务…")
+
+        def work():
+            # 不预先判断对面是什么系统：先按 POSIX 探一次，回显里连一条
+            # `@svc` 都没解析出来、系统名也不是 unix 系，就换 PowerShell 再探。
+            # 这样 Windows OpenSSH（默认 shell 是 cmd）也能认。
+            rc, out, err = self.nas.run(tunnels.probe_cmd(), timeout=60)
+            got = tunnels.parse_probe(out)
+            osname = (got.get("os") or "").lower()
+            posix = any(k in osname for k in
+                        ("linux", "bsd", "darwin", "sunos", "synology"))
+            if not posix:
+                rc2, out2, err2 = self.nas.run(tunnels.windows_probe_cmd(),
+                                               timeout=90)
+                wgot = tunnels.parse_windows_probe(out2)
+                if wgot.get("services") or wgot.get("os"):
+                    return wgot
+                return got
+            return got
+
+        def ok(got):
+            self._svc = [s for s in got["services"] if s.get("installed")]
+            self._svc_os = got.get("os") or ""
+            self._svc_init = got.get("init") or ""
+            self._svc_render()
+            n = len(self._svc)
+            up = sum(1 for s in self._svc if s["active"])
+            self.lbl_svc_sys.configure(
+                text=f"{self._svc_os or '未知系统'} · init={self._svc_init or '?'}"
+                     f" · 装了 {n} 个、在跑 {up} 个")
+            self.status.set(f"✓ 检测完成：{n} 个隧道服务，{up} 个在跑" if n
+                            else "这台设备上没有隧道服务")
+
+        self.bg(work, ok=ok, err=lambda m: self._fail(m))
+
+    def _svc_render(self):
+        for w in list(self.svc_host.winfo_children()):
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        self._svc_rows = {}
+        if not self._svc:
+            U.wlabel(self.svc_host, "这台设备上没有检测到隧道服务",
+                     "dim", U.FONT_S).pack(anchor="w")
+            return
+        for s in self._svc:
+            key = s["key"]
+            row = U.wframe(self.svc_host, "card")
+            row.pack(fill="x", pady=(0, U.px(6)))
+            on = bool(s.get("active"))
+            U.wlabel(row, s["name"], "card", U.FONT_S).pack(side="left")
+            U.Pill(row, "运行中" if on else "已停止",
+                   "ok" if on else "mute").pack(side="left", padx=(8, 0))
+            ports = [str(p) for p in (s.get("ports") or [])]
+            if ports:
+                U.wlabel(row, "端口 " + "/".join(ports), "dim", U.FONT_XS).pack(
+                    side="left", padx=(10, 0))
+            if s.get("note"):
+                U.wlabel(row, s["note"], "dim", U.FONT_XS).pack(
+                    side="left", padx=(10, 0))
+            # 右侧按钮：pack(side="right") 是**反序**的，先 pack 的贴最右
+            if on:
+                U.RoundButton(row, "重启",
+                              lambda k=key: self.svc_control(k, "restart"),
+                              variant="ghost", font=U.FONT_XS, height=26,
+                              padx=10).pack(side="right", padx=(6, 0))
+                U.RoundButton(row, "停止",
+                              lambda k=key: self.svc_control(k, "stop"),
+                              variant="ghost", font=U.FONT_XS, height=26,
+                              padx=10).pack(side="right", padx=(6, 0))
+            else:
+                U.RoundButton(row, "启动",
+                              lambda k=key: self.svc_control(k, "start"),
+                              variant="ghost", font=U.FONT_XS, height=26,
+                              padx=10).pack(side="right", padx=(6, 0))
+            U.RoundButton(row, "看连接",
+                          lambda k=key: self.svc_clients(k),
+                          variant="secondary", font=U.FONT_XS, height=26,
+                          padx=10).pack(side="right")
+            self._svc_rows[key] = s
+
+    def _svc_by_key(self, key: str) -> dict | None:
+        for s in self._svc:
+            if s["key"] == key:
+                return s
+        return None
+
+    # ---- 启停
+    def svc_control(self, key: str, action: str):
+        s = self._svc_by_key(key)
+        if not s:
+            return
+        verb = {"start": "启动", "stop": "停止", "restart": "重启"}.get(action, action)
+        cmds = tunnels.control_cmds(s, action, self._svc_init)
+        if not messagebox.askokcancel(
+                f"确认{verb}",
+                f"要{verb} {s['name']}：\n\n" + "\n".join(cmds) +
+                ("\n\n注意：重启会断开当前所有连接。" if action == "restart"
+                 and s.get("active") else ""),
+                parent=self):
+            return
+        self.status.set(f"正在{verb} {s['name']}…")
+
+        def work():
+            last = (0, "", "")
+            for c in cmds:
+                last = self.nas.run(c, sudo=True, timeout=90)
+                if last[0] != 0:
+                    break
+            return last
+
+        def ok(res):
+            rc, out, err = res
+            if rc == 0:
+                self.status.set(f"✓ {s['name']} 已{verb}")
+                self.after(900, self.svc_refresh)
+            else:
+                self._fail(f"{verb}失败（rc={rc}）：{(err or out).strip()[:300]}")
+
+        self.bg(work, ok=ok, err=lambda m: self._fail(m))
+
+    # ---- 在线连接
+    def svc_clients(self, key: str):
+        s = self._svc_by_key(key)
+        if not s:
+            return
+        self._svc_sel = key
+        kind = s.get("kind") or key
+        cmd = tunnels.clients_cmd(s)
+        self.status.set(f"正在读 {s['name']} 的连接…")
+
+        def work():
+            rc, out, err = self.nas.run(cmd, sudo=True, timeout=60)
+            if rc != 0 and not out.strip():
+                rc, out, err = self.nas.run(cmd, timeout=60)
+            return rc, out, err
+
+        def ok(res):
+            rc, out, err = res
+            rows = tunnels.parse_clients(kind, out)
+            self.tree_cli.delete(*self.tree_cli.get_children())
+            # 表格高度跟着数据走：3 条就 3 行高，别在下面留一大片空白；
+            # 最多 8 行，再多就滚动。ttk 的 height 是**行数**，不会自适应。
+            self.tree_cli.configure(height=max(3, min(8, len(rows))))
+            for r in rows:
+                self.tree_cli.insert("", "end", values=(
+                    r.get("name", ""), r.get("remote", ""), r.get("virtual", ""),
+                    r.get("since", ""), r.get("rx", ""), r.get("tx", ""),
+                    r.get("state", "")))
+            body = (out or "").strip()
+            if rows:
+                self.lbl_cli.configure(
+                    text=f"{s['name']}：{len(rows)} 个连接")
+                self.status.set(f"✓ {s['name']} 有 {len(rows)} 个连接")
+            else:
+                # 解析不出结构（L2TP/PPTP 没有统一的状态文件）就把原文给人看
+                hint = ("没有解析到连接。原始回显：\n" + body[:600]) if body else \
+                    "没有读到连接信息（可能需要 root，或该服务没有状态文件）"
+                self.lbl_cli.configure(text=hint[:300])
+                self.status.set(f"{s['name']}：没读到连接")
+
+        self.bg(work, ok=ok, err=lambda m: self._fail(m))
+
+    # ---- 证书认证开关
+    def _openvpn_svc(self) -> dict | None:
+        return self._svc_by_key("openvpn")
+
+    def svc_read_certmode(self):
+        s = self._openvpn_svc()
+        if not s:
+            return messagebox.showinfo(
+                "没有 OpenVPN", "设备上没检测到 OpenVPN，这个开关用不上。",
+                parent=self)
+        conf = (s.get("conf") or (s.get("confs") or [""])[0])
+        if not conf:
+            return self._fail("不知道 OpenVPN 的配置文件在哪，先在设备上确认 server.conf 路径")
+
+        def work():
+            for path in (s.get("confs") or [conf]):
+                rc, out, err = self.nas.run(tunnels.read_conf_cmd(path),
+                                            sudo=True, timeout=30)
+                if rc == 0 and out.strip():
+                    return path, out
+            return conf, ""
+
+        def ok(res):
+            path, text = res
+            if not text.strip():
+                self.lbl_cert.configure(text=f"读不到配置：{path}")
+                return
+            mode = tunnels.cert_mode(text)
+            self.v_certmode.set(next(f"{k} —— {lab}"
+                                     for k, lab in tunnels.CERT_MODES
+                                     if k == mode))
+            n = len(tunnels.status_files_from_conf(text))
+            self.lbl_cert.configure(
+                text=f"{path} · 当前模式 {mode}"
+                     + (f" · 配置里有 {n} 处 status 指令" if n else ""))
+
+        self.bg(work, ok=ok, err=lambda m: self._fail(m))
+
+    def svc_apply_certmode(self):
+        s = self._openvpn_svc()
+        if not s:
+            return messagebox.showinfo("没有 OpenVPN", "设备上没检测到 OpenVPN。",
+                                      parent=self)
+        raw = self.v_certmode.get()
+        mode = raw.split(" ")[0].strip()
+        label = dict(tunnels.CERT_MODES).get(mode, mode)
+        confs = list(s.get("confs") or [])
+        path = confs[0] if confs else ""
+
+        def build(_path=""):
+            return tunnels.cert_mode_cmds(_path or path, mode, self._svc_init)
+
+        # 先探一下哪个配置文件真的存在，再让用户确认
+        def probe_work():
+            for c in confs:
+                rc, _out, _err = self.nas.run(f"test -f '{c}' && echo yes",
+                                              sudo=True, timeout=20)
+                if rc == 0:
+                    return c
+            return path
+
+        def probe_ok(found):
+            cmds = build(found)
+            if not messagebox.askokcancel(
+                    "确认修改 OpenVPN 认证方式",
+                    f"要改成：{label}\n\n会执行：\n" + "\n".join(cmds) +
+                    "\n\n会先备份原配置；改完重启 OpenVPN，当前连接会断开。\n"
+                    "如果新配置写错，可以在设备上把 .bak.<时间> 文件拷回来。",
+                    parent=self):
+                return
+            self.status.set("正在修改 OpenVPN 认证方式…")
+
+            def work():
+                last = (0, "", "")
+                for c in cmds:
+                    last = self.nas.run(c, sudo=True, timeout=120)
+                    if last[0] != 0:
+                        break
+                return last
+
+            def ok(res):
+                rc, out, err = res
+                if rc == 0:
+                    self.status.set(f"✓ 认证方式已改为 {mode}")
+                    self.lbl_cert.configure(
+                        text=f"{found} · 已改为 {mode}（重启完成）")
+                    self.after(700, self.svc_refresh)
+                else:
+                    self._fail(f"修改失败（rc={rc}）：{(err or out).strip()[:300]}\n\n"
+                               "配置已备份，可在设备上回滚。")
+
+            self.bg(work, ok=ok, err=lambda m: self._fail(m))
+
+        self.bg(probe_work, ok=probe_ok, err=lambda m: self._fail(m))
+
     def _build_cert(self, pg: tk.Frame):
         pg.columnconfigure(0, weight=1)
         pg.rowconfigure(2, weight=1)

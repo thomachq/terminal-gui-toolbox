@@ -11,7 +11,7 @@
   · 路由表        —— 读 + 增删
   · 防火墙        —— nftables / iptables / netsh / pf / ipfw 读 + 增删
   · Docker        —— 容器 / 镜像 / 资源占用，未安装时明确提示
-  · 隧道客户端证书管理 —— 建 CA / 签证书 / 多平台打包 / 吊销（内嵌页）
+  · 隧道服务管理 —— 探测设备上装了什么隧道服务 / 启停 / 在线连接 / OpenVPN 客户端证书（内嵌页）
   · 智能体接入    —— 本地 HTTP API，给 AI 智能体保持 SSH 连接
 """
 from __future__ import annotations
@@ -40,6 +40,7 @@ from core import ai_skills, aitrace
 from core import aiops, parsers, routes
 from core import audit as audit_core
 from core import creds as creds_core
+from core import elev
 from core import hosts as hosts_core
 from core import proxies as proxies_core
 from core import scripts as scripts_core
@@ -67,6 +68,7 @@ from pages.cron_page import CronPage
 from pages.db_page import DbPage
 from pages.docker_page import DockerPage
 from pages.files_page import FilesPage
+from pages.remote_page import RemotePage
 from pages.routes_page import RoutesPage
 from pages.security_page import SecurityPage
 from pages.web_page import WebPage
@@ -115,7 +117,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.26"
+APP_VER = "1.0.27"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -127,11 +129,27 @@ NAV_ALIAS = {"fw": "sec", "conn": "hosts"}
 # 表格自己有内滚动，再套一层就成了双重滚动（滚轮不知道在滚哪一层）。
 _TABLE_PAGES = {"hosts", "tools", "sys", "files", "routes"}
 
+# 页面内容的「不许再压」下限（逻辑像素）。0/缺省 = 不设。
+# 文件管理：双栏时每栏要有卡片头（~34）+ 路径条（~36）+ 列表头（~28）+ 几行，
+# 400 能露 4 行左右；压到 400 以下就不如让整页滚。
+# 表格页也有个下限：一张表 = 工具条 + 搜索框 + 表头 + 至少两行 + 底栏，
+# 压到 240 逻辑像素以下就连工具条都被裁（实测 1200x760 窗口里 tools/sys/routes
+# 各有 4~16 个控件落在视口外，滚也滚不到）。到那个份上不如让整页滚。
+_MIN_PAGE_H = {"files": 400, "hosts": 260, "tools": 260, "sys": 260,
+               "routes": 260}
+
+# 需要页面级横向滚动条的页：内容本身有不可压缩的宽度，视口一窄右边就被切。
+# 目前只有隧道页那种「一行排好几个输入框」的表单（实测 Entry + Combobox
+# 超出视口 127 像素，怎么调列宽都压不下来）。表格页不要开 ——
+# DataTable 自己有横滚，页面级再来一条就是两条横滚抢同一件事。
+_HSCROLL_PAGES = {"vpn"}
+
+
 # 运维工具那一组：这些页打的命令都落在「当前活动设备」上，所以顶部要显示
 # 并允许切换「操作目标」。上面那组（主机管理 / 代理池 / 凭证 / 脚本）管的是
 # 资产本身，跟连没连设备无关，不显示设备条。
 TOOL_PAGES = frozenset({
-    "tools", "sys", "files", "routes", "sec", "docker",
+    "tools", "rmt", "sys", "files", "routes", "sec", "docker",
     "web", "db", "cron", "vpn", "api",
 })
 
@@ -190,10 +208,10 @@ TOOL_COLS = {
 }
 
 
-class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
-                 FilesPage, AiDockPage, ApiPage, WebPage, SettingsCenter,
-                 HostsPage, ProxyPage, CredPage, ScriptPage, LogPage, LogDock,
-                 tk.Tk):
+class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
+                 DockerPage, FilesPage, AiDockPage, ApiPage, WebPage,
+                 SettingsCenter, HostsPage, ProxyPage, CredPage, ScriptPage,
+                 LogPage, LogDock, tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
@@ -667,6 +685,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             # 下面一组是「对机器做什么」—— 操作
             ("group", "运维工具", [
                 ("tools", "网络工具"),
+                ("rmt", "远程管理"),
                 ("sys", "系统信息"),
                 ("files", "文件管理"),
                 ("routes", "路由表"),
@@ -675,7 +694,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                 ("web", "Web 服务"),
                 ("db", "数据库"),
                 ("cron", "计划任务"),
-                ("vpn", "隧道客户端证书管理"),
+                ("vpn", "隧道服务管理"),
                 ("api", "智能体接入"),
             ]),
             # 「日志管理」不再占导航位（用户要求）：它改成底部一条可开关的
@@ -711,6 +730,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
                              ("cred", self.build_cred),
                              ("script", self.build_script),
                              ("tools", self._build_tools),
+                             ("rmt", self.build_remote),
                              ("sys", self._build_sys),
                              ("files", self.build_files),
                              ("routes", self.build_routes),
@@ -727,8 +747,16 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
             # 下方一大片空白」。
             # shrink：主体是表格的页面只压缩、不加外层滚动条。表格自己有内滚动，
             # 再套一层就是双重滚动，滚一下不知道动的是哪一层。
+            #
+            # 但「压缩」有个下限：文件管理这种一页塞两张卡的页面，卡片头 +
+            # 路径条 + 搜索框是固定高度，压狠了表格直接消失（实测日志升起时
+            # 两栏各只剩 95 像素，连表头都露不全，用户报「显示不完整」）。
+            # 给个 min_h 之后，压不下就让整页滚 —— 外层滚动条这时才真的有用。
             host = U.ScrollBox(self.stack, fill=True, auto_hide=True,
-                               shrink=key in _TABLE_PAGES)
+                               shrink=key in _TABLE_PAGES,
+                               hscroll=key in _HSCROLL_PAGES,
+                               min_h=U.px(_MIN_PAGE_H.get(key, 0)))
+
             # 页面容器不参与尺寸协商：16 个页面 grid 在 stack 的同一格里，
             # grid 会取「所有子页请求宽度的最大值」当列宽 —— 只要有一页里
             # 有张宽表（安全中心两张表列宽合计 1311），整个 stack 就被撑到
@@ -1208,6 +1236,12 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
     def destroy(self) -> None:
         self._cancel_timers()
+        # 提权助手是**管理员进程**：主程序退了它还活着，用户在任务管理器里
+        # 看到会慌，也是一条没人管的提权后门。必须跟着一起收。
+        try:
+            elev.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
         super().destroy()
 
     def _quit_app(self) -> None:
@@ -1407,14 +1441,18 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         """
         s = self.session
         if exc.kind == "uac":
-            if messagebox.askyesno(
+            if not messagebox.askyesno(
                     "需要管理员权限",
-                    f"{exc}\n\n要现在以管理员身份重新启动吗？\n"
-                    "（会关闭当前窗口并重开一个）",
+                    f"{exc}\n\n点「是」现在弹一次 UAC 授权，通过后自动重试这项操作。\n"
+                    "**程序不会重启**，当前会话不受影响。",
                     parent=self):
-                self._restart_as_admin()
-            else:
                 self.status.set_state("需要管理员权限", "warn")
+                return
+
+            def redo():
+                self.bg(fn, ok, err, allow_elev=False)
+
+            self._elevate_now(then=redo)
             return
 
         if s is None or not hasattr(s, "sudo_ok"):
@@ -1869,17 +1907,77 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
     # ---------------- 提权区（随平台与协议变形）
     def _is_admin(self) -> bool:
-        """当前进程是否已经是管理员（Windows UAC / Unix root）。"""
+        """当前能不能跑管理员命令（Windows UAC / Unix root）。
+
+        注意「能跑」不等于「本进程是管理员」：勾了「以管理员身份运行」之后，
+        命令由提权助手代跑（core/elev.py），进程权限一点没变。界面上再说
+        「当前是普通用户」就是在骗人，连接时还会重复弹 UAC。
+        """
         if sys.platform == "win32":
             try:
                 import ctypes
-                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+                if bool(ctypes.windll.shell32.IsUserAnAdmin()):
+                    return True
             except Exception:  # noqa: BLE001
-                return False
+                pass
+            return elev.current() is not None
         try:
             return os.geteuid() == 0
         except AttributeError:
             return False
+
+    def _admin_ready(self) -> bool:
+        """已经能以管理员身份执行命令（含提权助手通道）。"""
+        return self._is_admin()
+
+    def _elevate_now(self, then=None) -> bool:
+        """弹一次 UAC 拿到管理员通道，**不重启应用**。
+
+        返回 False = 这次没拿到（用户点了否 / 被策略拦 / 助手起不来），
+        `then` 不会被调用。成功时先刷新界面上「已具备管理员权限」那行、
+        提示符，再执行 `then`（通常是「把刚才失败的那次操作重跑一遍」）。
+        """
+        if self._admin_ready():
+            if then:
+                then()
+            return True
+        self.status.set_state("正在请求管理员授权…", "warn")
+
+        def work():
+            return elev.helper().start()
+
+        def ok(got):
+            if got:
+                self._apply_elev()
+                self.status.set_state("已获得管理员权限", "ok")
+                self._log_raw("ok", "[提权] 已通过 UAC 拿到管理员通道（未重启程序）")
+                if then:
+                    then()
+                return
+            msg = elev.helper().last_error or "没拿到管理员权限"
+            self.status.set_state("需要管理员权限", "warn")
+            self._log_raw("warn", f"[提权] {msg}")
+            messagebox.showwarning("需要管理员权限", msg, parent=self)
+
+        def failed(msg):
+            self.status.set_state("需要管理员权限", "warn")
+            messagebox.showerror("提权失败", msg, parent=self)
+
+        self.bg(work, ok, failed, allow_elev=False)
+        return True
+
+    def _apply_elev(self) -> None:
+        """把「已提权」落到当前会话与界面上。"""
+        s = self.session
+        if s is not None and hasattr(s, "set_helper"):
+            try:
+                s.set_helper(True)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self._rebuild_elevation()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _rebuild_elevation(self) -> None:
         """Windows 本机没有 sudo，说的是 UAC；类 Unix 才是 sudo 密码。
@@ -1998,31 +2096,53 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         self._refresh_cred_hint()
 
     def _admin_toggled(self) -> None:
-        if not self.v_admin.get() or self._is_admin():
+        """勾上「以管理员身份运行」就当场要一次 UAC —— **不重启程序**。
+
+        以前这里问「要不要以管理员身份重新启动」，用户点「是」之后窗口
+        直接消失（新进程在 `main()` 里抢不到单实例锁就退出了），表现就是
+        「点了 UAC 通过，然后闪退」。现在改成拉一个管理员助手代跑命令，
+        界面、终端、已经连着的会话全都留着。
+        """
+        if not self.v_admin.get() or self._admin_ready():
             return
         if messagebox.askyesno(
                 "需要管理员权限",
-                "当前不是管理员。要现在以管理员身份重新启动吗？\n\n"
-                "会关闭当前窗口并重开一个（已连接的会话会断开）。",
+                "点「是」现在弹出 UAC 授权，通过后即可用管理员权限执行命令，\n"
+                "**程序不会重启**，当前窗口和已连接的会话都保留。\n\n"
+                "（选「否」也行，真正需要管理员权限时再问你一次。）",
                 parent=self):
-            self._restart_as_admin()
+            self._elevate_now()
 
     def _restart_as_admin(self) -> bool:
-        """用 UAC 重新拉起自己。成功就关掉当前实例，避免两个窗口抢 data 目录。"""
+        """兜底：整个进程以管理员身份重启（提权助手起不来时才走）。
+
+        两个坑都在这里：
+          1. `ShellExecuteW` 返回时新进程已经在跑，而老进程还要活几百毫秒 ——
+             新进程在 `main()` 里抢单实例锁会失败，然后 `return` 退出，
+             用户看到的就是「点完 UAC 闪退」。所以**先放锁再拉起**。
+          2. 新进程带 `--elev-restart`，`main()` 那边会等锁释放而不是一撞就退。
+        """
+        key = singleinstance.key_from_argv(sys.argv)
         try:
             import ctypes
-            args = [a for a in sys.argv[1:]]
+            args = [a for a in sys.argv[1:] if a != "--elev-restart"]
+            args.append("--elev-restart")
             if getattr(sys, "frozen", False):
                 exe, params = sys.executable, subprocess.list2cmdline(args)
             else:
                 exe = sys.executable
                 params = subprocess.list2cmdline([str(Path(sys.argv[0]).resolve())] + args)
+            singleinstance.release(key)      # 必须在新进程抢锁之前
             rc = ctypes.windll.shell32.ShellExecuteW(
                 None, "runas", exe, params, str(Path.cwd()), 1)
             if rc > 32:
-                self.after(400, self.destroy)
+                self.after(600, self.destroy)
                 return True
+            # 没起来：把锁抢回来，否则这台机器从此可以多开
+            singleinstance.acquire(key)
+            messagebox.showerror("提权失败", elev.shell_err(rc), parent=self)
         except Exception as e:  # noqa: BLE001
+            singleinstance.acquire(key)
             messagebox.showerror("提权失败", str(e), parent=self)
         return False
 
@@ -2313,19 +2433,18 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
 
         is_local = proto == "local"
         local_win = is_local and sys.platform == "win32"
-        # 本机 Windows 走 UAC（整个进程），类 Unix 与远程走 sudo / enable
+        # 本机 Windows 走 UAC（提权助手代跑），类 Unix 与远程走 sudo / enable
         elevate = bool(self.v_elevate.get()) or (local_win and self.v_admin.get())
-        if local_win and self.v_admin.get() and not self._is_admin():
+        if local_win and self.v_admin.get() and not self._admin_ready():
             self.btn_connect.set_enabled(True)
             if not messagebox.askyesno(
                     "需要管理员权限",
-                    "勾了「以管理员身份运行」，但当前不是管理员。\n"
-                    "要现在以管理员身份重新启动吗？",
+                    "勾了「以管理员身份运行」。点「是」会弹一次 UAC 授权，\n"
+                    "通过后自动继续连接，**程序不会重启**。",
                     parent=self):
                 return
-            if self._restart_as_admin():
-                return
-            self.btn_connect.set_enabled(True)
+            # 授权是异步的（UAC 可能要等十几秒），拿到后自己再进一次本函数
+            self._elevate_now(then=self.do_connect)
             return
 
         spec = ConnSpec(proto=proto,
@@ -3524,7 +3643,7 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         try:
             self.vpn_console.boot()
         except Exception as e:  # noqa: BLE001
-            self.status.set_state(f"隧道客户端证书管理初始化失败：{e}", "err")
+            self.status.set_state(f"隧道服务管理初始化失败：{e}", "err")
 
     # ============================================================ 防火墙模块
     # ============================================================ 应用锁
@@ -3764,9 +3883,24 @@ class ToolboxApp(RoutesPage, SecurityPage, DbPage, CronPage, DockerPage,
         dlg.grab_set()
 
 def main():
+    # 一次性 UAC 提权助手（由「以管理员身份运行」拉起）：**不开窗口、不建 Tk**，
+    # 只从指定目录里领命令、把结果写回去，主程序退出时它自己退出。
+    # 必须排在单实例检查和 Tk 之前，否则提权进程会去抢互斥量、再建一个窗口。
+    if "--elev-serve" in sys.argv:
+        i = sys.argv.index("--elev-serve")
+        path = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        parent = 0
+        if "--parent" in sys.argv:
+            j = sys.argv.index("--parent")
+            try:
+                parent = int(sys.argv[j + 1])
+            except (IndexError, ValueError):
+                parent = 0
+        raise SystemExit(elev.serve(path, parent))
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 证书控制台已经内嵌在「隧道客户端证书管理」页里，不再有 --vpncert 子进程形态。
+    # 隧道控制台已经内嵌在「隧道服务管理」页里，不再有 --vpncert 子进程形态。
     # 想单独调它可以直接 `python vpncert_gui.py`（它自己能独立跑）。
 
     # 单实例（参考微信）：已经有一套在跑，就把那个窗口叫到前台，自己退出。
@@ -3777,14 +3911,20 @@ def main():
     # 现在只让 `--smoke` / `--version`（根本不出窗口的那种）跳过，
     # 其余情况一律走单实例；测试脚本改用 `--instance-key <名字>` 换命名空间，
     # 例如 `--instance-key exe`，各测各的，谁也不挡谁。
-    _NO_SINGLETON = ("--smoke", "--version")
+    _NO_SINGLETON = ("--smoke", "--version", "--elev-serve")
     if not any(a in sys.argv for a in _NO_SINGLETON):
         key = singleinstance.key_from_argv(sys.argv)
         # 「把已有那个窗口叫到前台」这条兜底是按**窗口标题**找的，不认命名空间。
         # 测试实例（--instance-key exeN）被拦时要是也走这条路，就会把用户正在
         # 用的那个窗口拉到前面来 —— 测试不该碰用户的东西。
         is_default = key == singleinstance.DEFAULT_KEY
-        if not singleinstance.acquire(key):
+        # `--elev-restart` 是新进程的标记：老进程刚放锁、还要几百毫秒才退，
+        # 这里必须**等一会儿**再抢。一撞就退正是「点完 UAC 闪退」的那条路。
+        if "--elev-restart" in sys.argv:
+            got = singleinstance.wait_acquire(key, timeout=25.0)
+        else:
+            got = singleinstance.acquire(key)
+        if not got:
             singleinstance.wake(key)        # 叫醒它（本版本起会自己弹到前台）
             if is_default:
                 # 老版本收不到事件，兜底直接动它的窗口，然后自己退出。

@@ -122,7 +122,10 @@ PAGE_META: dict[str, dict] = {
            "actions": [("probe", "探测数据库实例", "db_probe", "read")]},
     "cron": {"label": "计划任务", "table": "tbl_cron",
              "actions": [("load", "重新读取计划任务", "cron_load", "read")]},
-    "vpn": {"label": "隧道客户端证书管理", "table": "", "actions": []},
+    "vpn": {"label": "隧道服务管理", "table": "", "actions": []},
+    # 远程管理：SSH 配置 / 密钥 / RDP / XRDP 四块卡片，没有对外表格名；
+    # 动作全是「改远端配置」，不给模型直接调 —— 这类操作必须有人看着确认。
+    "rmt": {"label": "远程管理", "table": "", "actions": []},
     "api": {"label": "智能体接入", "table": "tbl_sess",
             "actions": [("refresh", "刷新 API 状态", "api_refresh", "read")]},
 }

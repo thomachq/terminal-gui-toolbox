@@ -323,6 +323,13 @@ def configure_ttk(root: tk.Misc) -> None:
                  arrowcolor=T.text_dim, width=px(12), gripsize=0,
                  relief="flat", borderwidth=0)
     st.map("Nav.Vertical.TScrollbar", background=[("active", T.text_dim)])
+    # 横向那一条：跟竖向同一套配色，只是要矮一些（12 逻辑像素）。
+    # 页面底部的横条如果跟竖条一样宽，会在右下角留一块很难看的空白。
+    st.configure("Nav.Horizontal.TScrollbar", background=T.text_mute,
+                 troughcolor=T.page, bordercolor=T.page,
+                 arrowcolor=T.text_dim, width=px(12), gripsize=0,
+                 relief="flat", borderwidth=0)
+    st.map("Nav.Horizontal.TScrollbar", background=[("active", T.text_dim)])
 
     st.configure("TNotebook", background=T.page, borderwidth=0)
     st.configure("TNotebook.Tab", background=T.page, foreground=T.text_dim,
@@ -537,9 +544,11 @@ class Card(tk.Frame):
         self.inner.pack(fill="both", expand=True, padx=px(pad), pady=px(pad))
         self._title = None
         self._hint = None
+        self._head = None
         if title:
             head = tk.Frame(self.inner, bg=T.card, bd=0)
             head.pack(fill="x", pady=(0, px(10)))
+            self._head = head
             self._title = tk.Label(head, text=title, bg=T.card, fg=T.text,
                                    font=FONT_T, anchor="w", bd=0)
             self._title.pack(side="left")
@@ -553,7 +562,12 @@ class Card(tk.Frame):
 
     def _paint(self):
         self.configure(bg=T.card, highlightbackground=T.border, highlightcolor=T.border)
-        for w in (self.inner, self.body):
+        frames = [self.inner, self.body]
+        # head 也要重绘：漏了它，切到暗色后标题那一行会留一条白底
+        # （实测整条 30px 高、宽度到最右边的白条，字是暗色压在上面）。
+        if self._head is not None:
+            frames.append(self._head)
+        for w in frames:
             w.configure(bg=T.card)
         for lb in (self._title, self._hint):
             if lb is not None:
@@ -860,22 +874,43 @@ class ScrollBox(tk.Frame):
     """
 
     def __init__(self, master, bg: str | None = None, fill: bool = False,
-                 auto_hide: bool = False, shrink: bool = False, **kw):
+                 auto_hide: bool = False, shrink: bool = False,
+                 hscroll: bool = False, min_h: int = 0, **kw):
+        # 记住「底色是不是跟主题走」：传了具体颜色就不动它，没传就必须
+        # 跟着主题重绘。以前这里是 `bg = T.page` 直接取值 —— 亮色下建的
+        # 内胆永远是 #F5F9FF，切暗色后内胆不重绘，卡片之间的缝、段控件
+        # 那一条、表格下方空白全留成一条白底（远程管理页一眼就能看见）。
+        # 这类「只有露出来的部分才显形」的漏色，卡片铺满时根本看不出来。
+        bg_fixed = bg
         bg = T.page if bg is None else bg
         super().__init__(master, bg=bg, bd=0, **kw)
+        self._bg_fixed = bg_fixed
         self._fill = bool(fill)
         self._shrink = bool(shrink)
         self._auto_hide = bool(auto_hide)
+        # hscroll：内容比视口宽时给一条横向滚动条。
+        # 默认关闭 —— 大多数页面靠表格自己的横滚（DataTable 有），
+        # 页面级再来一条就是「两条横滚抢一件事」。只有确认内容真的被
+        # 切掉的页（表单一排 6 个输入框那种）才开。
+        self._hscroll = bool(hscroll)
+        # min_h：内容再挤也不许压到这个高度以下，压不下就让整页滚。
+        # 文件管理用得上：两栏各有卡片头 + 路径条 + 搜索框，压到 95 像素
+        # 的时候连表头都露不全，「双栏」等于没有。
+        self._min_h = int(min_h)
         self.cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
         # 用 ttk + Nav 那套样式：原生 tk.Scrollbar 在浅色主题下几乎是白的，
         # 页面右边一条「看不见的滚动条」等于没有（用户原话就是「缺少滚动条」）。
         self.vs = ttk.Scrollbar(self, orient="vertical", command=self.cv.yview,
-                                style="Nav.Vertical.TScrollbar")
-        self.cv.configure(yscrollcommand=self.vs.set)
+                               style="Nav.Vertical.TScrollbar")
+        self.hs = ttk.Scrollbar(self, orient="horizontal", command=self.cv.xview,
+                                style="Nav.Horizontal.TScrollbar")
+        self.cv.configure(yscrollcommand=self.vs.set,
+                          xscrollcommand=self.hs.set)
         # 先 pack 滚动条、再 pack 画布：画布带 expand，先 pack 会把整条宽度吃光，
         # 滚动条只能分到 1px（表现为「滚动条不见了，滚轮也压不到它」）。
         self.vs.pack(side="right", fill="y")
         self.cv.pack(side="left", fill="both", expand=True)
+
         self.inner = tk.Frame(self.cv, bg=bg, bd=0)
         # 标记：嵌套滚动容器时，从里往外找，先碰到谁就归谁滚
         self.inner._is_scroll_inner = True
@@ -894,6 +929,16 @@ class ScrollBox(tk.Frame):
         self._wheel_ids: list[str] = []
         self._bind_wheel()
         self.bind("<Destroy>", self._unbind_wheel, add="+")
+        register(self, self._paint)
+
+    # ---------------------------------------------------------- 主题
+    def _paint(self) -> None:
+        bg = T.page if self._bg_fixed is None else self._bg_fixed
+        for w in (self, self.cv, self.inner):
+            try:
+                w.configure(bg=bg)
+            except tk.TclError:
+                pass
 
     # ---------------------------------------------------------- 滚轮
     def _bind_wheel(self) -> None:
@@ -925,7 +970,7 @@ class ScrollBox(tk.Frame):
     def _owns(self, widget) -> bool:
         node = widget
         while node is not None:
-            if node is self.cv or node is self.vs:
+            if node is self.cv or node is self.vs or node is self.hs:
                 return True
             if isinstance(node, (tk.Text, tk.Listbox, ttk.Treeview)):
                 return False
@@ -955,7 +1000,12 @@ class ScrollBox(tk.Frame):
 
     def _apply_fit(self, width: int, height: int) -> None:
         try:
-            self.cv.itemconfigure(self._win, width=width)
+            iw = width
+            if self._hscroll:
+                # 开了横滚的容器：内胆按「内容本来要多宽」摆，超出视口的
+                # 部分交给横向滚动条。不这么干的话，宽了也只是把右边切掉。
+                iw = max(width, self.inner.winfo_reqwidth())
+            self.cv.itemconfigure(self._win, width=iw)
             if self._fill:
                 # 内胆高度怎么定，分两种页面：
                 #   · shrink=True（表格页）：直接用可视高。表格自己会滚动，
@@ -968,10 +1018,16 @@ class ScrollBox(tk.Frame):
                 #     才滚得动。
                 h = (height if self._shrink
                      else max(self.inner.winfo_reqheight(), height))
-                self.cv.itemconfigure(self._win, height=h)
+            else:
+                h = height
+            # min_h 是底线：给了就绝不压到它以下（压不下就让整页滚）。
+            if self._min_h:
+                h = max(h, self._min_h)
+            self.cv.itemconfigure(self._win, height=h)
         except tk.TclError:
             return
         self._autosb()
+
 
     def _watch_req(self) -> None:
         """盯内胆的「需求高度」是否变了，变了就重算一次。
@@ -1013,6 +1069,15 @@ class ScrollBox(tk.Frame):
         if not self._auto_hide:
             return
         try:
+            cw, ch = self.cv.winfo_width(), self.cv.winfo_height()
+        except tk.TclError:
+            return
+        if cw <= 1 or ch <= 1:
+            # 还没布局好（建页初期画布就是 1x1）：这时候任何「需求 > 视口」
+            # 的判断都是假的，一旦据此挂上滚动条，下一轮又判成不用挂 ——
+            # 来回抖成死循环（实测：`update()` 永远不返回）。
+            return
+        try:
             ih = 0
             try:
                 ih = int(float(self.cv.itemcget(self._win, "height") or 0))
@@ -1020,20 +1085,59 @@ class ScrollBox(tk.Frame):
                 ih = 0
             if ih <= 0:
                 ih = self.inner.winfo_reqheight()
-            need = ih > self.cv.winfo_height() + 1
+            need = ih > ch + 1
         except tk.TclError:
             return
-        if need == bool(self.vs.winfo_ismapped()):
-            return
-        try:
-            if need:
-                # before=cv：画布带 expand，晚 pack 的滚动条只会分到 1px
-                self.vs.pack(side="right", fill="y", before=self.cv)
+        # 横向：只有显式开了 hscroll 的容器才管。判据同理，用内胆**设定**宽度。
+        need_h = False
+        if self._hscroll:
+            try:
+                iw = int(float(self.cv.itemcget(self._win, "width") or 0))
+                need_h = iw > cw + 1
+            except (tk.TclError, ValueError):
+                need_h = False
+        # 判断「现在挂着没有」必须用 winfo_manager()，不能用 ismapped()：
+        # 窗口还没映射时 ismapped 一直是 0，pack 完还判成 0，于是每轮都
+        # 「刚挂上 → 又觉得没挂 → 再挂」，配合下面的 after_idle 就是死循环。
+        changed = False
+        if need != bool(self.vs.winfo_manager()):
+            try:
+                if need:
+                    # before=cv：画布带 expand，晚 pack 的滚动条只会分到 1px
+                    self.vs.pack(side="right", fill="y", before=self.cv)
+                else:
+                    self.vs.pack_forget()
+                    self.cv.yview_moveto(0.0)
+                changed = True
+            except tk.TclError:
+                pass
+        if need_h != bool(self.hs.winfo_manager()):
+            try:
+                if need_h:
+                    # 横条也必须 before=cv，否则同样只分到 1px 高
+                    self.hs.pack(side="bottom", fill="x", before=self.cv)
+                else:
+                    self.hs.pack_forget()
+                    self.cv.xview_moveto(0.0)
+                changed = True
+            except tk.TclError:
+                pass
+        if changed:
+            # 挂上/摘掉横条会改变画布自身的高度，纵向那条的判据跟着变，
+            # 再算一遍才不会出现「横条压着内容、竖条没出来」的僵局。
+            # 只补一次、最多两轮 —— 无条件重排会变成死循环。
+            self._sb_again = getattr(self, "_sb_again", 0) + 1
+            if self._sb_again <= 2:
+                try:
+                    self.after_idle(self._autosb_again)
+                except tk.TclError:
+                    self._sb_again = 0
             else:
-                self.vs.pack_forget()
-                self.cv.yview_moveto(0.0)
-        except tk.TclError:
-            pass
+                self._sb_again = 0
+
+    def _autosb_again(self) -> None:
+        self._autosb()
+
 
     def _wheel(self, e):
         try:
@@ -1047,6 +1151,18 @@ class ScrollBox(tk.Frame):
             step = 3
         else:
             step = -3 if getattr(e, "delta", 0) > 0 else 3
+        # Shift + 滚轮 = 横向滚（Windows 上触控板/鼠标的通用约定）。
+        # 只对真的挂了横条的容器生效，否则 Shift 滚会变成「什么都不动」。
+        try:
+            shift = bool(int(getattr(e, "state", 0)) & 0x0001)
+        except (TypeError, ValueError):
+            shift = False
+        if shift and self.hs.winfo_ismapped():
+            try:
+                self.cv.xview_scroll(step, "units")
+            except tk.TclError:
+                return None
+            return "break"
         try:
             self.cv.yview_scroll(step, "units")
         except tk.TclError:

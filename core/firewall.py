@@ -19,9 +19,72 @@ from __future__ import annotations
 import json
 import re
 
+from core import ipaddr
+
 RULE_KEYS = ("ref", "family", "table", "chain", "handle", "pos", "action", "proto",
              "src", "dst", "port", "iface", "comment", "raw", "enabled",
              "editable", "persistent")
+
+
+def _split_pairs(text) -> list[tuple[str, bool]]:
+    """一框多值 → [(网段, 是不是 IPv6)]，`any`/空 一律丢掉。"""
+    out: list[tuple[str, bool]] = []
+    ok, _bad = ipaddr.split(text)
+    for c in ok:
+        if c == "any":
+            continue
+        out.append((c, ipaddr.family(c) == 6))
+    return out
+
+
+def _first(text) -> str:
+    """取第一个网段；没有就是 any。"""
+    ok, _bad = ipaddr.split(text)
+    ok = [c for c in ok if c != "any"]
+    return ok[0] if ok else "any"
+
+
+# 一条表单规则最多展开成多少条后端命令。地址库选一个省就是几百条网段，
+# 源 × 目标 再一乘就是天文数字（iptables 逐条 -A，几十万条能把设备写死），
+# 所以在生成命令前先卡一道：宁可让用户少选，也不要下发到一半断掉。
+_MAX_RULES = 400
+
+
+def _cross(src_text, dst_text) -> list[tuple[str, str]]:
+    """源 × 目标 → [(src, dst)]，`any` 用空串表示。"""
+    srcs = [c for c, _f in _split_pairs(src_text)] or [""]
+    dsts = [c for c, _f in _split_pairs(dst_text)] or [""]
+    return [(s, d) for s in srcs for d in dsts]
+
+
+def _check_addrs(r: dict) -> str | None:
+    """地址校验：写错的、一条规则塞多个的，都在下发前拦住。"""
+    for key, label in (("src", "来源地址"), ("dst", "目标地址")):
+        ok, bad = ipaddr.split(r.get(key))
+        if bad:
+            return (f"{label}写错了：{bad[0]}"
+                    "（IPv4 如 192.168.1.0/24，IPv6 如 fe80::/10）")
+        if not ok:
+            continue
+        # 多值不是错误：add_cmds 会把一个框里的网段拆成多条后端命令
+        # （地址库选一个省就是几百条）。只卡硬上限 —— 超过了下发到一半
+        # 断掉比拒绝更糟，用户会以为规则已经生效。
+        n = len([c for c in ok if c != "any"])
+        if n > _MAX_RULES:
+            return (f"{label}有 {n} 个网段，超过单条规则上限 "
+                    f"{_MAX_RULES} 条，请少选几项或分成多条规则")
+    n_src = len(_split_pairs(r.get("src")))
+    n_dst = len(_split_pairs(r.get("dst")))
+    if n_src and n_dst and n_src * n_dst > _MAX_RULES:
+        return (f"来源 × 目标 会展开成 {n_src * n_dst} 条规则"
+                f"（上限 {_MAX_RULES}），请缩小子集")
+    # 一个 IPv4 源 + 一个 IPv6 目标，在任何后端上都是非法规则
+    # （nft 会直接语法错、iptables 会报 network not found），提前拦住。
+    sf = {ipaddr.family(c) for c in ipaddr.split(r.get("src"))[0]} - {0}
+    df = {ipaddr.family(c) for c in ipaddr.split(r.get("dst"))[0]} - {0}
+    if sf and df and not (sf & df):
+        return "来源与目标地址族不一致（一个 IPv4、一个 IPv6），请拆成两条规则"
+    return None
 
 _ACTION_CN = {"accept": "允许", "allow": "允许", "drop": "丢弃", "block": "阻止",
               "reject": "拒绝", "deny": "拒绝", "pass": "放行"}
@@ -228,29 +291,36 @@ class NftBackend(FirewallBackend):
         port = str(r.get("port") or "").strip()
         if port and not re.match(r"^[\d,\-: ]+$", port):
             return "端口写 22 或 80,443 或 1000-2000"
-        return None
+        return _check_addrs(r)
 
     def add_cmds(self, r: dict) -> list[str]:
         fam = r.get("family") or "inet"
         tbl = r.get("table") or "filter"
         chain = r.get("chain")
-        parts = ["nft", "add", "rule", fam, tbl, chain]
         proto = (r.get("proto") or "").lower()
-        src = (r.get("src") or "").strip()
-        dst = (r.get("dst") or "").strip()
         port = str(r.get("port") or "").strip()
-        if src and src != "any":
-            parts += ["ip", "saddr", src]
-        if dst and dst != "any":
-            parts += ["ip", "daddr", dst]
-        if proto and proto != "any":
-            parts.append(proto)
-            if port:
-                parts += ["dport", port]
         act = (r.get("action") or "accept").lower()
-        parts.append("accept" if act in ("accept", "allow") else
-                     ("drop" if act in ("drop", "block") else act))
-        return [" ".join(parts)]
+        act = ("accept" if act in ("accept", "allow")
+               else ("drop" if act in ("drop", "block") else act))
+        # 源 × 目标 一起拆：一个网段一条命令。nft 的匹配上下文关键字
+        # **必须**跟着地址族走 —— IPv6 写 `ip saddr` 会直接语法错
+        # （老版本这里硬编码 `ip`，于是「地址填 IPv6」永远下发失败）。
+        out: list[str] = []
+        for src, dst in _cross(r.get("src"), r.get("dst")):
+            parts = ["nft", "add", "rule", fam, tbl, chain]
+            if src:
+                parts += [("ip6" if ipaddr.family(src) == 6 else "ip"),
+                          "saddr", src]
+            if dst:
+                parts += [("ip6" if ipaddr.family(dst) == 6 else "ip"),
+                          "daddr", dst]
+            if proto and proto != "any":
+                parts.append(proto)
+                if port:
+                    parts += ["dport", port]
+            parts.append(act)
+            out.append(" ".join(parts))
+        return out
 
     def del_cmds(self, r: dict) -> list[str]:
         fam = r.get("family") or "inet"
@@ -327,32 +397,39 @@ class IptablesBackend(FirewallBackend):
         port = str(r.get("port") or "").strip()
         if port and not re.match(r"^[\d,\-: ]+$", port):
             return "端口写 22 或 80,443 或 1000-2000"
-        return None
+        return _check_addrs(r)
 
     def add_cmds(self, r: dict) -> list[str]:
         table = r.get("table") or "filter"
-        parts = ["iptables", "-t", table, "-A", r.get("chain") or "INPUT"]
+        chain = r.get("chain") or "INPUT"
         proto = (r.get("proto") or "").lower()
-        if proto and proto != "any":
-            parts += ["-p", proto]
-        src = (r.get("src") or "").strip()
-        if src and src != "any":
-            parts += ["-s", src]
-        dst = (r.get("dst") or "").strip()
-        if dst and dst != "any":
-            parts += ["-d", dst]
-        if r.get("iface"):
-            parts += ["-i", r["iface"]]
-        port = str(r.get("port") or "").strip()
-        if port:
-            parts += ["--dport", port]
         act = (r.get("action") or "ACCEPT").upper()
         if act in ("ALLOW", "DROP", "BLOCK"):
             act = {"ALLOW": "ACCEPT", "BLOCK": "DROP"}.get(act, act)
-        parts += ["-j", act]
-        if r.get("comment"):
-            parts += ["-m", "comment", "--comment", f'"{r["comment"]}"']
-        return [" ".join(parts)]
+        port = str(r.get("port") or "").strip()
+        out: list[str] = []
+        # 源 × 目标 → 一个网段一条命令；IPv6 必须走 ip6tables（iptables 只认
+        # v4，拿 v6 地址喂它会报「host/network not found」）。只要两侧有一侧
+        # 是 v6，整条规则就得走 ip6tables，否则地址族对不上。
+        for src, cidr in _cross(r.get("src"), r.get("dst")):
+            parts = ["ip6tables" if (ipaddr.family(cidr) == 6 or
+                                     ipaddr.family(src) == 6) else "iptables",
+                     "-t", table, "-A", chain]
+            if proto and proto != "any":
+                parts += ["-p", proto]
+            if src:
+                parts += ["-s", src]
+            if cidr:
+                parts += ["-d", cidr]
+            if r.get("iface"):
+                parts += ["-i", r["iface"]]
+            if port:
+                parts += ["--dport", port]
+            parts += ["-j", act]
+            if r.get("comment"):
+                parts += ["-m", "comment", "--comment", f'"{r["comment"]}"']
+            out.append(" ".join(parts))
+        return out
 
     def del_cmds(self, r: dict) -> list[str]:
         raw = r.get("raw") or ""
@@ -492,7 +569,10 @@ class NetshBackend(FirewallBackend):
                  f"protocol={proto}"]
         if port and proto.lower() in ("tcp", "udp"):
             parts.append(f"localport={port}")
-        src = str(r.get("src") or "any").strip()
+        # netsh 的 remoteip 本身就支持逗号分隔多个地址（IPv4/IPv6 都行），
+        # 所以这里不拆命令，把一框多值归一化成 `a,b,c` 一次下发。
+        # 归一化必须做：地址库里带出来的是换行分隔，直接塞进命令行会断成两截。
+        src = ipaddr.join([c for c, _f in _split_pairs(r.get("src"))])
         parts.append(f"remoteip={src or 'any'}")
         return [" ".join(parts)]
 
@@ -652,12 +732,15 @@ class IpfwBackend(FirewallBackend):
         act = (r.get("action") or "allow").lower()
         act = {"accept": "allow", "block": "deny", "drop": "deny"}.get(act, act)
         proto = (r.get("proto") or "ip").lower()
-        src = (r.get("src") or "any").strip() or "any"
-        dst = (r.get("dst") or "any").strip() or "any"
-        parts = ["ipfw", "add", act, proto, "from", src, "to", dst]
-        if r.get("port"):
-            parts += ["dst-port", str(r["port"])]
-        return [" ".join(parts)]
+        # ipfw 一条规则只能一个 from / 一个 to，多网段拆成多条。
+        out: list[str] = []
+        for src, dst in _cross(r.get("src"), r.get("dst")):
+            parts = ["ipfw", "add", act, proto,
+                     "from", src or "any", "to", dst or "any"]
+            if r.get("port"):
+                parts += ["dst-port", str(r["port"])]
+            out.append(" ".join(parts))
+        return out
 
     def del_cmds(self, r: dict) -> list[str]:
         return [f"ipfw delete {r.get('handle')}"]
@@ -744,8 +827,6 @@ class UfwBackend(FirewallBackend):
 
     def add_cmds(self, r: dict) -> list[str]:
         act = self._act(r)
-        src = "" if self._is_any(r.get("src")) else str(r.get("src")).strip()
-        dst = "" if self._is_any(r.get("dst")) else str(r.get("dst")).strip()
         port = str(r.get("port") or "").strip()
         proto = str(r.get("proto") or "").lower()
         if proto == "any":
@@ -754,23 +835,34 @@ class UfwBackend(FirewallBackend):
         if port:
             spec = port if (proto and "/" in port) else (
                 f"{port}/{proto}" if proto else port)
-        if src:
-            tail = f" to {dst or 'any'} port {port}" if port else (
-                f" to {dst}" if dst else "")
-            cmd = f"ufw {act} from {src}{tail}"
-            if port and proto:
-                cmd += f" proto {proto}"
-            return [cmd]
-        if dst and port:
-            cmd = f"ufw {act} to {dst} port {port}"
+        pairs = _cross(r.get("src"), r.get("dst"))
+        if pairs == [("", "")]:
+            # 两侧都不限：ufw 的简写形态（允许 22/tcp）
+            if spec:
+                return [f"ufw {act} {spec}"]
             if proto:
-                cmd += f" proto {proto}"
-            return [cmd]
-        if spec:
-            return [f"ufw {act} {spec}"]
-        if proto:
-            return [f"ufw {act} {proto}"]
-        return [f"ufw {act}"]
+                return [f"ufw {act} {proto}"]
+            return [f"ufw {act}"]
+        out: list[str] = []
+        # ufw 一条规则只表达一个 from/to，多网段只能拆成多条命令。
+        for src, dst in pairs:
+            if src:
+                tail = f" to {dst or 'any'} port {port}" if port else (
+                    f" to {dst}" if dst else "")
+                cmd = f"ufw {act} from {src}{tail}"
+                if port and proto:
+                    cmd += f" proto {proto}"
+                out.append(cmd)
+            elif dst and port:
+                cmd = f"ufw {act} to {dst} port {port}"
+                if proto:
+                    cmd += f" proto {proto}"
+                out.append(cmd)
+            elif dst:
+                out.append(f"ufw {act} to {dst}")
+            else:
+                out.append(f"ufw {act} {spec or proto}")
+        return out
 
     def del_cmds(self, r: dict) -> list[str]:
         num = str(r.get("handle") or "").strip()
@@ -895,16 +987,22 @@ class FirewalldBackend(FirewallBackend):
 
     def add_cmds(self, r: dict) -> list[str]:
         kind, val = self._target(r)
-        src = str(r.get("src") or "").strip()
-        if src and src.lower() != "any":
-            rule = (f"rule family=ipv4 source address={src} "
-                    + (f"port port={val.split('/')[0]} protocol={val.split('/')[1]} "
-                       if kind == "port" else "")
-                    + "accept")
-            return [f"firewall-cmd --permanent --add-rich-rule='{rule}'",
-                    "firewall-cmd --reload"]
-        return [f"firewall-cmd --permanent --add-{kind}={val}",
-                "firewall-cmd --reload"]
+        out: list[str] = []
+        # rich rule 的 family 原来是写死的 ipv4 —— 填 IPv6 必错。现在按地址
+        # 自己判；一个框里多个来源就生成多条 rich rule（一条一个 source）。
+        for src, _dst in _cross(r.get("src"), None):
+            if src:
+                fam = "ipv6" if ipaddr.family(src) == 6 else "ipv4"
+                rule = (f"rule family={fam} source address={src} "
+                        + (f"port port={val.split('/')[0]} "
+                           f"protocol={val.split('/')[1]} "
+                           if kind == "port" else "")
+                        + "accept")
+                out.append(f"firewall-cmd --permanent --add-rich-rule='{rule}'")
+            else:
+                out.append(f"firewall-cmd --permanent --add-{kind}={val}")
+        out.append("firewall-cmd --reload")
+        return out
 
     def del_cmds(self, r: dict) -> list[str]:
         name = str(r.get("_name") or r.get("raw") or "").strip()

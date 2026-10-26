@@ -78,6 +78,9 @@ def main() -> int:
         # 原始输出挪进分段页签（默认不显示，所以别拿 txt_* 量宽度）
         "tools": ["tbl_tool", "lbl_ping"],
         "sys": ["tbl_disk"],
+        # 远程管理：分四段（SSH 服务 / 密钥 / RDP / XRDP），段控件是常显的，
+        # 各段正文按需切换，所以只量段控件本身
+        "rmt": ["rm_seg"],
         # 证书控制台已内嵌成页内 Frame（不再是子进程 iframe），量它本身
         "vpn": ["vpn_console"],
         # 防火墙已并进安全中心；tbl_sec 是体检结果表，两个都要能测到
@@ -85,7 +88,14 @@ def main() -> int:
     }
     for key, attrs in expected.items():
         app.nav.select(key)
-        pump(app, 0.4)
+        # 固定 0.4 秒在这台机器上不够：上一页的懒加载/重排还没跑完，
+        # vpn 那页量出来是 21x1（内胆还没被 _apply_fit 撑开），
+        # 看上去像「页面没显示」，其实是没等够。改成等尺寸稳定。
+        for _ in range(30):
+            pump(app, 0.1)
+            _pg_ = app._pages.get(key)
+            if _pg_ is not None and _pg_.winfo_width() > 100:
+                break
         page = app._pages[key]
         mapped = visible_children(page)
         n = count_widgets(page)
@@ -198,6 +208,13 @@ def main() -> int:
     chk("[stderr]" in d2 and "Access denied" in d2, "stderr 也收进来了")
 
     # ---------------- 认证区联动（「连接与设备」是主机页的第二段）
+    # 前面的页面巡检把当前页留在了别处，这里必须先回到主机页 ——
+    # 否则 conn_box 挂在一个没显示的页里，row_auth 永远是「不可见」。
+    app.nav.select("hosts")
+    for _ in range(30):
+        pump(app, 0.1)
+        if app._pages["hosts"].winfo_ismapped():
+            break
     app.seg_hosts.select("conn")
     pump(app, 0.4)
     app.v_proto.set("local")

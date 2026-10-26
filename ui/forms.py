@@ -303,6 +303,34 @@ class FormDialog(tk.Toplevel):
             tx.pack(fill="x", expand=True)
             self._getters[f["key"]] = lambda t=tx: t.get("1.0", "end").rstrip("\n")
             self._widgets[f["key"]] = tx
+        elif kind == "iplist":
+            # 地址用「多行 + 地址库按钮」而不是单行输入框：一个框里经常要塞
+            # 十几条网段（IPv4 和 IPv6 混着），单行连自己填了什么都看不见。
+            tx = tk.Text(cell, height=int(f.get("lines", 3)), width=width,
+                         font=U.MONO_S, bd=0, relief="flat",
+                         highlightthickness=1,
+                         highlightbackground=U.T.input_border,
+                         highlightcolor=U.T.brand,
+                         bg=U.T.input_bg, fg=U.T.text, insertbackground=U.T.text,
+                         padx=U.px(7), pady=U.px(4), wrap="none")
+            tx.insert("1.0", str(val or ""))
+            tx.pack(side="left", fill="both", expand=True)
+            self._getters[f["key"]] = lambda t=tx: t.get("1.0", "end").strip()
+            self._widgets[f["key"]] = tx
+
+            def picklib(_e=None, t=tx):
+                from ui.ipick import IpPickDialog
+                got = IpPickDialog.open(
+                    self, initial=t.get("1.0", "end").strip(),
+                    title=f.get("lib_title") or "地址库")
+                if got is None:
+                    return
+                t.delete("1.0", "end")
+                t.insert("1.0", got)
+
+            U.RoundButton(cell, "地址库…", picklib, variant="secondary",
+                          font=U.FONT_XS, height=26, padx=10).pack(
+                side="left", padx=(U.px(6), 0), anchor="n")
         elif kind in ("file", "secret_file"):
             # 私钥/证书这类要填「路径」的字段。让用户手打一串
             # C:\Users\...\.ssh\id_ed25519 是折磨，还容易错一个字符查半天。
