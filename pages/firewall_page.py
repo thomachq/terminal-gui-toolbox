@@ -14,6 +14,7 @@ Windows 是 netsh，让用户先自己判断「我这是哪套」等于没做探
 """
 from __future__ import annotations
 
+import re
 import tkinter as tk
 
 import wbtui as U
@@ -42,7 +43,26 @@ _ACTIONS = {
     "netsh": [("allow", "允许"), ("block", "阻止")],
     "ipfw": [("allow", "允许"), ("deny", "拒绝")],
     "pf": [("pass", "放行"), ("block", "阻止")],
+    # 群晖只有 allow / deny 两种（配置文件里 policy 0 / 1）
+    "synofirewall": [("allow", "允许"), ("deny", "拒绝")],
 }
+
+
+def _port_hits(port_text, target) -> bool:
+    """端口框里有没有命中某个端口（支持 22 / 80,443 / 1000-2000）。"""
+    t = str(target or "").strip()
+    if not t.isdigit():
+        return False
+    for x in re.split(r"[,，\s]+", str(port_text or "")):
+        x = x.strip()
+        if not x:
+            continue
+        if x == t:
+            return True
+        a, sep, b = x.partition("-")
+        if sep and a.isdigit() and b.isdigit() and int(a) <= int(t) <= int(b):
+            return True
+    return False
 
 
 class FirewallPage:
@@ -52,7 +72,7 @@ class FirewallPage:
         pg.rowconfigure(1, weight=1)
 
         c = U.Card(pg, title="防火墙",
-                   hint="自动探测 ufw / firewalld / nftables / iptables / netsh")
+                   hint="自动探测 群晖 / ufw / firewalld / nftables / iptables / netsh")
         c.grid(row=0, column=0, sticky="we")
         b = c.body
         head = U.wframe(b, "card")
@@ -156,7 +176,7 @@ class FirewallPage:
         dev = self._effective_device()
         self.badge_fw.set("探测中", "mute")
         self.status.set_state("探测防火墙后端…")
-        self.lbl_fw.configure(text="正在试 ufw → firewalld → nftables → iptables …",
+        self.lbl_fw.configure(text="正在试 群晖 → ufw → firewalld → nftables → iptables …",
                               fg=U.T.text_dim)
 
         def work():
@@ -360,6 +380,27 @@ class FirewallPage:
                  "hint_below": True, "width": 32},
                 {"key": "comment", "label": "备注", "default": d("comment")},
             ]
+        if key == "synofirewall":
+            # 群晖的规则表里没有「目标 IP」这一列 —— 目标恒为 any。
+            # 所以这里刻意不出目标字段：出了就是骗人（填了存不进去）。
+            return [
+                {"key": "action", "label": "动作", "kind": "select",
+                 "options": acts, "default": (row or {}).get("action") or "allow"},
+                {"key": "proto", "label": "协议", "kind": "select",
+                 "options": [("tcp", "TCP"), ("udp", "UDP"), ("", "全部")],
+                 "default": (row or {}).get("proto") or "tcp"},
+                {"key": "port", "label": "端口", "default":
+                 "" if str(d("port")) in ("所有", "any") else d("port"),
+                 "hint": "22 或 80,443 或 1000-2000；留空 = 所有端口。"
+                         "群晖内置服务名（ssh / ntp 这类）请到 DSM 界面里选"},
+                {"key": "src", "label": "来源地址", "kind": "iplist", "lines": 2,
+                 "default": d("src") or "any",
+                 "hint": "群晖的规则只有来源 IP，目标恒为 any（DSM 界面也不显示"
+                         "目标这一列）。一条规则只带一个网段，填多个会拆成多条；"
+                         "IPv6 在群晖上没验证过，不写",
+                 "hint_below": True, "width": 32},
+                {"key": "comment", "label": "备注", "default": d("comment")},
+            ]
         if key == "ipfw":
             return [
                 {"key": "action", "label": "动作", "kind": "select",
@@ -443,17 +484,26 @@ class FirewallPage:
         self._fw_apply("edit" if editing else "add", data,
                        "规则已修改" if editing else "规则已添加", old=row)
 
-    @staticmethod
-    def _is_self_lockout(backend, row) -> bool:
-        """改的是 SSH 端口相关的拒绝规则时加一层危险提示。
+    def _is_self_lockout(self, backend, row) -> bool:
+        """改的是「会把自己关在门外」的规则时加一层危险提示。
 
-        不做严格判定（各后端字段差太多），只抓「22 端口 + 拒绝/丢弃」这种
-        最容易把自己关在门外的组合。
+        不做严格判定（各后端字段差太多），只抓两类：
+          · 拒绝**所有端口** —— 一定把自己断掉；
+          · 拒绝**当前这条 SSH 连接用的端口** —— 群晖这类设备 SSH 端口
+            经常被改成 2222/22222，只认 22 会漏（真机上就有一条 2222 的规则）。
         """
         try:
             port = str(row.get("port") or "")
             act = str(row.get("action") or "").lower()
-            if "22" in port and act in ("deny", "drop", "block", "reject"):
+            if act not in ("deny", "drop", "block", "reject"):
+                return False
+            if port.strip() in ("", "所有", "any", "全部"):
+                return True
+            try:
+                cur = str(getattr(self._active_session(), "port", "") or "22")
+            except Exception:  # noqa: BLE001
+                cur = "22"
+            if _port_hits(port, cur) or _port_hits(port, "22"):
                 return True
         except Exception:  # noqa: BLE001
             pass

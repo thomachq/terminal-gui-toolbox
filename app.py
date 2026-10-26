@@ -117,7 +117,7 @@ def _asset(name: str) -> Path:
 ICON_ICO = _asset("app.ico")
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.27"
+APP_VER = "1.0.28"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -2848,8 +2848,10 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         t = self._term_live()
         if t is None:
             return
+        # 智能体经 API 发的命令带 [API] 前缀，单独受「同步 API」开关管
+        by_api = str(display or "").startswith(API_CMD_TAG)
         try:
-            t.feed(display, rc, out, err, ms)
+            t.feed(display, rc, out, err, ms, by_api=by_api)
         except tk.TclError:
             pass
 

@@ -571,6 +571,7 @@ class SSHSession(BaseSession):
         self._root_shell = None     # sudo -i 之后的 root 持久 shell（见 elevate_root）
         self.enabled = False        # 网络设备是否已进 enable
         self.vendor = ""            # detect 之后由 bind_device 补上，关分页要用
+        self._sudo_n: bool | None = None   # 免密 sudo 探测结果（None=还没探）
 
     # ---------------- 连接
     def connect(self, host: str, port: int = 22, user: str = "",
@@ -610,6 +611,8 @@ class SSHSession(BaseSession):
         self.client = cli
         self.host, self.port, self.user = host, int(port), user
         self.label = f"{user}@{host}"
+        # 换了连接就重新判一次「免密 sudo 能不能用」（上一台设备的结果不算）
+        self._sudo_n = None
 
     @property
     def alive(self) -> bool:
@@ -707,6 +710,22 @@ class SSHSession(BaseSession):
     def admin_kind(self) -> str:
         return "enable" if self.host_kind == "network" else "sudo"
 
+    def sudo_n_ok(self) -> bool:
+        """这台设备能不能免密 sudo（探一次就记住）。
+
+        群晖的 administrators 组默认是 NOPASSWD，`sudo -n` 直接过 ——
+        如果还按「没填密码就不让提权」来判，用户在群晖上会遇到
+        「能读规则、一条也改不了」，而且根本不知道该填什么密码。
+        每台设备只探一次，探不到就退回要密码那条老路。
+        """
+        if self._sudo_n is None:
+            try:
+                rc, _o, _e = self.run("sudo -n true", timeout=8)
+                self._sudo_n = (rc == 0)
+            except Exception:  # noqa: BLE001
+                self._sudo_n = False
+        return bool(self._sudo_n)
+
     def run_admin(self, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
         if self.host_kind == "network":
             if not self.enabled:
@@ -719,6 +738,9 @@ class SSHSession(BaseSession):
             return 0, out, ""
         if self.is_root or self.user == "root":
             return self.run_traced(cmd, timeout)
+        # 顺序固定：先试免密 sudo，再要密码。别假设 sudo 一定要密码。
+        if self.sudo_n_ok():
+            return self.run_traced(f"sudo -n sh -c {shlex.quote(cmd)}", timeout)
         if not self.sudo_pw:
             raise NeedElevation(
                 "这一步要 root 权限：请提供 sudo 密码。",
@@ -860,6 +882,10 @@ class SSHSession(BaseSession):
         if self.is_root or self.user == "root":
             return True, ""
         if self.sudo_pw:
+            return True, ""
+        # 免密 sudo：群晖的 administrators 组默认就是 NOPASSWD，
+        # 不先探一次的话，用户在群晖上会看到「需要 sudo 密码」却无密码可填。
+        if self.sudo_n_ok():
             return True, ""
         return False, "需要 sudo 密码或 root 登录"
 

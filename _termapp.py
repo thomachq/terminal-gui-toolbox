@@ -84,6 +84,10 @@ def main():
     chk(ps.endswith("> ") or ps.endswith("$ "), "提示符成型", ps)
 
     print("\n4. 敲命令")
+    # 默认形态是「行内」（不是输入框）：v_in 那时候是隐藏的，_submit 取的是
+    # 正文里的内容。拿 v_in 注入等于什么都没输 —— 所以这里显式切到输入框模式。
+    w._set_mode("box")
+    pump(a, 0.3)
     w.v_in.set("echo from-terminal")
     w._submit()
     pump(a, 2.2)
@@ -126,6 +130,26 @@ def main():
     body2 = w.text.get("1.0", "end")
     chk("muted-agent" not in body2, "关掉同步后不再刷屏", body2.strip()[:40])
     w._sync.set(True)
+
+    # 只关「同步 API」：智能体的命令闭嘴，自己敲的照常
+    chk(hasattr(w, "chk_api"), "顶栏有「同步 API」开关")
+    w._sync_api.set(False)
+    w.clear()
+    a.api_pool.exec(conn.id, "echo api-muted")
+    pump(a, 1.6)
+    chk("api-muted" not in w.text.get("1.0", "end"),
+        "关掉「同步 API」后智能体的命令不显示",
+        w.text.get("1.0", "end").strip()[:40])
+    w.v_in.set("echo self-visible")
+    w._submit()
+    pump(a, 2.2)
+    chk("self-visible" in w.text.get("1.0", "end"),
+        "同一时刻自己敲的命令照常显示")
+    w._sync_api.set(True)
+    w.clear()
+    a.api_pool.exec(conn.id, "echo api-back")
+    pump(a, 1.6)
+    chk("api-back" in w.text.get("1.0", "end"), "重新勾上就恢复同步")
     a.api_pool.close(conn.id)
 
     print("\n8. 断开联动")

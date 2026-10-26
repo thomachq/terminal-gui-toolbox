@@ -945,6 +945,23 @@ class KVGrid(tk.Frame):
         self.bg_role = bg_role
         self._font = None
         self.bind("<Configure>", self._on_configure)
+        # 切主题要跟着重画：这一格是 tk.Frame（不是 ttk），底色在 __init__
+        # 里取值之后就再也不变了 —— 暗色下会留一条整行白底，里面每个 label
+        # 又是深色的，看着像「文字浮在白条上」。label 由 U.wlabel 自己注册，
+        # Frame 得在这里补。
+        U.register(self, self._paint)
+
+    def _paint(self) -> None:
+        try:
+            self.configure(bg=U.T.card)
+        except tk.TclError:
+            return
+        for w in self.winfo_children():
+            if isinstance(w, tk.Frame):
+                try:
+                    w.configure(bg=U.T.card)
+                except tk.TclError:
+                    pass
 
     # ------------------------------------------------ 自适应列数
     def _measure(self, text: str) -> int:

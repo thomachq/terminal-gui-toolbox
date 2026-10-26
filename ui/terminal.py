@@ -150,6 +150,12 @@ class _TermShell:
         self.seg_mode.pack(side="right", padx=(0, U.px(10)))
         # 头部控件多，窄的时候先被挤掉的是最左边那几个 —— 所以文案都压到最短，
         # 「输入方式」这种一看分段控件就懂的标签干脆不要。
+        # 智能体通过 API 跑的命令单独一个开关：很多人只想看自己敲的，
+        # 不想被智能体的命令刷屏；反过来也有只想看智能体在干什么的。
+        # 「同步命令」是总线：关掉它，两个都不显示。
+        self._sync_api = tk.BooleanVar(value=True)
+        self.chk_api = U.Check(head, "同步 API", self._sync_api, font=U.FONT_XS)
+        self.chk_api.pack(side="right", padx=(0, U.px(10)))
         self.chk_sync = U.Check(head, "同步命令", self._sync, font=U.FONT_XS)
         self.chk_sync.pack(side="right", padx=(0, U.px(10)))
         # AI 活动流：助手调模型、发命令都往这里写。默认开 —— 这就是
@@ -507,9 +513,18 @@ class _TermShell:
             pass
 
     # ------------------------------------------------------------ 旁路
-    def feed(self, display: str, rc: int, out: str, err: str, ms: int) -> None:
-        """主程序执行完一条命令后由 tracer 调进来。"""
+    def feed(self, display: str, rc: int, out: str, err: str, ms: int,
+             by_api: bool = False) -> None:
+        """主程序 / 智能体执行完一条命令后由 tracer 调进来。
+
+        `by_api=True` 表示这条是智能体通过 HTTP API 发的（tracer 那边已经
+        加了 `[API] ` 前缀）。两个开关的关系：
+          「同步命令」是总线 —— 关掉它，人和智能体的都不显示；
+          「同步 API」只管子集 —— 关掉它，自己敲的照常显示。
+        """
         if not self._sync.get():
+            return
+        if by_api and not self._sync_api.get():
             return
         if self._own or self._is_own(display):
             return

@@ -637,6 +637,454 @@ class NetshBackend(FirewallBackend):
         return "Windows 防火墙规则写在注册表里，重启后仍在"
 
 
+# ==================================================================== Synology
+# 群晖的防火墙**不是靠 iptables 持久化的**。DSM 界面里配的规则写在
+# /usr/syno/etc/firewall.d/<n>.json，再由 synofirewall 翻译成 iptables 规则；
+# 直接 `iptables -A` 加进去的那条只活到下次重载/重启 —— 用户在 DSM 里配的
+# 规则重启还在，靠的就是这份 JSON。所以这里改的是配置文件本身。
+#
+# 真机（DSM 7.2 / geminilake_224+）逐字段核对过的语义：
+#   policy     0=允许  1=拒绝
+#   protocol   1=tcp  2=udp  3=全部  4=其它（实测生成 -p esp/ah，只读）
+#   ipDirect   恒为 1。**群晖 NAS 的规则只有来源 IP，没有目标 IP**，
+#              目标恒为 any（DSM 的规则表里连这一列都不显示）。
+#   ipGroup    0=所有 IP  1=自定义（配 ipList）  3/5=位置/系统保留（只读）
+#   ipType     0=自定义 IPv4  2=位置组
+#   portGroup  0=所有端口  1=自定义端口
+#   portList   端口字符串，或群晖内置服务名（"ssh" / "ntp" / "cifs"…）
+# ipList 是「地址 + 掩码」两元素形态：["192.168.3.0","255.255.255.0"]，
+# 单主机就是 ["1.2.3.4"]。
+#
+# 写流程（一条 shell 里做完，不留中间态）：
+#   sha256 对不上 → 停（有人刚在 DSM 界面改过）
+#   → cp -p 备份 → python3 改 JSON → jq 校验 → --update + --reload
+#   → --enum 数一遍，规则集空了就拿备份还原再 reload
+_SYNO_DIR = "/usr/syno/etc/firewall.d"
+_SYNO_BIN = "/usr/syno/bin/synofirewall"
+_SYNO_PROTO = {1: "tcp", 2: "udp", 3: ""}       # 空串 = 协议不限
+_PROTO_TO_SYNO = {"tcp": 1, "udp": 2, "any": 3, "": 3, "all": 3}
+_SYNO_ALLOW = ("allow", "accept", "pass")
+
+
+def _mask_to_prefix(addr: str, mask: str) -> int | None:
+    """"255.255.255.0" → 24。掩码不连续或不合法时给 None（按原文显示）。"""
+    import ipaddress
+    try:
+        return ipaddress.IPv4Network(f"{addr}/{mask}", strict=False).prefixlen
+    except ValueError:
+        return None
+
+
+def _syno_iplist(cidr: str) -> list[str]:
+    """CIDR → 群晖的 ["地址","掩码"] 形态（/32 只留地址）。"""
+    import ipaddress
+    if not cidr:
+        return []
+    try:
+        n = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return [cidr]
+    if n.version != 4:
+        return [cidr]
+    if n.prefixlen == 32:
+        return [str(n.network_address)]
+    return [str(n.network_address), str(n.netmask)]
+
+
+def _plain_ports(text) -> list[str]:
+    """端口框 → 群晖 portList（逗号/空格/中文逗号都认）。"""
+    out = []
+    for x in re.split(r"[,，\s]+", str(text or "").strip()):
+        if x:
+            out.append(x)
+    return out
+
+
+def _ports_are_plain(plist) -> bool:
+    """全是数字/范围才算「能安全改写」；服务名改写后语义会变。"""
+    return all(re.fullmatch(r"\d{1,5}(-\d{1,5})?", str(x)) for x in plist)
+
+
+class SynoBackend(FirewallBackend):
+    key = "synofirewall"
+    label = "群晖防火墙（配置文件）"
+
+    def __init__(self, session=None, device=None):
+        super().__init__(session, device)
+        self.docs: dict[str, dict] = {}
+        self.shas: dict[str, str] = {}
+        self.profiles: dict[str, str] = {}      # 文件名 → profile 名
+        self.cur_profile = ""
+        self.cur_file = ""
+        self.fw_on = True
+
+    # ---------------- 探测 / 读
+    def probe_cmd(self) -> str:
+        # 注意是 `-f` 不是 `-x`：真机上 /usr/syno/bin/synofirewall 的权限是
+        # `-r-xr-x---`（root:root），普通管理员账号**不可执行**，用 test -x
+        # 会让整条探测短路，群晖永远认不出来。文件在不在，stat 一下就够。
+        return (f"test -f {_SYNO_BIN} && test -d {_SYNO_DIR} && "
+                f"echo SYNO_FW_OK && cat {_SYNO_DIR}/firewall_settings.json "
+                "2>/dev/null")
+
+    def read_cmd(self) -> str:
+        return f"""D={_SYNO_DIR}
+echo '@@@TB-SETTINGS'
+cat "$D/firewall_settings.json" 2>/dev/null
+for f in "$D"/*.json; do
+  [ -f "$f" ] || continue
+  case "$f" in *firewall_settings*) continue ;; esac
+  echo "@@@TB-FILE $(basename "$f") $(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"
+  cat "$f" 2>/dev/null
+done"""
+
+    @staticmethod
+    def _blocks(text: str) -> dict:
+        """@@@TB-XXX 分节 → {节名: 正文}。JSON 是多行的，只能按行切。"""
+        got: dict[str, str] = {}
+        cur, buf = None, []
+        for ln in (text or "").splitlines():
+            if ln.startswith("@@@TB-SETTINGS"):
+                if cur:
+                    got[cur] = "\n".join(buf)
+                cur, buf = "@@settings", []
+            elif ln.startswith("@@@TB-FILE "):
+                if cur:
+                    got[cur] = "\n".join(buf)
+                cur, buf = ln[len("@@@TB-FILE "):].strip(), []
+            else:
+                buf.append(ln)
+        if cur:
+            got[cur] = "\n".join(buf)
+        return got
+
+    def parse(self, text: str) -> list[dict]:
+        blocks = self._blocks(text)
+        self.docs, self.shas, self.profiles = {}, {}, {}
+        settings = {}
+        try:
+            settings = json.loads(blocks.get("@@settings") or "{}")
+        except ValueError:
+            settings = {}
+        self.cur_profile = str(settings.get("profile") or "")
+        self.fw_on = bool(settings.get("status"))
+
+        rows: list[dict] = []
+        for head, body in blocks.items():
+            if head == "@@settings" or not (body or "").strip():
+                continue
+            parts = head.split(" ", 1)
+            fname = parts[0]
+            sha = parts[1].strip() if len(parts) > 1 else ""
+            self.shas[fname] = sha
+            try:
+                doc = json.loads(body)
+            except ValueError:
+                continue
+            if not isinstance(doc, dict):
+                continue
+            self.docs[fname] = doc
+            prof = str(doc.get("name") or fname)
+            self.profiles[fname] = prof
+            rules = doc.get("rules") or {}
+            if not isinstance(rules, dict):
+                continue
+            for key, arr in rules.items():
+                if not isinstance(arr, list):
+                    continue
+                for i, it in enumerate(arr):
+                    if isinstance(it, dict):
+                        rows.append(self._row(fname, prof, key, i, it))
+        # 当前 profile 的文件：按 name 找，别按文件名猜（真机上 1.json 叫
+        # "default"、2.json 叫 "custom"，文件名跟名字毫无关系）
+        self.cur_file = ""
+        for fname, prof in self.profiles.items():
+            if prof == self.cur_profile:
+                self.cur_file = fname
+                break
+        if not self.cur_file and self.profiles:
+            self.cur_file = sorted(self.profiles)[0]
+        return rows
+
+    def _row(self, fname: str, prof: str, key: str, idx: int,
+             it: dict) -> dict:
+        proto = int(it.get("protocol") or 0)
+        policy = int(it.get("policy") or 0)
+        group = int(it.get("ipGroup") or 0)
+        itype = int(it.get("ipType") or 0)
+        pgroup = int(it.get("portGroup") or 0)
+        iplist = [str(x) for x in (it.get("ipList") or [])]
+        plist = [str(x) for x in (it.get("portList") or [])]
+        name = str(it.get("name") or "")
+
+        if group in (3, 5) and not iplist:
+            src = f"（位置组 {group}）"
+        elif len(iplist) >= 2:
+            pfx = _mask_to_prefix(iplist[0], iplist[1])
+            src = f"{iplist[0]}/{pfx}" if pfx is not None else \
+                f"{iplist[0]}/{iplist[1]}"
+        elif iplist:
+            src = iplist[0]
+        else:
+            src = "any"
+
+        port = ",".join(plist) if plist else "所有"
+        # 只读判定只用**实证过的**依据。portGroup 有 0/1/2/3 四种取值，
+        # 其中 0 和 3 都表示「所有端口」（真机上 3 配空 portList 的那些
+        # 规则，GUI 里显示的就是「所有」）—— 所以不能拿 portGroup 当门槛，
+        # 要看 portList 里到底装的是什么。
+        why = ""
+        if proto not in (1, 2, 3):
+            why = f"协议 {proto}（IPSec/ESP 一类）未验证，只读"
+        elif group == 3:
+            why = "来源是位置（GeoIP）规则，只读"
+        elif group == 5 and not iplist:
+            why = "来源标记为 5（系统保留/全部），语义未验证，只读"
+        elif itype not in (0, 2):
+            why = f"来源类型 {itype} 未验证，只读"
+        elif not _ports_are_plain(plist):
+            why = "端口用的是群晖内置服务名，改写会丢服务语义"
+
+        action = "allow" if policy == 0 else "deny"
+        proto_txt = _SYNO_PROTO.get(proto, f"其它({proto})")
+        raw = (f"[{prof}] {'允许' if policy == 0 else '拒绝'} "
+               f"{proto_txt or '全部'} {port} ← {src}")
+        row = {
+            "ref": f"syno:{fname}:{key}:{idx}",
+            "family": "ip", "table": "filter", "handle": "",
+            "chain": "所有界面" if key == "global" else key,
+            "pos": idx + 1, "action": action, "proto": proto_txt,
+            "src": src, "dst": "any",          # 群晖没有目标 IP
+            "port": port, "iface": "", "comment": name, "raw": raw,
+            "enabled": bool(it.get("enable")), "editable": not why,
+            "persistent": fname, "_tone": _tone(action),
+            "_syno_file": fname, "_syno_key": key, "_syno_idx": idx,
+            "_syno_rule": json.loads(json.dumps(it)),
+            "_readonly_why": why,
+        }
+        return row
+
+    def status_cmd(self) -> str:
+        return f"cat {_SYNO_DIR}/firewall_settings.json 2>/dev/null"
+
+    def persist_note(self) -> str:
+        if not self.cur_file:
+            return f"规则存在 {_SYNO_DIR}/*.json"
+        state = "已启用" if self.fw_on else "当前是关闭状态"
+        # 界面里只留 70 个字符，写太长会被硬截成半句话
+        return (f"{self.cur_file}（profile {self.cur_profile or '?'}，{state}）· "
+                "跟 DSM 界面同一份配置，重启不丢 · 改完自动 reload")
+
+    # ---------------- 校验
+    def validate(self, r: dict) -> str | None:
+        # 这条最要紧：用户在界面上填了目标 IP，群晖没有对应字段。
+        # 静默丢掉会让人以为目标限制生效了，所以直接拒绝并说清楚。
+        if _split_pairs(r.get("dst")):
+            return ("群晖的防火墙规则只有「来源 IP」，配置文件里没有目标 IP "
+                    "字段（DSM 界面连这一列都不显示，目标恒为 any）。"
+                    "要按目标地址限制，请用 iptables / nftables / firewalld，"
+                    "或者把规则改成按来源收窄。")
+        ok, bad = ipaddr.split(r.get("src"))
+        if bad:
+            return (f"来源地址写错了：{bad[0]}"
+                    "（IPv4 如 192.168.1.0/24）")
+        for c in ok:
+            if c != "any" and ipaddr.family(c) == 6:
+                return ("群晖配置文件里的 IPv6 规则用的是另一套 ipType，"
+                        "没在真机验证过，不替你猜。IPv6 请用 iptables / nftables。")
+        n = len([c for c in ok if c != "any"])
+        if n > _MAX_RULES:
+            return (f"来源有 {n} 个网段，超过单条规则上限 {_MAX_RULES}，"
+                    "请分成多条规则")
+        port = str(r.get("port") or "").strip()
+        if port and not re.fullmatch(r"[\d,，\s\-]+", port):
+            return ("端口只填数字（22 / 80,443 / 1000-2000）；"
+                    "群晖内置服务名请在 DSM 界面里选")
+        proto = str(r.get("proto") or "").lower()
+        if proto not in _PROTO_TO_SYNO:
+            return f"群晖只支持 tcp / udp / 全部，不支持 {proto}"
+        act = str(r.get("action") or "").lower()
+        if act not in _SYNO_ALLOW + ("deny", "drop", "block", "reject"):
+            return f"群晖只支持「允许 / 拒绝」，不支持 {act}"
+        if not self.cur_file:
+            return "没读到群晖的防火墙配置文件（需要 root 权限读 /usr/syno/etc/firewall.d）"
+        return None
+
+    # ---------------- 写
+    def _rule_item(self, r: dict, cidr: str, keep: dict | None = None) -> dict:
+        port = _plain_ports(r.get("port"))
+        act = str(r.get("action") or "").lower()
+        pgroup = 1 if port else 0
+        # 编辑「所有端口」的规则时沿用原来的 portGroup：真机上 0 和 3 都
+        # 表示「所有端口」，改写成一个值可能让群晖的语义变掉。
+        if keep is not None and not port:
+            old_pg = int(keep.get("portGroup") or 0)
+            if old_pg in (0, 3):
+                pgroup = old_pg
+        return {
+            "adapterDirect": 1, "blLog": False,
+            "chainList": ["FORWARD_FIREWALL", "INPUT_FIREWALL"],
+            "enable": True, "ipDirect": 1,
+            "ipGroup": 1 if cidr else 0,
+            "ipList": _syno_iplist(cidr),
+            "ipType": 0, "labelList": [],
+            "name": str(r.get("comment") or ""),
+            "policy": 0 if act in _SYNO_ALLOW else 1,
+            "portDirect": 0,
+            "portGroup": pgroup,
+            "portList": port,
+            "protocol": _PROTO_TO_SYNO.get(
+                str(r.get("proto") or "").lower(), 3),
+            "ruleIndex": 0, "table": "filter",
+        }
+
+    def add_cmds(self, r: dict) -> list[str]:
+        err = self.validate(r)
+        if err:
+            raise FirewallError(err)
+        srcs = [c for c, _f in _split_pairs(r.get("src"))] or [""]
+        items = [self._rule_item(r, s) for s in srcs]
+        return [self._write_cmd("add", key="global",
+                                items=items, pos=len(self._rows_global()))]
+
+    def set_cmds(self, old: dict, new: dict) -> list[str]:
+        """就地替换，不走「先删后加」—— 中间态会让那条规则短暂消失。"""
+        err = self.validate(new)
+        if err:
+            raise FirewallError(err)
+        if not old.get("editable"):
+            why = old.get("_readonly_why") or "这条规则只读"
+            raise FirewallError(
+                f"{why}；要改请在 DSM 界面里改，或在下面「新增规则」重建一条。")
+        srcs = [c for c, _f in _split_pairs(new.get("src"))] or [""]
+        key = old.get("_syno_key") or "global"
+        idx = int(old.get("_syno_idx") or 0)
+        keep = old.get("_syno_rule")
+        keep = keep if isinstance(keep, dict) else None
+        if len(srcs) > 1:
+            # 一条群晖规则只带一个来源网段，多来源只能拆：先删旧的再加多条
+            return (self._write_cmd("del", key=key, idx=idx)
+                    + [self._write_cmd(
+                        "add", key=key,
+                        items=[self._rule_item(new, s, keep=keep) for s in srcs],
+                        pos=idx)])
+        return [self._write_cmd("set", key=key, idx=idx,
+                                rule=self._rule_item(new, srcs[0], keep=keep))]
+
+    def del_cmds(self, r: dict) -> list[str]:
+        if r.get("_syno_file") is None or r.get("_syno_idx") is None:
+            raise FirewallError("这条规则不是从群晖配置文件里读出来的，无法确定位置")
+        return [self._write_cmd("del", key=r.get("_syno_key") or "global",
+                                idx=int(r["_syno_idx"]))]
+
+    def toggle_cmds(self, r: dict, enable: bool) -> list[str]:
+        if r.get("_syno_idx") is None:
+            raise FirewallError("这条规则不是从群晖配置文件里读出来的")
+        return [self._write_cmd("toggle", key=r.get("_syno_key") or "global",
+                                idx=int(r["_syno_idx"]), enable=bool(enable))]
+
+    def move_cmds(self, r: dict, delta: int) -> list[str]:
+        i = int(r.get("_syno_idx") or 0)
+        arr = self._rows_global(r.get("_syno_key") or "global")
+        j = i + (1 if delta > 0 else -1)
+        if j < 0:
+            raise FirewallError("已经在最前面了")
+        if j >= len(arr):
+            raise FirewallError("已经在最后面了")
+        return [self._write_cmd("move", key=r["_syno_key"],
+                                idx=i, delta=(1 if delta > 0 else -1))]
+
+    def _rows_global(self, key: str = "global") -> list:
+        doc = self.docs.get(self.cur_file) or {}
+        rules = doc.get("rules") or {}
+        arr = rules.get(key) if isinstance(rules, dict) else None
+        return arr if isinstance(arr, list) else []
+
+    def _write_cmd(self, op: str, key: str = "global", items=None,
+                   idx: int | None = None, rule=None, pos: int | None = None,
+                   enable: bool = True, delta: int = 0) -> str:
+        import base64
+        import shlex
+
+        fname = self.cur_file or "1.json"
+        path = f"{_SYNO_DIR}/{fname}"
+        sha = self.shas.get(fname, "")
+        payload = {"op": op, "key": key, "items": items or [],
+                   "idx": -1 if idx is None else int(idx),
+                   "rule": rule, "pos": pos, "enable": bool(enable),
+                   "delta": int(delta)}
+        b64 = base64.b64encode(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode()
+        # 远端脚本用 heredoc 传：里面的引号、中文都不用转义
+        script = f"""set -e
+F={shlex.quote(path)}
+CUR=$(sha256sum "$F" 2>/dev/null | cut -d' ' -f1)
+if [ -n {shlex.quote(sha)} ] && [ "$CUR" != {shlex.quote(sha)} ]; then
+  echo "TB:STALE $F 在读取之后被改过（有人刚在 DSM 界面里动过规则），先刷新规则再试"
+  exit 9
+fi
+B="$F.tb-bak-$(date +%Y%m%d-%H%M%S)"
+cp -p "$F" "$B" || {{ echo "TB:NOBACKUP 备份失败，不动配置"; exit 8; }}
+python3 - "$F" {shlex.quote(b64)} <<'TBEOF'
+import base64, json, os, re, sys
+p, b64 = sys.argv[1], sys.argv[2]
+d = json.load(open(p, encoding="utf-8"))
+a = json.loads(base64.b64decode(b64).decode("utf-8"))
+key = a.get("key") or "global"
+arr = d.setdefault("rules", {{}}).setdefault(key, [])
+op, i = a["op"], a["idx"]
+if op == "add":
+    pos = a.get("pos")
+    pos = len(arr) if pos is None or pos < 0 or pos > len(arr) else pos
+    for it in a["items"]:
+        arr.insert(pos, it)
+        pos += 1
+elif op in ("del", "set", "toggle"):
+    if not (0 <= i < len(arr)):
+        raise SystemExit("TB:INDEX 规则位置对不上（配置可能刚被改过），刷新后再试")
+    if op == "del":
+        arr.pop(i)
+    elif op == "set":
+        arr[i] = a["rule"]
+    else:
+        arr[i]["enable"] = bool(a["enable"])
+elif op == "move":
+    j = i + int(a["delta"])
+    if not (0 <= i < len(arr) and 0 <= j < len(arr)):
+        raise SystemExit("TB:EDGE 已经到头了")
+    arr[i], arr[j] = arr[j], arr[i]
+else:
+    raise SystemExit("TB:OP 不认识的操作 " + op)
+tmp = p + ".tb-tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    s = json.dumps(d, indent=3, ensure_ascii=False)
+    s = re.sub(r'^(\\s*)"([^"]+)": ', r'\\1"\\2" : ', s, flags=re.M)
+    f.write(s + "\\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, p)
+print("TB:WROTE")
+TBEOF
+if ! (jq -e . "$F" >/dev/null 2>&1 || python3 -c 'import json,sys;json.load(open(sys.argv[1]))' "$F"); then
+  cp -p "$B" "$F"
+  echo "TB:BADJSON 写出的 JSON 不合法，已还原 $B"
+  exit 7
+fi
+{_SYNO_BIN} --update >/dev/null 2>&1 || true
+{_SYNO_BIN} --reload >/dev/null 2>&1 || true
+sleep 1
+N=$({_SYNO_BIN} --enum IPV4 2>/dev/null | grep -c '^-t filter\\|^-A ' || true)
+if [ "${{N:-0}}" -lt 1 ]; then
+  cp -p "$B" "$F"
+  {_SYNO_BIN} --update >/dev/null 2>&1 || true
+  {_SYNO_BIN} --reload >/dev/null 2>&1 || true
+  echo "TB:EMPTY 重载后规则集空了，已还原 $B"
+  exit 6
+fi
+echo "TB:OK n=$N backup=$B"
+"""
+        return script
+
+
 # ==================================================================== pf / ipfw
 class PfBackend(FirewallBackend):
     key = "pf"
@@ -1025,12 +1473,16 @@ BACKEND_CLASSES = {
     "netsh": NetshBackend,
     "pf": PfBackend,
     "ipfw": IpfwBackend,
+    "synofirewall": SynoBackend,
 }
 
 # 优先级 = 「哪个更能代表这台设备真正在用的防火墙」。
 # 网络设备上不能一股脑全跑（一条命令卡 10 秒），所以 detect() 是逐个试、
 # 一探到同档里优先级最高的就停。
-PROBE_ORDER = ("ufw", "firewalld", "nftables", "iptables", "netsh", "pf", "ipfw")
+# 群晖排最前：它底层也是 iptables，但持久化在 firewall.d/*.json 里 ——
+# 认出群晖就别去改 iptables 了，那改完重启就没了。
+PROBE_ORDER = ("synofirewall", "ufw", "firewalld", "nftables", "iptables",
+               "netsh", "pf", "ipfw")
 
 
 def backend_class(key: str):
@@ -1045,7 +1497,10 @@ def candidates(device) -> list[FirewallBackend]:
         return [PfBackend()]
     if fam == "freebsd":
         return [PfBackend(), IpfwBackend()]
-    return [UfwBackend(), FirewalldBackend(), NftBackend(), IptablesBackend()]
+    # 群晖排第一个：非群晖机器上这条探测是 `test -x ... && ...`，立刻返回
+    # 非 0，代价可以忽略；是群晖就必须由它接管，不能落到裸 iptables。
+    return [SynoBackend(), UfwBackend(), FirewalldBackend(), NftBackend(),
+            IptablesBackend()]
 
 
 # ------------------------------------------------------------------ 探测
@@ -1108,6 +1563,17 @@ def rank(key: str, rc: int, text: str) -> tuple[int, str]:
             return 2, "ipfw 有规则"
         if rc == 0 and t:
             return 1, "ipfw 可用"
+        return 0, ""
+    if key == "synofirewall":
+        # 只有「二进制 + 配置目录 + 设置文件」三样都在才算 —— 光有
+        # /usr/syno/bin/synofirewall 却读不到 firewall.d 的机器不能接管。
+        if "SYNO_FW_OK" in t:
+            prof = ""
+            m = re.search(r'"profile"\s*:\s*"([^"]+)"', t)
+            if m:
+                prof = m.group(1)
+            return 2, (f"群晖 DSM 防火墙 · profile {prof}" if prof
+                       else "群晖 DSM 防火墙（配置文件）")
         return 0, ""
     return 0, ""
 

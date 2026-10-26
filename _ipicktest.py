@@ -16,6 +16,23 @@ sys.path.insert(0, str(HERE))
 import wbtui as U  # noqa: E402
 from core import ipaddr, iplib  # noqa: E402
 
+# 选一整个省（广东 1954 条）会弹「确认要下发这么多？」。真人测试要点一下，
+# 自动化里没人点 → 整个脚本卡死在 askokcancel 上（实测 150 秒超时、一行
+# 输出都没有，很容易误判成「代码卡死」）。这里替掉它，同时记下弹过几次，
+# 顺带把「该弹的时候真的弹了」也断言掉。
+import tkinter.messagebox as _MB  # noqa: E402
+
+_WARN_CALLS = []
+_real_ask = _MB.askokcancel
+
+
+def _fake_ask(title="", message="", **kw):
+    _WARN_CALLS.append(title)
+    return True
+
+
+_MB.askokcancel = _fake_ask
+
 _p = _f = _s = 0
 
 
@@ -129,8 +146,11 @@ if has_prov:
     dlg._picked[gd["_key"]] = gd["_item"]
     dlg._render()
     root.update()
+    _WARN_CALLS.clear()
     dlg._ok()
     root.update()
+    chk(_WARN_CALLS and "确认" in _WARN_CALLS[-1],
+        "超过 200 条时弹了确认框（不是闷声下发）", _WARN_CALLS[-1:])
     chk(dlg.result is not None, "点「加入」产出结果")
     lines = [x for x in (dlg.result or "").splitlines() if x.strip()]
     chk(len(lines) > 0, f"广东展开 {len(lines)} 条", str(len(lines)))
