@@ -25,8 +25,17 @@ from datetime import date
 from email.utils import formatdate
 from pathlib import Path
 
-VER = "1.0.29"
 HERE = Path(__file__).resolve().parent
+
+# 版本号只认 app.py 的 APP_VER（import 出来），不再手抄 —— v1.0.30 那次
+# 忘了改这里，四个包里有三个是 1.0.30、portable 还叫 1.0.29（静默错版）。
+import re as _re
+
+_m = _re.search(r'APP_VER\s*=\s*"([\d.]+)"',
+                (HERE / "app.py").read_text(encoding="utf-8"))
+if not _m:
+    raise SystemExit("[error] 从 app.py 读不到 APP_VER")
+VER = _m.group(1)
 OUT = HERE / "_release" / f"v{VER}"
 STAMP = (2026, 10, 24, 17, 0, 0)
 

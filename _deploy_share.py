@@ -25,8 +25,14 @@ OLD = DST / "old"
 def ver() -> str:
     if len(sys.argv) > 1:
         return sys.argv[1].lstrip("v")
-    m = re.search(r'^VER\s*=\s*"([^"]+)"', (ROOT / "_pack_release.py").read_text(
-        encoding="utf-8"), re.M)
+    src = (ROOT / "_pack_release.py").read_text(encoding="utf-8")
+    # _pack_release 的 VER 现在是从 app.py 的 APP_VER 算出来的（v1.0.30 起
+    # 不再手抄），两处都试：先认字面量，认不到就从 app.py 直接拿。
+    m = re.search(r'^VER\s*=\s*"([^"]+)"', src, re.M)
+    if m:
+        return m.group(1)
+    m = re.search(r'APP_VER\s*=\s*"([\d.]+)"',
+                  (ROOT / "app.py").read_text(encoding="utf-8"))
     return m.group(1) if m else ""
 
 
