@@ -37,6 +37,28 @@ MAX_OUT_CHARS = 200_000        # 单条命令回传上限，防止把智能体�
 API_CMD_TAG = "[API] "
 
 
+def _auth_of(spec: dict) -> str:
+    """这次连接用哪种认证：**以请求里声明的为准**。
+
+    原来的写法是 `"password" if spec.get("password") else "key"` —— 只要有密码
+    就走密码认证，私钥形同被丢弃。实测（2026-10-27，飞牛OS 192.168.3.48）：
+    那条档案是「私钥 + 口令」认证，但里面顺手存了账户登录密码（备 sudo 用），
+    于是 API 拿密码去连，而该机 sshd 上密码认证是关的 → 400「认证失败」；
+    同一把私钥用 paramiko 直连完全正常。用户看到的就是「工具连不上，但手动
+    ssh 能连」，而且报错说的是「检查用户名/密码/私钥」，把人引向查密钥。
+
+    优先级的道理：
+      1. 请求里写了 `auth` 就照它办（那是档案里用户自己选的）；
+      2. 没写就看 `key_path` —— 指定了私钥文件就是明确要用它，
+         不该被一个「顺手存下的密码」顶掉；
+      3. 都没有才是密码。
+    """
+    a = str(spec.get("auth") or "").strip().lower()
+    if a in ("key", "password"):
+        return a
+    return "key" if str(spec.get("key_path") or "").strip() else "password"
+
+
 def _tagged(tracer):
     """把主程序的 tracer 包一层，给每条命令加上 API 标记。
 
@@ -143,7 +165,7 @@ class SessionPool:
             host=str(spec.get("host") or "").strip(),
             port=int(spec.get("port") or (22 if proto == "ssh" else 0) or 0),
             user=str(spec.get("user") or "").strip(),
-            auth="password" if spec.get("password") else "key",
+            auth=_auth_of(spec),
             key_path=str(spec.get("key_path") or "").strip(),
             password=str(spec.get("password") or ""),
             key_passphrase=str(spec.get("key_passphrase") or ""),
@@ -358,7 +380,7 @@ class SessionPool:
                 host=spec.get("host", ""),
                 port=int(spec.get("port") or 22),
                 user=spec.get("user", ""),
-                auth="password" if spec.get("password") else "key",
+                auth=_auth_of(spec),
                 key_path=spec.get("key_path", ""),
                 password=spec.get("password", ""),
                 key_passphrase=spec.get("key_passphrase", ""),

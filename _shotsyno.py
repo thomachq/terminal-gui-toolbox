@@ -94,20 +94,31 @@ except Exception:  # noqa: BLE001
 pump(a, 0.6)
 
 
-def grab(name: str) -> None:
+def grab(name: str, win=None) -> None:
+    win = win or a
     try:
-        a.attributes("-topmost", True)
-        a.lift()
-        a.focus_force()
+        win.attributes("-topmost", True)
+        win.lift()
+        win.focus_force()
     except Exception:  # noqa: BLE001
         pass
-    pump(a, 0.5)
-    hwnd = ctypes.windll.user32.GetParent(a.winfo_id()) or a.winfo_id()
+    pump(win, 0.5)
+    import ctypes.wintypes as wt
+    u = ctypes.windll.user32
+    own = win.winfo_id()
+    # GetAncestor(GA_ROOT=2) 比 GetParent 稳：GetParent 在 Tk 换过 wrapper
+    # 的情况下会指到一个内部小窗口（这次就抓出 237x39 的标题栏碎片）。
+    hwnd = u.GetAncestor(own, 2) or u.GetParent(own) or own
+    r = wt.RECT()
+    u.GetWindowRect(hwnd, ctypes.byref(r))
+    print(f"  [grab] {name}: tk={win.winfo_width()}x{win.winfo_height()} "
+          f"hwnd={hwnd} rect={r.right - r.left}x{r.bottom - r.top}", flush=True)
     img = print_window(hwnd)
-    if img is None:
-        img = capture_screen(hwnd)
-    if img is None:
-        print(f"!! {name} 抓不到")
+    if img is None or img.size[0] < 400 or img.size[1] < 300:
+        img = capture_screen(hwnd) or img
+    # 尺寸不合理就是抓错了 —— 宁可报错，也不拿碎片覆盖掉原来那张好图
+    if img is None or img.size[0] < 400 or img.size[1] < 300:
+        print(f"!! {name} 抓到的是碎片 {getattr(img, 'size', None)}，不覆盖原图")
         return
     dst = OUT / f"{name}.png"
     img.save(dst)
@@ -181,12 +192,16 @@ try:
     grab("term_syncapi")
 
     # ---------------------------------------------------- ② 群晖防火墙
-    a.fw_backend = BE                     # 先挂上，切页签时才不会重新探测
     rows = BE.parse(TEXT)
     a.nav.select("sec")
-    pump(a, 1.0)
+    pump(a, 1.2)
     a.seg_sec.select("fw")
-    pump(a, 0.8)
+    # 进页会跑 fw_probe()（异步），它的 done 回调**无条件**
+    # `self.fw_backend = backend` —— 不等它跑完就注入，会被冲成
+    # 「未探测 + 空表」。先让它探完（本机那下很快），再覆盖。
+    pump(a, 3.0)
+    a.fw_backend = BE
+    pump(a, 0.3)
     a.badge_fw.set("群晖防火墙（配置文件）", "ok")
     a.lbl_fw.configure(
         text="群晖 DSM 防火墙 · profile default（写在 /usr/syno/etc/firewall.d/1.json，"
@@ -207,9 +222,37 @@ try:
     pump(a, 0.8)
     grab("fw_syno_light")
 
+    # 新增规则表单：「位置（国家）」是这一版新加的字段，40 项下拉
+    # 会不会把行撑高/溢出只有截图看得见。
+    def shot_form(tag: str) -> None:
+        from ui import forms as _F
+        dlg = _F.FormDialog(
+            a, "新增防火墙规则", a._fw_fields(BE, None),
+            subtitle="后端：群晖防火墙（配置文件）。保存后会先给你看命令，"
+                     "确认了才执行。", submit="确定")
+        dlg.deiconify()
+        for _ in range(40):
+            dlg.update()
+            time.sleep(0.01)
+        grab(f"fw_syno_form_{tag}", dlg)
+        try:
+            dlg.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        pump(a, 0.4)
+
+    shot_form("light")
+
     U.apply_theme("dark")
     pump(a, 0.8)
     grab("fw_syno_dark")
+    try:
+        shot_form("dark")
+    except Exception as e:  # noqa: BLE001
+        # 暗色这张偶尔被窗口管理器提前销毁。产品本身连开三次都正常
+        # （840x438），这里是截图脚本在 ShowWindow 之后重开对话框的时序问题，
+        # 亮色那张已经足够证明布局，不影响交付。
+        print(f"!! 暗色表单没截到：{type(e).__name__}: {e}")
 finally:
     try:
         a._close_to_tray = False

@@ -14,9 +14,11 @@
 """
 from __future__ import annotations
 
+import time
 import tkinter as tk
 
 import wbtui as U
+from core import devicecert as DC
 from core import secscan as S
 from core import servercert as SC
 from pages.firewall_page import FirewallPage
@@ -36,12 +38,19 @@ TABS = [("scan", "体检结果"), ("fw", "防火墙"), ("cert", "证书管理"),
         ("fix", "加固建议")]
 
 CERT_COLS = [
-    Column("name", "名称", 150),
-    Column("cn", "CN", 170),
-    Column("sans", "SAN（域名 / IP）", 260, stretch=True),
-    Column("not_after", "到期", 100),
-    Column("days", "剩余", 78, anchor="e"),
-    Column("key", "私钥", 56, anchor="center"),
+    # 列宽总和压到 ~960 逻辑像素：右边常驻 AI 面板，再宽就会把「用途」列
+    # 挤出可视区（实测 1128 时最后一列整列看不见）。名称列会截断，
+    # 双击看详情有全名。
+    Column("name", "名称", 190),
+    # 「来源」是这一页最容易误解的一列：本机库只是工具箱自己的一份收藏，
+    # 设备上那份（DSM 控制面板 / fnOS 系统设置）才是真正在用的。
+    Column("src", "来源", 76),
+    Column("cn", "CN", 130),
+    Column("sans", "SAN（域名 / IP）", 200, stretch=True),
+    Column("not_after", "到期", 88),
+    Column("days", "剩余", 62, anchor="e"),
+    Column("key", "私钥", 48, anchor="center"),
+    Column("usage", "用途 / 绑定的服务", 166, stretch=True),
 ]
 
 
@@ -161,15 +170,26 @@ class SecurityPage(FirewallPage):
             self.after(80, self.fw_probe)
         if key == "cert":
             self.cert_refresh()
+            # 切到这一页就连带读一次设备自己的证书清单 —— 用户报的就是
+            # 「页面上看不到设备上明明装着的证书」，不该让他再点一次按钮。
+            self.cert_maybe_sync()
 
     def _sec_fw_maybe_probe(self):
-        """停在防火墙页签时换了设备 —— 必须重探，否则会拿上一台的后端跑命令。"""
+        """换了设备后把这一页的数据重取一遍。
+
+        防火墙页签要重探后端（否则会拿上一台的后端跑命令）；证书页签要重读
+        设备自己的清单（换设备后还显示上一台的证书 = 张冠李戴）。
+        """
         try:
-            if getattr(self, "seg_sec", None) is None:
-                return
-            if getattr(self.seg_sec, "current", "") != "fw":
-                return
+            cur = getattr(getattr(self, "seg_sec", None), "current", "") or ""
         except Exception:  # noqa: BLE001
+            cur = ""
+        if cur == "cert":
+            # 设备变了，旧缓存一律作废，强制重读
+            self._devcert = {}
+            self.after(120, lambda: self.cert_maybe_sync(force=True))
+            return
+        if cur != "fw":
             return
         self.fw_backend = None
         try:
@@ -271,7 +291,7 @@ class SecurityPage(FirewallPage):
         pg.rowconfigure(0, weight=1)
 
         card = U.Card(pg, title="服务器证书",
-                      hint="自签名或导入 · 给群晖 / nginx / IIS 这类 Web 服务用")
+                      hint="本机库 + 设备清单 · 群晖 DSM / 飞牛 fnOS / nginx / IIS")
         card.grid(row=0, column=0, sticky="nsew")
         b = card.body
 
@@ -279,7 +299,8 @@ class SecurityPage(FirewallPage):
         bar.pack(fill="x", pady=(0, U.px(8)))
         U.RoundButton(bar, "新建自签名", self.cert_new, variant="primary",
                       height=30, padx=16).pack(side="left")
-        for text, cmd in (("导入…", self.cert_import),
+        for text, cmd in (("读取设备证书", self.cert_sync),
+                          ("导入…", self.cert_import),
                           ("导出…", self.cert_export),
                           ("上传到设备", self.cert_upload)):
             U.RoundButton(bar, text, cmd, variant="secondary",
@@ -289,13 +310,13 @@ class SecurityPage(FirewallPage):
         self.lbl_cert_sum = U.wlabel(bar, "", "dim", U.FONT_XS)
         self.lbl_cert_sum.pack(side="right")
 
-        # 说明放在动作条下面、表格上面：安全中心这块 holder 本身不滚，
-        # 放卡片底部会被 expand 的表格挤出可视区（实测整段看不见）。
+        # 说明压在**一行**：这一页上面还有体检卡片和页签，日志面板一开
+        # 纵向就只剩一百多像素，说明多一行表格就少一行（实测只剩表头）。
         self.lbl_cert_tip = U.wlabel(
             b,
-            "自签名证书首次访问会提示「不受信任」—— 把 cert.pem 导入客户端"
-            "「受信任的根证书颁发机构」即可。证书里的 SAN 才决定哪些地址受信任，"
-            "浏览器不看 CN。",
+            "「本机库」是工具箱收藏的证书；连上设备自动带出它自己的清单"
+            "（只读、私钥不下发）。自签名首次访问会提示不受信任："
+            "把 cert.pem 导入客户端「受信任的根证书颁发机构」—— 浏览器只认 SAN。",
             "dim", U.FONT_XS, justify="left")
         self.lbl_cert_tip.pack(anchor="w", pady=(0, U.px(6)))
 
@@ -303,12 +324,16 @@ class SecurityPage(FirewallPage):
             b, CERT_COLS, height=10, searchable=True,
             empty_title="证书库是空的",
             empty_hint="「新建自签名」给内网服务签一张；"
-                       "「导入…」把已有的证书收起来。",
+                       "「导入…」把已有的证书收起来；"
+                       "连着设备时点「读取设备证书」读它自己的清单。",
             on_activate=self.cert_detail)
         self.tbl_cert.pack(fill="both", expand=True)
         self.tbl_cert.set_menu([
             ("查看证书内容", self.cert_detail, lambda r: bool(r)),
-            ("导出到目录…", lambda r: self.cert_export(r), lambda r: bool(r)),
+            ("保存到本机库", self.cert_save_local, self._is_dev_row),
+            ("导出到目录…", lambda r: self.cert_export(r), self._is_local_row),
+            ("上传到设备…", lambda r: self.cert_upload(r), self._is_local_row),
+            ("删除", lambda r: self.cert_delete(r), self._is_local_row),
         ])
         self.cert_refresh()
 
@@ -320,45 +345,233 @@ class SecurityPage(FirewallPage):
             root = _P(__file__).resolve().parent.parent / "data"
         return SC.Store(root / "certs")
 
+    # ---- 渲染
     def cert_refresh(self):
         tbl = getattr(self, "tbl_cert", None)
         if tbl is None:
             return
+        local, why = [], ""
         try:
-            rows = self.cert_store().list()
+            local = self.cert_store().list()
         except Exception as e:  # noqa: BLE001
-            tbl.set_empty("读证书库失败", str(e))
-            return
+            why = f"读本机证书库失败：{e}"
         out = []
-        for r in rows:
-            left = r.get("days_left", 0)
+        for r in local:
+            left = int(r.get("days_left") or 0)
             out.append({
                 "name": r.get("label") or r.get("name", ""),
+                "src": "本机库",
                 "cn": r.get("cn", "") or "（读不出来）",
                 "sans": ", ".join(r.get("sans") or []) or "—",
                 "not_after": r.get("not_after", ""),
                 "days": ("已过期" if left < 0 else f"{left} 天"),
                 "key": "有" if r.get("has_key") else "无",
-                "_raw": r,
+                "usage": str(r.get("usage") or "—"),
+                "_raw": {**r, "source": "local"},
             })
+        st = getattr(self, "_devcert", None) or {}
+        dev_rows = st.get("rows") or []
+        for r in dev_rows:
+            out.append(self._dev_row(r))
         tbl.set_rows(out)
-        if out:
-            exp = sum(1 for r in rows if r.get("days_left", 0) < 0)
-            soon = sum(1 for r in rows
-                       if 0 <= r.get("days_left", 0) <= 30)
-            msg = f"{len(out)} 张证书"
-            if soon:
-                msg += f" · {soon} 张 30 天内到期"
-            if exp:
-                msg += f" · {exp} 张已过期"
-            self.lbl_cert_sum.configure(text=msg)
+        if not out and why:
+            tbl.set_empty("读证书库失败", why[:300])
+        self._cert_sum(local, dev_rows, st.get("why") or why)
+
+    def _dev_row(self, r: dict) -> dict:
+        """设备证书 → 表格行。`_raw` 里保留 pem（详情/保存要用）。"""
+        left = int(r.get("days_left") or 0)
+        svc = [str(s) for s in (r.get("services") or []) if str(s).strip()]
+        if len(svc) > 2:
+            usage = "、".join(svc[:2]) + f" 等 {len(svc)} 项"
         else:
-            self.lbl_cert_sum.configure(text="")
+            usage = "、".join(svc) or "—"
+        name = str(r.get("name") or "（无名）")
+        if r.get("used"):
+            name += "（默认）"
+        return {
+            "name": name,
+            "src": DC.KIND_LABEL.get(str(r.get("kind") or ""), "设备"),
+            "cn": r.get("cn") or "（读不出来）",
+            "sans": ", ".join(r.get("sans") or []) or "—",
+            "not_after": r.get("not_after", ""),
+            "days": ("已过期" if left < 0 else f"{left} 天"),
+            "key": "有" if r.get("has_key") else "无",
+            "usage": usage,
+            "_raw": {**r, "source": "device"},
+        }
+
+    def _cert_sum(self, local: list[dict], dev_rows: list[dict],
+                  why: str = "") -> None:
+        lbl = getattr(self, "lbl_cert_sum", None)
+        if lbl is None:
+            return
+        bits = []
+        if local:
+            bits.append(f"本机库 {len(local)} 张")
+        if dev_rows:
+            kind = DC.KIND_LABEL.get(str(dev_rows[0].get("kind") or ""), "设备")
+            extra = []
+            exp = sum(1 for r in dev_rows if int(r.get("days_left") or 0) < 0)
+            soon = sum(1 for r in dev_rows
+                       if 0 <= int(r.get("days_left") or 0) <= 30)
+            if soon:
+                extra.append(f"{soon} 张 30 天内到期")
+            if exp:
+                extra.append(f"{exp} 张已过期")
+            bits.append(f"{kind} {len(dev_rows)} 张"
+                        + (f"（{'、'.join(extra)}）" if extra else ""))
+        elif why:
+            one = str(why).splitlines()[0].strip()
+            bits.append("设备：读不到（" + (one[:40] + "…" if len(one) > 40
+                                          else one) + "）")
+        lbl.configure(text=" · ".join(bits))
 
     def _cert_sel(self, row=None) -> dict | None:
         row = row if isinstance(row, dict) and row.get("_raw") else \
             (self.tbl_cert.selected() or {})
         return (row or {}).get("_raw")
+
+    @staticmethod
+    def _raw_of(row) -> dict:
+        return (row or {}).get("_raw") or {}
+
+    def _is_dev_row(self, row) -> bool:
+        return self._raw_of(row).get("source") == "device"
+
+    def _is_local_row(self, row) -> bool:
+        return self._raw_of(row).get("source") == "local"
+
+    # ---------------------------------------------------- 设备证书（只读）
+    def _dev_key(self) -> str:
+        """会话指纹：换设备就必须重读，同一台别反复读。"""
+        s = getattr(self, "session", None)
+        if s is None or not getattr(s, "alive", False):
+            return ""
+        return "{}:{}:{}".format(getattr(s, "host", "") or "",
+                                 getattr(s, "port", "") or "",
+                                 getattr(s, "user", "") or "")
+
+    def cert_maybe_sync(self, force: bool = False) -> None:
+        """切到证书页签时调 —— 有设备就连带读一次，没连就只显示本机库。"""
+        key = self._dev_key()
+        st = getattr(self, "_devcert", None) or {}
+        if not key:
+            if st:
+                self._devcert = {}
+                self.cert_refresh()
+            return
+        if not force:
+            if st.get("key") == key:
+                return
+            # 同一条会话 8 秒内只试一次：即使上次卡在提权弹窗 / 失败，
+            # 也不会切来切去反复连，但过一会儿仍能重试。
+            last = getattr(self, "_devcert_try", (None, 0.0))
+            if last[0] == key and (time.time() - last[1]) < 8.0:
+                return
+        self.cert_sync(silent=True, key=key)
+
+    def cert_sync(self, silent: bool = False, key: str = "") -> None:
+        """从设备读证书清单（群晖 DSM / 飞牛 fnOS）。只读，不下载私钥。"""
+        s = getattr(self, "session", None)
+        if s is None or not getattr(s, "alive", False):
+            if not silent:
+                self.toast("先连一台设备（SSH），才能读它上面的证书", "warn")
+            self._devcert = {}
+            self.cert_refresh()
+            return
+        key = key or self._dev_key()
+        # 只有 Linux 系设备才有这两套证书模块；连的是 Windows/macOS 时
+        # 别去跑 `test -d /usr/syno/...` 再报一句「读不到」——那是噪音。
+        try:
+            fam = getattr(self._effective_device(), "os_family", "") or ""
+        except Exception:  # noqa: BLE001
+            fam = "linux"
+        if fam and fam != "linux":
+            self._devcert = {}
+            self.cert_refresh()
+            if not silent:
+                self.toast("这台设备不是 Linux，暂无证书清单可读"
+                           "（目前支持群晖 DSM / 飞牛 fnOS）", "warn")
+            return
+        self._devcert_try = (key, time.time())
+        lbl = getattr(self, "lbl_cert_sum", None)
+        if lbl is not None:
+            lbl.configure(text="正在读取设备证书…")
+        try:
+            self.status.set_state("读取设备证书…")
+        except Exception:  # noqa: BLE001
+            pass
+
+        def work():
+            try:
+                return {"rows": DC.list_device(s), "why": ""}
+            except DC.DeviceCertError as e:
+                why = str(e) + (f" —— {e.hint}" if e.hint else "")
+                return {"rows": [], "why": why}
+
+        def ok(res):
+            rows = res.get("rows") or []
+            self._devcert = {"key": key, "rows": rows,
+                             "why": res.get("why") or ""}
+            self.cert_refresh()
+            try:
+                if rows:
+                    self.status.set_state(f"设备证书已读取（{len(rows)} 张）", "ok")
+                else:
+                    self.status.set_state("设备证书读不到", "warn")
+            except Exception:  # noqa: BLE001
+                pass
+            if not silent:
+                if rows:
+                    self.toast(f"已读取 {len(rows)} 张设备证书", "ok")
+                else:
+                    self.toast(str(res.get("why") or "设备上没读到证书")[:140],
+                               "warn")
+
+        def err(m):
+            # 提权弹窗被取消时不会走到这里（app 自己处理），这条只管真失败。
+            self._devcert = {"key": key, "rows": [], "why": str(m)}
+            self.cert_refresh()
+            if not silent:
+                self.toast(f"读取设备证书失败：{str(m)[:120]}", "err")
+
+        self.bg(work, ok=ok, err=err)
+
+    def cert_save_local(self, row=None) -> None:
+        """把设备上那张证书存进本机库（**只存证书，不碰私钥**）。"""
+        rec = self._cert_sel(row)
+        if not rec or rec.get("source") != "device":
+            return self.toast("先在列表里选一张「来源＝群晖 / 飞牛」的证书", "warn")
+        pem = str(rec.get("pem") or "")
+        if not pem:
+            return self.toast("这张证书的内容没读到："
+                              + str(rec.get("error") or "权限不足"), "err")
+        kind = DC.KIND_LABEL.get(str(rec.get("kind") or ""), "设备")
+        stem = str(rec.get("name") or "cert")
+        data = forms.FormDialog.open(
+            self, "保存到本机库",
+            [{"key": "name", "label": "库里叫它", "required": True,
+              "width": 30,
+              "default": f"{kind}-{stem}",
+              "hint": "存的是证书文件（cert.pem）。设备上的私钥不会被下载，"
+                      "需要私钥请到设备自己的管理界面导出。",
+              "hint_below": True}],
+            subtitle=f"{kind} · {stem} · {rec.get('not_after')} 到期",
+            submit="保存")
+        if not data:
+            return
+        name = str(data.get("name") or "").strip() or stem
+        try:
+            rec2 = self.cert_store().add(
+                name, pem, "", meta={"from_device": kind,
+                                     "device_path": rec.get("where") or ""})
+        except SC.CertError as e:
+            return self.toast(str(e), "err")
+        except OSError as e:
+            return self.toast(f"写不进本机库：{e}", "err")
+        self.cert_refresh()
+        self.toast(f"已存入本机库：{rec2.get('name')}（只有证书，无私钥）", "ok")
 
     # ---- 新建
     def cert_new(self):
@@ -469,6 +682,19 @@ class SecurityPage(FirewallPage):
         d = filedialog.askdirectory(parent=self, title="导出到哪个目录")
         if not d:
             return
+        if rec.get("source") == "device":
+            pem = str(rec.get("pem") or "")
+            if not pem:
+                return self.toast("这张证书的内容没读到："
+                                  + str(rec.get("error") or "权限不足"), "err")
+            from pathlib import Path as _P
+            out = _P(d) / f"{SC._safe_name(rec.get('name') or 'cert')}.crt"
+            try:
+                out.write_text(pem, encoding="utf-8")
+            except OSError as e:
+                return self.toast(f"导出失败：{e}", "err")
+            return self.toast(f"已导出证书到 {out}（私钥留在设备上，没下载）",
+                              "ok")
         try:
             made = self.cert_store().export(rec["name"], d)
         except (OSError, SC.CertError) as e:
@@ -480,6 +706,10 @@ class SecurityPage(FirewallPage):
         rec = self._cert_sel(row)
         if not rec:
             return self.toast("先在列表里选一张证书", "warn")
+        if rec.get("source") == "device":
+            return self.toast(
+                "这是设备上的证书，这里只读 —— 要删请在设备自己的"
+                "「证书」界面删（群晖：控制面板 → 安全性 → 证书）", "warn")
         if not forms.confirm(
                 self, "删除证书",
                 f"要删除「{rec['name']}」吗？私钥会一起删掉，删了没法恢复。\n"
@@ -495,11 +725,26 @@ class SecurityPage(FirewallPage):
         rec = self._cert_sel(row)
         if not rec:
             return
-        try:
-            cert, key = self.cert_store().read(rec["name"])
-        except OSError as e:
-            return self.toast(f"读不了：{e}", "err")
-        body = [
+        dev = rec.get("source") == "device"
+        if dev:
+            cert = str(rec.get("pem") or "")
+            key = ""
+            if not cert:
+                return self.toast("这张证书的内容没读到："
+                                  + str(rec.get("error") or "权限不足"), "err")
+        else:
+            try:
+                cert, key = self.cert_store().read(rec["name"])
+            except OSError as e:
+                return self.toast(f"读不了：{e}", "err")
+        body = []
+        if dev:
+            body.append(
+                "来源：设备（" + DC.KIND_LABEL.get(str(rec.get("kind")), "设备")
+                + " · 只读）" + ("　【当前默认证书】" if rec.get("used") else ""))
+        else:
+            body.append("来源：本机库")
+        body += [
             f"名称：{rec.get('name')}",
             f"CN：{rec.get('cn')}",
             f"签发者：{rec.get('issuer')}"
@@ -509,10 +754,14 @@ class SecurityPage(FirewallPage):
             f"（剩 {rec.get('days_left')} 天）",
             f"序列号：{rec.get('serial')}",
             f"SHA256：{rec.get('sha256')}",
-            "",
-            "—— cert.pem ——",
-            cert.strip(),
         ]
+        if dev:
+            if rec.get("where"):
+                body.append(f"设备上的位置：{rec.get('where')}")
+            if rec.get("services"):
+                body.append("绑定的服务：" + "、".join(rec.get("services") or []))
+            body.append("私钥：留在设备上（本工具只读证书，不下载私钥）")
+        body += ["", "—— cert.pem ——", cert.strip()]
         if key:
             body += ["", "—— key.pem（私钥，注意别外传）——", key.strip()]
         forms.InfoDialog.show(self, f"证书 {rec.get('name')}", "\n".join(body),
@@ -523,6 +772,10 @@ class SecurityPage(FirewallPage):
         rec = self._cert_sel(row)
         if not rec:
             return self.toast("先在列表里选一张证书", "warn")
+        if rec.get("source") == "device":
+            return self.toast(
+                "这张本来就在设备上 —— 要从本机往设备装，请先"
+                "「保存到本机库」再选本机那张上传", "warn")
         sess = getattr(self, "session", None)
         if sess is None or not getattr(sess, "alive", False):
             return self.toast("先连接一台设备（SSH），本机窗口没有上传通道",

@@ -206,6 +206,37 @@ def inspect_key(path: str, passphrase: str | None = None) -> dict:
     return {"ok": False, "error": f"无法解析：{type(last).__name__}: {last}"}
 
 
+def passphrase_owner(store, key_path: str, passphrase: str | None = None) -> str | None:
+    """同一把私钥在**别的档案**里能解开 → 返回那条档案的名字，否则 None。
+
+    为什么需要它：私钥口令是按「档案」存的，同一把私钥可以配两个不同的口令
+    而没有任何人拦。实测过一次：两条档案指向同一个加密 PEM，一条 16 位能解，
+    另一条 12 位是**账户登录密码**（和该档案的 password 完全相等）。连接时
+    只能报「密码不对」，但人真正需要知道的是「该抄哪一条」。
+
+    只读、只在内存里试解密，不落盘、不打印口令。
+    """
+    want = norm_path(key_path)
+    if not want or store is None:
+        return None
+    try:
+        recs = store.profiles()
+    except Exception:  # noqa: BLE001
+        return None
+    for rec in recs or []:
+        if norm_path(str(rec.get("key_path") or "")) != want:
+            continue
+        pw = str(rec.get("key_passphrase") or "")
+        if not pw or pw == str(passphrase or ""):
+            continue
+        try:
+            if inspect_key(want, pw).get("ok"):
+                return str(rec.get("name") or "")
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def chmod_600_warning(path: str) -> str | None:
     """OpenSSH 会拒绝过宽权限的私钥，这里只做提示。"""
     try:

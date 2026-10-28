@@ -45,6 +45,22 @@ class NeedElevation(SessionError):
         self.target = target      # 显示给用户看的目标（user@host 或 本机）
 
 
+def _bad_passphrase(path) -> str:
+    """「口令错」不能写成「密钥可能坏了」—— 这两句话把人引到完全不同的动作上。
+
+    实测过的坑：同一把私钥在「192.168.3.12」和「飞牛OS」两条档案里共用，
+    新建那条时把**账户登录密码**（12 位）贴进了「私钥密码」，而正确口令是
+    16 位。连接时报的是「私钥文件本身可能也坏了」→ 人会去怀疑密钥、甚至
+    重新生成密钥，真正要改的只是一个字段。密钥没坏就明说它没坏。
+    """
+    from pathlib import Path
+
+    name = Path(str(path)).name if path else "私钥文件"
+    return (f"私钥密码不对，解不开「{name}」。同一把私钥在所有档案里必须是"
+            "同一个密码 —— 若这台设备在别的档案里能连，照抄那条的「私钥密码」"
+            "即可，密钥本身不用重新生成。")
+
+
 def load_private_key(path: str, passphrase: str | None = None):
     """读私钥，返回 paramiko.PKey。**口令一律转成 bytes 再交给 paramiko。**
 
@@ -96,7 +112,7 @@ def load_private_key(path: str, passphrase: str | None = None):
             # paramiko 在"加密但没给口令"时抛的是 TypeError，不是专用异常
             raise SessionError("私钥已加密：请在档案里填「私钥密码」") from e
         if "Incorrect password" in msg or "Bad password" in msg:
-            raise SessionError("私钥密码不对（私钥文件本身可能也坏了）") from e
+            raise SessionError(_bad_passphrase(p)) from e
         if "OPENSSH key" in msg:
             raise SessionError("私钥格式 paramiko 读不了，请转成 OpenSSH 格式") from e
         raise SessionError(f"私钥读不出来：{type(e).__name__}: {msg}") from e
@@ -125,7 +141,7 @@ def _load_with_crypto(path, password: bytes | None):
             return None, "私钥已加密：请在档案里填「私钥密码」"
         except ValueError as e:
             if "Incorrect password" in str(e):
-                return None, "私钥密码不对（私钥文件本身可能也坏了）"
+                return None, _bad_passphrase(path)
             continue
         except Exception:  # noqa: BLE001
             continue
@@ -774,19 +790,48 @@ class SSHSession(BaseSession):
             else:
                 self.elev_msg = getattr(cli, "last_error", "") or "enable 没成功"
             return ok
-        self.sudo_pw = pw
+        prev_pw = self.sudo_pw
+        self.sudo_pw = pw          # run(sudo=True) 就靠这个字段拼命令，必须先放进去
         try:
-            rc, _, _ = self.run("id -u", sudo=True, timeout=20)
-            self.elevated = rc == 0
+            rc, out, err = self.run("id -u", sudo=True, timeout=20)
             if rc == 0:
+                self.elevated = True
                 self.elev_method = "percmd"
                 self.elev_msg = ""
-            else:
-                self.elev_msg = "sudo 逐条执行时返回非 0"
-            return rc == 0
+                return True
+            # 没通过就别把这条密码留在会话上：`can_admin()` 只看「有没有密码」，
+            # 留着的话页面上的按需操作（Docker / 防火墙 / 路由）会拿一条错的
+            # 密码去 sudo，报出来的错跟「没填密码」完全是两回事，很难指认。
+            self.sudo_pw = prev_pw
+            self.elevated = False
+            self.elev_method = ""
+            self.elev_msg = self._sudo_why(rc, out, err)
+            return False
         except Exception as e:  # noqa: BLE001
+            self.sudo_pw = prev_pw
+            self.elevated = False
+            self.elev_method = ""
             self.elev_msg = str(e) or "sudo 逐条执行失败"
             return False
+
+    @staticmethod
+    def _sudo_why(rc: int, out: str, err: str) -> str:
+        """把 sudo 的原文翻成一句能照着办事的人话。
+
+        以前这里只有一句「sudo 逐条执行时返回非 0」—— 密码错了、不在 sudoers、
+        目标用户被锁，三种原因长得一模一样，用户根本无从下手。
+        """
+        text = ((err or "") + "\n" + (out or "")).strip()
+        low = text.lower()
+        if "sorry" in low or "incorrect password" in low or "try again" in low:
+            return "密码不对（sudo 原文：Sorry, try again.）"
+        if "not in the sudoers" in low:
+            return "这个账号不在 sudoers 里（要先授权才能提权）"
+        if "is not allowed to execute" in low:
+            return "sudoers 限制了可执行的命令，这条不在允许范围内"
+        if "no password was provided" in low:
+            return "sudo 没收到密码（通道被提前关了）"
+        return text[-160:] if text else f"sudo 返回 {rc}"
 
     def elevate_root(self, pw: str) -> bool:
         """「连接后自动提权」的真正落地：**进去**，而不是每条命令再 sudo 一次。
@@ -812,6 +857,17 @@ class SSHSession(BaseSession):
             self.elev_method = "root"
             return True
         if not pw:
+            # 密码留空 = 「每次现问」，但不是所有机器都需要问。
+            # 群晖 DSM 的 administrators 组默认 NOPASSWD，飞牛 / 部分加固发行版
+            # 也可能是免密 sudo —— 以前这里直接判「没有可用的 sudo 密码」，
+            # 于是勾了「连接后自动提权」的群晖用户看到
+            # 「提权未生效：没有可用的 sudo 密码」，而 `sudo -n` 明明能过。
+            # 所以先给它一次免密机会，真的不行再让上层去问密码。
+            if self.sudo_n_ok():
+                self.elevated = True
+                self.elev_method = "percmd"
+                self.elev_msg = ""
+                return True
             self.elev_msg = "没有可用的 sudo 密码"
             return False
         if self._root_shell is not None and self._root_shell.alive():

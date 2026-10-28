@@ -72,7 +72,7 @@ from pages.remote_page import RemotePage
 from pages.routes_page import RoutesPage
 from pages.security_page import SecurityPage
 from pages.web_page import WebPage
-from profiles import ProfileStore, discover_keys, inspect_key, norm_path
+from profiles import ProfileStore, discover_keys, inspect_key, norm_path, passphrase_owner
 from ui import forms
 from ui.icon import apply_icon, set_app_id
 from ui.logpanel import LogModel
@@ -116,8 +116,26 @@ def _asset(name: str) -> Path:
 
 ICON_ICO = _asset("app.ico")
 
+# 「提权失败」要不要再问一遍密码，靠这句话判断。只有密码这一类才有救：
+# sudo 没装、用户不在 sudoers、通道都建不起来 —— 输多少遍都一样，问第二遍只会招烦，
+# 还会在 passwd_tries / faillock 上累计次数。
+_SUDO_NO_PW_HELP = ("not found", "找不到", "command not found", "没有可用的 sudo 密码",
+                    "不在 sudoers", "not in the sudoers", "no sudo",
+                    "开不了交互式 shell", "连接已断开")
+_SUDO_PW_HINTS = ("密码", "password", "sorry", "incorrect", "try again", "denied")
+
+
+def _sudo_pw_maybe_wrong(msg: str) -> bool:
+    """这句失败原因换个密码还有救吗？"""
+    t = (msg or "").lower()
+    if not t:
+        return False
+    if any(k in t for k in _SUDO_NO_PW_HELP):
+        return False
+    return any(k in t for k in _SUDO_PW_HINTS)
+
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.28"
+APP_VER = "1.0.29"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -1491,6 +1509,118 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                 err=lambda m: self.status.set_state(m, "err"),
                 allow_elev=False)
 
+    def _safe_ask_sudo(self, s, slot=None, why="", attempt=0) -> None:
+        """after 调度的薄壳：窗口在 120ms 内被关掉时别抛 TclError 出来。"""
+        try:
+            self._ask_sudo_after_connect(s, slot, why, attempt)
+        except tk.TclError:
+            pass
+
+    def _ask_sudo_after_connect(self, s, slot=None, why="", attempt=0) -> None:
+        """勾了「连接后自动提权」但密码留空 —— 连上之后问一次。
+
+        为什么不在连接前问：
+          · 连之前不知道对方是交换机（问 enable 密码）还是服务器（问 sudo）；
+          · 也不知道它是不是免密 sudo（群晖 administrators 默认 NOPASSWD），
+            免密的机器根本不该弹窗。
+        所以顺序固定在：连上 → 探测出系统 → 免密试一次 → 真要密码才问。
+
+        用户的原话是「不勾选 sudo 密码时，需要提权就弹窗」，界面上那句提示
+        写的是「留空表示每次现问」—— 以前这条路径根本没实现，勾了提权、
+        密码留空，结果只是状态栏一句「未提权：缺密码」。
+        """
+        if not self._alive or s is None:
+            return
+        try:
+            if s is not self.session:
+                return          # 期间又连了别的设备，这次弹窗已经没意义
+        except Exception:  # noqa: BLE001
+            return
+        retry = bool(why)
+        data = forms.FormDialog.open(
+            self, "sudo 密码没通过" if retry else "需要 sudo 密码",
+            [{"key": "pw", "label": "sudo 密码", "kind": "password",
+              "required": True, "width": 26,
+              "hint": ("档案里存的那个被拒了，输现在能用的那个"
+                       if retry else
+                       "这条档案没存密码，勾了「连接后自动提权」就得问一次")},
+             # 「重新输一次」和「存下来」是一件事的两半：用户愿意再输一遍，
+             # 就是不想下次还输。放在同一个框里勾，比让他回头去档案页改省事。
+             {"key": "save", "kind": "check",
+              "label": "把这条密码存进档案，下次不用再输",
+              "default": True}],
+            subtitle=(f"目标：{s.user}@{s.host}\n"
+                      + (f"刚才失败：{str(why)[:120]}\n" if retry else "")
+                      + "注意：有些系统（飞牛OS / 部分 NAS）sudo 要的是 root 密码，"
+                        "不是你的登录密码 —— 两个都可以试。\n"
+                        "密码只在内存里用到本次会话结束；勾了保存才写进档案。"),
+            submit="提权")
+        if not data:
+            self.status.set_state("已连接（未提权）", "warn")
+            self._log_raw("warn", "[提权] 取消了密码输入，本次以普通用户运行\n")
+            return
+        pw = str(data.get("pw") or "")
+
+        def work():
+            try:
+                got = bool(s.elevate_root(pw))
+            except Exception as e:  # noqa: BLE001
+                return False, str(e)
+            if not got:
+                return False, (getattr(s, "elev_msg", "") or "密码没通过")
+            try:
+                return s.verify_root()
+            except Exception as e:  # noqa: BLE001
+                return False, str(e)
+
+        def done(res):
+            good, detail = res
+            if not good:
+                self._log_raw("bad", f"[提权] 没成功：{detail}\n")
+                # 状态栏那一格很窄，只放结论（「密码不对」），原文留给弹窗和日志。
+                short = str(detail).split("（")[0].strip()[:30] or "原因不明"
+                self.status.set_state(f"已连接（提权未生效：{short}）", "warn")
+                # 输错了再问一次，但只问一次：连续试错会被 passwd_tries /
+                # faillock / fail2ban 计数，问到第三遍就不是帮忙，是害人。
+                if attempt < 1 and _sudo_pw_maybe_wrong(detail):
+                    self._log_raw("warn", "[提权] 第 1 次没通过，再问一次"
+                                          "（两次都不过就停，避免把账号试锁）\n")
+                    self.after(200, lambda: self._safe_ask_sudo(
+                        s, slot, f"{detail}", attempt + 1))
+                    return
+                messagebox.showwarning(
+                    "sudo 密码两次都没通过",
+                    f"最后一次的原文：{detail}\n\n"
+                    "已经停手了 —— 重复试错会被 passwd_tries / faillock 记账，"
+                    "再试可能把账号锁住。请认真核对下面几件：\n\n"
+                    "· 飞牛OS / 部分 NAS 的 sudo 要的是 root 密码，不是登录密码；\n"
+                    "· 账户密码改过的话，档案里存的那条就是旧的；\n"
+                    "· 用 ssh 进去手敲一次 sudo -i，看清它到底问的是谁的密码；\n"
+                    "· 确认在不在 sudoers：`sudo -l`（会被拒就是不在）。\n\n"
+                    "核对完在「主机管理」里把这条档案的 sudo 密码改对，再连接一次。",
+                    parent=self)
+                return
+            label = {"sudo-i": "sudo -i", "percmd": "逐条 sudo",
+                     "root": "root 登录"}.get(
+                         getattr(s, "elev_method", ""), "root 权限")
+            if slot is not None:
+                slot.elev = label
+            self._log_raw("ok", f"[提权] 已生效（{label}），并已实测 `id -u` = 0 "
+                                 f"—— 终端里敲的命令与页面操作都以 root 身份执行\n")
+            self.status.set_state(f"已连接（root · {label}）", "ok")
+            self._term_elev_note()
+            # 弹框里勾了「存进档案」就落盘。主表单那颗「保存」也算数 ——
+            # 两处都是用户在界面上明确表达过「记住它」。
+            if data.get("save") or self.v_save_sudo.get():
+                self.v_sudopw.set(pw)
+                if self.v_prof.get().strip():
+                    self._autosave_creds()
+                    self._log_raw("ok", "[提权] 这条密码已写进档案，下次连接直接用\n")
+
+        self.bg(work, ok=done,
+                err=lambda m: self.status.set_state(m, "err"),
+                allow_elev=False)
+
     def _drain(self):
         if not self._alive:
             return
@@ -2426,7 +2556,70 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             pass
 
     # ---------------- 连接动作
-    def do_connect(self):
+    def _ask_keypw_then_retry(self, spec, tries: int = 0,
+                              why: str = "") -> None:
+        """私钥口令解不开 → 让用户重输，再连一次；手工输满两次就停手。
+
+        为什么不让用户在档案表单里改：那份表单已经关掉了，他输入的其它内容
+        全丢；而且「口令错」和「地址写错」不是一回事，没必要一起重来。
+
+        为什么两次就停：私钥认证失败在 sshd 侧也算失败次数，
+        `MaxAuthTries` 与 fail2ban 都会记账，连着刷会被封 IP —— 那比连不上
+        更难解释。所以到点必须停，并告诉人该核对什么。
+        """
+        name = Path(spec.key_path).name if spec.key_path else "私钥"
+        # 同一把私钥在别的档案里能解开 → 直接点名该抄哪一条。
+        # 不点名的话人只会看到「口令不对」，然后去重新生成密钥（没用）。
+        owner = passphrase_owner(self.profiles, spec.key_path, spec.key_passphrase)
+        if tries >= 2:
+            messagebox.showerror(
+                "私钥口令两次都没通过",
+                f"「{name}」的口令已经手工输错两次，停手了。\n"
+                "再试下去 sshd 会按 MaxAuthTries / fail2ban 记账，可能把 IP 封掉。\n\n"
+                + (f"同一把私钥在「{owner}」那条档案里用的是另一个口令，"
+                   f"照抄那一串就能连上 —— 密钥文件本身没坏，不用重新生成。\n\n"
+                   if owner else
+                   "核对一下这把私钥当初生成时设的口令；真忘了就用\n"
+                   "`ssh-keygen -p -f <私钥文件>` 重设，或者换一把新密钥。\n\n")
+                + "核对完在「主机管理」里把这条档案的「私钥密码」改对，再连接一次。",
+                parent=self)
+            self.status.set_state("已取消连接（私钥口令没通过）", "warn")
+            self._log_raw("bad", f"[连接] 私钥口令连续两次没通过，已停手：{name}\n")
+            return
+        data = forms.FormDialog.open(
+            self, "私钥口令没通过" if why else "需要私钥口令",
+            [{"key": "pw", "label": "私钥密码", "kind": "password",
+              "required": True, "width": 26,
+              "hint": f"「{name}」带口令保护；留空＝不改已存的，不是不用填"},
+             {"key": "save", "kind": "check",
+              "label": "把这个口令存进档案，下次不用再输", "default": True}],
+            subtitle="\n".join(x for x in [
+                f"私钥：{name}",
+                (f"刚才失败：{why[:100]}" if why else "这条档案没填私钥密码"),
+                (f"同一把私钥在「{owner}」那条档案里用的是另一个口令，"
+                 f"照抄那一串就能连上" if owner else ""),
+                "还剩 2 次机会：口令错满两次就停手，"
+                "因为 sshd 会把私钥认证失败也计入 MaxAuthTries。",
+            ] if x),
+            submit="重试连接")
+        if not data:
+            self.status.set_state("已取消连接", "warn")
+            self._log_raw("warn", "[连接] 取消了私钥口令输入\n")
+            return
+        pw = str(data.get("pw") or "")
+        self.v_keypw.set(pw)
+        if data.get("save") and self.v_prof.get().strip():
+            self._autosave_creds()
+            self._log_raw("ok", "[连接] 私钥口令已写进档案，下次连接直接用\n")
+        self.status.set_state("正在连接…")
+        self.do_connect(keypw_try=tries + 1)
+
+    def do_connect(self, keypw_try: int = 0):
+        """连接（以及连接后的探测 / 提权）。
+
+        `keypw_try` 只在「私钥口令解不开」这条路上自己递归时用：数手工重输
+        了几次，满 2 次就停手并让用户去核对，别把私钥认证失败刷成封 IP。
+        """
         proto = self.v_proto.get()
         self.btn_connect.set_enabled(False)
         self.status.set_state("正在连接…")
@@ -2479,10 +2672,12 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                             "PuTTY 的 .ppk 无法直接读取。\n"
                             "用 PuTTYgen → Conversions → Export OpenSSH key 导出后再选。",
                             parent=self)
-                    if info.get("encrypted") and not spec.key_passphrase:
-                        return messagebox.showwarning("缺少私钥口令",
-                                                      "这把私钥带口令保护，请先填「私钥口令」。",
-                                                      parent=self)
+                    if info.get("encrypted"):
+                        # 口令解不开（或者压根没填）：**在这里就让用户重输**，
+                        # 而不是打一句「私钥密码不对」把表单里填的其它东西一起丢掉。
+                        return self._ask_keypw_then_retry(
+                            spec, keypw_try,
+                            str(info.get("error") or "") if spec.key_passphrase else "")
                     return messagebox.showerror("私钥不可用",
                                                 info.get("error", "无法读取"), parent=self)
             elif not spec.password:
@@ -2528,6 +2723,7 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                         getattr(dev, "os_family", "") != "network":
                     pw = spec.password
                     used_login_pw = True
+                net_dev = getattr(dev, "os_family", "") == "network"
                 okadm = False
                 if pw:
                     try:
@@ -2535,6 +2731,16 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                         # 交换机 / 路由器走 enable。不是只验一下密码就算数 ——
                         # 光验密码的话终端里手敲的命令仍然不带提权。
                         okadm = bool(s.elevate_root(pw))
+                    except Exception:  # noqa: BLE001
+                        okadm = False
+                elif not net_dev:
+                    # 密码留空也进去试一次：elevate_root("") 内部会先探
+                    # 「免密 sudo」（群晖 administrators 默认 NOPASSWD）。
+                    # 以前这里 pw 空就整个跳过，于是「勾了自动提权 + 密码留空」
+                    # 的免密机器被判成「缺密码、没提权」。
+                    # 交换机不试空密码：enable 试错会锁账号。
+                    try:
+                        okadm = bool(s.elevate_root(""))
                     except Exception:  # noqa: BLE001
                         okadm = False
                 # 提权那步返回 True 还不算完：终端里真正跑的通道是另一条
@@ -2552,12 +2758,27 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                         if used_login_pw:
                             elev += "（用的是登录密码）"
                     else:
-                        elev, elev_why = "failed", detail
-                else:
+                        # 提权那步说成了、实测却不是 root —— 也是「换个密码再试」的范畴
+                        elev, elev_why = ("ask", detail) \
+                            if _sudo_pw_maybe_wrong(detail) else ("failed", detail)
+                elif not pw and not net_dev:
+                    # 勾了提权、密码留空、这台机器又不免密 —— 交给主线程问一次。
+                    # 「留空表示每次现问」必须真的问，否则界面上只剩一句
+                    # 「未提权：缺密码」，用户以为勾了就有 root。
+                    elev = "ask"
+                elif net_dev:
                     elev = "failed"
                     elev_why = (getattr(s, "elev_msg", "") or "").strip()
-                if not pw:
-                    elev = "nopw"
+                else:
+                    # 档案里存着密码，但机器不认。**这才是最常见的一条**：
+                    # 飞牛OS / 群晖这类 NAS 的 sudo 密码常常不是登录密码，
+                    # 用户两年前填的那条早就是旧的。以前这里只写一行
+                    # 「提权未生效：密码不对」就算了，用户看到的是
+                    # 「勾了提权、还是普通用户」，而窗口里根本没出现过密码框。
+                    # 只要还有救（是密码问题），就必须弹一次让他自己输。
+                    why = (getattr(s, "elev_msg", "") or "").strip()
+                    elev, elev_why = ("ask", why) if _sudo_pw_maybe_wrong(why) \
+                        else ("failed", why)
             return s, dev, elev, elev_why
 
         def ok(res):
@@ -2590,14 +2811,19 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                 # 原因原文照抄：密码错、不在 sudoers、sudo -i 被关掉……
                 # 只写「提权未生效」等于让用户去猜。
                 self._log_raw("bad", f"[提权] 没成功：{elev_why or '原因不明'}\n")
+                short = str(elev_why or "").split("（")[0].strip()[:30]
                 self.status.set_state(
-                    f"已连接（提权未生效：{elev_why[:40]}）" if elev_why
+                    f"已连接（提权未生效：{short}）" if short
                     else "已连接（提权未生效）", "warn")
-            elif elev == "nopw":
-                self._log_raw("warn", "[提权] 勾了「连接后自动提权」但既没填 "
-                                      "sudo / enable 密码，也没有登录密码可用，"
-                                      "这次没有提权\n")
-                self.status.set_state("已连接（未提权：缺密码）", "warn")
+            elif elev == "ask":
+                if elev_why:
+                    self._log_raw("warn", f"[提权] 档案里存的 sudo 密码没通过"
+                                          f"（{elev_why}）—— 弹框让你重新输一次\n")
+                else:
+                    self._log_raw("warn", "[提权] 勾了「连接后自动提权」，但 sudo "
+                                          "密码留空、这台机器又不免密 —— 弹一次密码框\n")
+                self.status.set_state("已连接（待输入 sudo 密码）", "warn")
+                self.after(120, lambda: self._safe_ask_sudo(s, slot, elev_why))
             elif elev:
                 self._log_raw("ok", f"[提权] 已生效（{elev}），并已实测 "
                                      f"`id -u` = 0 —— 终端里敲的命令与页面操作"

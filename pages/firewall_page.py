@@ -48,6 +48,21 @@ _ACTIONS = {
 }
 
 
+def _loc_options() -> list[tuple[str, str]]:
+    """群晖「位置」下拉：空 + 内置的 40 个国家/地区（含中国港澳台）。
+
+    只用 iplib.COUNTRIES 这份清单，不去 xt_geoip 现场列 —— 界面上不该出现
+    「这台设备碰巧有、那台没有」的选项。清单之外的国家请到 DSM 界面选。
+    """
+    opts = [("", "（不用位置）")]
+    try:
+        from core import iplib as _ipl
+        opts += [(iso, f"{name}  {iso}") for iso, name in _ipl.COUNTRIES]
+    except Exception:                                     # noqa: BLE001
+        opts.append(("CN", "中国  CN"))
+    return opts
+
+
 def _port_hits(port_text, target) -> bool:
     """端口框里有没有命中某个端口（支持 22 / 80,443 / 1000-2000）。"""
     t = str(target or "").strip()
@@ -393,11 +408,23 @@ class FirewallPage:
                  "" if str(d("port")) in ("所有", "any") else d("port"),
                  "hint": "22 或 80,443 或 1000-2000；留空 = 所有端口。"
                          "群晖内置服务名（ssh / ntp 这类）请到 DSM 界面里选"},
+                # 「位置」是群晖唯一一条顶一整国的能力：内核里只有一条
+                # -m geoip --source-country CN，不像自定义网段一段占一条规则。
+                # 粒度只到国家/地区（xt_geoip 里只有 <国码>.iv4，没有省级）。
+                {"key": "loc", "label": "位置（国家）", "kind": "select",
+                 "options": _loc_options(),
+                 "default": (row or {}).get("loc") or "",
+                 "hint": "只能到国家/地区，没有省份。选了位置就别填下面的来源地址",
+                 "hint_below": True, "width": 26},
                 {"key": "src", "label": "来源地址", "kind": "iplist", "lines": 2,
                  "default": d("src") or "any",
                  "hint": "群晖的规则只有来源 IP，目标恒为 any（DSM 界面也不显示"
-                         "目标这一列）。一条规则只带一个网段，填多个会拆成多条；"
-                         "IPv6 在群晖上没验证过，不写",
+                         "目标这一列）。一条规则只带一个网段，而这个配置总共只装 "
+                         "100 条规则 —— 按地区过滤只能用「位置」，且群晖的位置"
+                         "只能到国家/地区，没有省份。IPv6 未验证，不写",
+                 # 群晖没有省级位置库（xt_geoip 里只有 <国码>.iv4），
+                 # 地址库不让点省级，省得用户选完才发现装不下
+                 "lib_groups": ("country", "common"),
                  "hint_below": True, "width": 32},
                 {"key": "comment", "label": "备注", "default": d("comment")},
             ]

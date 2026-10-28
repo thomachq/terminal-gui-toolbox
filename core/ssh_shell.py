@@ -30,18 +30,20 @@ class SSHShellClient(CLIClient):
                  cols: int | None = None, rows: int | None = None) -> None:
         super().__init__()
         try:
+            # invoke_shell(term=...) **自己就会申请 pty**（paramiko 内部先
+            # `get_pty()` 再 `invoke_shell()`）。
+            # 以前这里紧接着又调了一次 `get_pty()`：OpenSSH 把重复的
+            # pty-req 当协议错误，直接把 channel 关掉。于是 `sudo -i` 一开口
+            # 就得到「连接已断开，开不了 root shell」—— 看着像网络断了或密码
+            # 不对，实际是我们在建通道时自己把它弄死的。
+            # 异常还被 `except: pass` 吞掉，连 traceback 都没有。
+            # 凭证是对的、勾了自动提权却进不了 root，根因就在这里。
             self.chan = client.invoke_shell(
                 term="vt100", width=int(cols or self.COLS),
                 height=int(rows or self.ROWS))
         except Exception as e:  # noqa: BLE001
             raise CLIError(f"开不了交互式 shell：{e}") from e
         self.chan.settimeout(0.35)
-        try:
-            # 不关掉回显的话，每条命令都会在输出里重复一遍
-            self.chan.get_pty(term="vt100", width=int(cols or self.COLS),
-                              height=int(rows or self.ROWS))
-        except Exception:  # noqa: BLE001
-            pass
         try:
             self.chan.setblocking(False)
         except Exception:  # noqa: BLE001

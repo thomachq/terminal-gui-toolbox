@@ -94,6 +94,41 @@ def capture(hwnd):
     return Image.frombuffer("RGB", (w, h), buf, "raw", "BGRX", 0, 1)
 
 
+def settle(hwnd, min_colors=300, stable=2, limit=25.0, step=0.4,
+           min_size=(600, 400)):
+    """等界面真画完再截图，替代固定 sleep。
+
+    为什么不能写 sleep：onefile 首跑会被 Defender 扫一遍，AI 面板还要异步拉数据，
+    实测「等 2.5 秒」经常只画到页签标题 + 空白 —— 于是底部状态栏量出「2 色」，
+    报成 FAIL。同一份 exe 隔 5 秒再抓就是完整的 1203 色。假红比漏测更费人。
+
+    为什么还要 min_size：Tk 是「先按内容请求尺寸建窗、再 apply geometry」，
+    中间会有一两帧是 237x39，颜色数照样够 300，抓下来就是一张碎片图，
+    而且会被当成交付截图写进 screenshots/。所以尺寸不够不算「画完」。
+    超时兜底返回「见过的最大的那张」，宁可是旧图也不能是碎片。
+    """
+    t0 = time.time()
+    img, last, same = None, -1, 0
+    best, best_px = None, -1
+    while True:
+        img = capture(hwnd)
+        if img is not None and img.width * img.height > best_px:
+            best, best_px = img, img.width * img.height
+        n = len(img.getcolors(maxcolors=1 << 22) or []) if img else 0
+        big = (img is not None and img.width >= min_size[0]
+               and img.height >= min_size[1])
+        if big and n >= min_colors and n == last:
+            same += 1
+            if same >= stable:
+                return img
+        else:
+            same = 0
+        last = n
+        if time.time() - t0 >= limit:
+            return best or img
+        time.sleep(step)
+
+
 def wait_window(title, before, limit=30.0):
     t0 = time.time()
     while time.time() - t0 < limit:
@@ -166,8 +201,7 @@ def main():
         hwnd = wait_window("Terminal GUI Toolbox", before)
         chk(hwnd is not None, "exe 起出主窗口")
         if hwnd:
-            time.sleep(2.5)
-            img = capture(hwnd)
+            img = settle(hwnd)
             chk(img is not None, "主窗口可截图")
             if img:
                 OUT.mkdir(exist_ok=True)
@@ -192,8 +226,7 @@ def main():
         hwnd2 = wait_window("Terminal GUI Toolbox", before2)
         chk(hwnd2 is not None, "--page vpn 起出主窗口")
         if hwnd2:
-            time.sleep(3.2)
-            img2 = capture(hwnd2)
+            img2 = settle(hwnd2)
             chk(img2 is not None, "VPN 页可截图")
             if img2:
                 OUT.mkdir(exist_ok=True)
@@ -214,8 +247,7 @@ def main():
         hwnd3 = wait_window("Terminal GUI Toolbox", before3)
         chk(hwnd3 is not None, "--page web 起出主窗口")
         if hwnd3:
-            time.sleep(4.0)
-            img3 = capture(hwnd3)
+            img3 = settle(hwnd3)
             chk(img3 is not None, "Web 服务页可截图")
             if img3:
                 OUT.mkdir(exist_ok=True)
@@ -234,8 +266,7 @@ def main():
         hwnd4 = wait_window("Terminal GUI Toolbox", before4)
         chk(hwnd4 is not None, "--page ai 起出主窗口")
         if hwnd4:
-            time.sleep(4.0)
-            img4 = capture(hwnd4)
+            img4 = settle(hwnd4)
             chk(img4 is not None, "AI 运维页可截图")
             if img4:
                 OUT.mkdir(exist_ok=True)

@@ -118,6 +118,13 @@ class FirewallBackend:
     can_write = True
     direction_hint = ""
 
+    # ---- 引擎能力声明
+    # 界面和校验都读这里，别在页面里再写一遍常量 —— 两处写死必然对不上。
+    max_rules = 0                 # 规则总数上限；0 = 不限或未知
+    one_cidr_per_rule = False     # 一条规则能不能只承载一个来源网段
+    location_granularity = "any"  # "any"=只认具体地址；"country"=只能到国家
+    location_note = ""            # 给用户看的一句人话（为什么不能更细）
+
     def __init__(self, session=None, device=None):
         self.session = session
         self.device = device
@@ -705,9 +712,41 @@ def _ports_are_plain(plist) -> bool:
     return all(re.fullmatch(r"\d{1,5}(-\d{1,5})?", str(x)) for x in plist)
 
 
+def _loc_parts(text) -> list[str]:
+    """把「位置」输入拆成国家/地区码（逗号、中文逗号、空格都当分隔符）。"""
+    s = str(text or "").replace("，", ",").replace(" ", ",")
+    return [p.strip().upper() for p in s.split(",") if p.strip()]
+
+
+def _loc_code(text) -> str:
+    """位置规则用哪个国家码；不是合法两字母码就当没填。
+
+    **只取第一个**：真机 1.json 里 9 条位置规则的 ipList 全是 ["CN"]，
+    多国家没有任何实证样本。官方规格虽然写「位置上限 15」，但没样本就不猜 ——
+    真填了两个由 validate 直接拒掉，绝不静默丢掉后面那个（丢一个等于
+    把「只允许这几个地区」变成「只允许一个地区」，是安全级别的静默错误）。
+    """
+    for p in _loc_parts(text):
+        if re.fullmatch(r"[A-Z]{2}", p):
+            return p
+    return ""
+
+
 class SynoBackend(FirewallBackend):
     key = "synofirewall"
     label = "群晖防火墙（配置文件）"
+
+    # 真机实证（DSM 7.4.1 / 192.168.3.12）：
+    #   位置规则 → iptables `-m geoip --source-country CN`，一条规则吃一整个国家；
+    #   自定义 IP → `-s 192.168.3.0/24`，**一段一条规则**（内核里 iprange 0 条，不合并）；
+    #   位置库只有 xt_geoip/<CC>.iv4|iv6（254 国 × 2），没有省级文件；
+    #   ipset 完全没有（lsmod 无 ipset/xt_set，没有 ipset 命令）。
+    # 官方规格：规则中的位置上限 15、规则数量上限 100。
+    max_rules = 100
+    one_cidr_per_rule = True
+    location_granularity = "country"
+    location_note = ("群晖的「位置」由内置 GeoLite 国家库决定（xt_geoip/<国码>.iv4），"
+                     "只有国家/地区码（CN / HK / MO / TW），没有省份")
 
     def __init__(self, session=None, device=None):
         super().__init__(session, device)
@@ -876,7 +915,10 @@ done"""
                 "跟 DSM 界面同一份配置，重启不丢 · 改完自动 reload")
 
     # ---------------- 校验
-    def validate(self, r: dict) -> str | None:
+    def validate(self, r: dict, replacing: int = 0) -> str | None:
+        # replacing = 这条规则会覆盖掉的旧规则条数（编辑时是 1，新增是 0）。
+        # 不算它的话，「把一条规则改成同一批网段」也会被额度检查误拦。
+        #
         # 这条最要紧：用户在界面上填了目标 IP，群晖没有对应字段。
         # 静默丢掉会让人以为目标限制生效了，所以直接拒绝并说清楚。
         if _split_pairs(r.get("dst")):
@@ -884,18 +926,48 @@ done"""
                     "字段（DSM 界面连这一列都不显示，目标恒为 any）。"
                     "要按目标地址限制，请用 iptables / nftables / firewalld，"
                     "或者把规则改成按来源收窄。")
-        ok, bad = ipaddr.split(r.get("src"))
-        if bad:
-            return (f"来源地址写错了：{bad[0]}"
-                    "（IPv4 如 192.168.1.0/24）")
-        for c in ok:
-            if c != "any" and ipaddr.family(c) == 6:
-                return ("群晖配置文件里的 IPv6 规则用的是另一套 ipType，"
-                        "没在真机验证过，不替你猜。IPv6 请用 iptables / nftables。")
-        n = len([c for c in ok if c != "any"])
-        if n > _MAX_RULES:
-            return (f"来源有 {n} 个网段，超过单条规则上限 {_MAX_RULES}，"
-                    "请分成多条规则")
+        # ---- 来源：位置（国家/地区） 或 具体网段，二选一
+        locs = _loc_parts(r.get("loc"))
+        if locs:
+            if len(locs) > 1:
+                return ("一条规则只能填一个位置：真机上 9 条位置规则的 ipList "
+                        "都是单值（[\"CN\"]），多国家没有实证样本。"
+                        "要允许多个地区请分条建 —— 静默只留一个，等于把"
+                        "「允许这几个地区」变成「只允许一个」。")
+            if not re.fullmatch(r"[A-Z]{2}", locs[0]):
+                return (f"位置要填两字母国家/地区码（如 CN、HK、MO、TW），"
+                        f"不是「{locs[0]}」。")
+            if _split_pairs(r.get("src")):
+                return ("「位置」和「来源地址」只能填一个：位置本身已经是"
+                        "按国家/地区整块匹配（内核里是 -m geoip --source-country），"
+                        "再叠一个 IP 段就该是两条规则了。要更细的只留来源地址。")
+            # 位置规则一条顶一整个国家，额度只占 1
+            n = 1
+        else:
+            ok, bad = ipaddr.split(r.get("src"))
+            if bad:
+                return (f"来源地址写错了：{bad[0]}"
+                        "（IPv4 如 192.168.1.0/24）")
+            for c in ok:
+                if c != "any" and ipaddr.family(c) == 6:
+                    return ("群晖配置文件里的 IPv6 规则用的是另一套 ipType，"
+                            "没在真机验证过，不替你猜。IPv6 请用 iptables / nftables。")
+            n = len([c for c in ok if c != "any"])
+            if n > _MAX_RULES:
+                return (f"来源有 {n} 个网段，超过单条规则上限 {_MAX_RULES}，"
+                        "请分成多条规则")
+        # 群晖是「一段一条规则」，所以真正的天花板是这个配置的规则总数（100），
+        # 不是上面那个 400（那是单条规则最多拆几段）。
+        # 不给这道闸会怎样：地址库选「澳门」58 段全部通过校验，下发时
+        # synofirewall --update 装不下，用户看到的是「改了但没生效」。
+        used = len(self._rows_global())
+        budget = max(self.max_rules - used + replacing, 0)
+        if n > budget:
+            return (f"群晖每个防火墙配置最多 {self.max_rules} 条规则，当前已有 "
+                    f"{used} 条，只剩 {budget} 个位置（一个来源网段占一条规则）。"
+                    "按地区过滤请改用「位置」（一条规则顶一整国），"
+                    "但它只能到国家/地区、没有省份；按省请换 "
+                    "iptables / nftables / firewalld 后端。")
         port = str(r.get("port") or "").strip()
         if port and not re.fullmatch(r"[\d,，\s\-]+", port):
             return ("端口只填数字（22 / 80,443 / 1000-2000）；"
@@ -921,13 +993,25 @@ done"""
             old_pg = int(keep.get("portGroup") or 0)
             if old_pg in (0, 3):
                 pgroup = old_pg
+        # 三种来源形态，字段组合逐条对齐真机 1.json 里已有的规则：
+        #   位置   ipGroup=3 ipType=2 ipList=["CN"]        （9 条实证）
+        #   自定义 ipGroup=1 ipType=0 ipList=[地址,掩码]    （52 条实证）
+        #   所有   ipGroup=0 ipType=0 ipList=[]             （21 条实证）
+        # ipType 和 ipGroup 是绑死的（3↔2、5↔2、0/1↔0），别单独改其中一个。
+        loc = _loc_code(r.get("loc"))
+        if loc:
+            group, iplist, itype = 3, [loc], 2
+        elif cidr:
+            group, iplist, itype = 1, _syno_iplist(cidr), 0
+        else:
+            group, iplist, itype = 0, [], 0
         return {
             "adapterDirect": 1, "blLog": False,
             "chainList": ["FORWARD_FIREWALL", "INPUT_FIREWALL"],
             "enable": True, "ipDirect": 1,
-            "ipGroup": 1 if cidr else 0,
-            "ipList": _syno_iplist(cidr),
-            "ipType": 0, "labelList": [],
+            "ipGroup": group,
+            "ipList": iplist,
+            "ipType": itype, "labelList": [],
             "name": str(r.get("comment") or ""),
             "policy": 0 if act in _SYNO_ALLOW else 1,
             "portDirect": 0,
@@ -949,7 +1033,8 @@ done"""
 
     def set_cmds(self, old: dict, new: dict) -> list[str]:
         """就地替换，不走「先删后加」—— 中间态会让那条规则短暂消失。"""
-        err = self.validate(new)
+        # replacing=1：这条旧规则会被顶掉，额度要还回来
+        err = self.validate(new, replacing=1)
         if err:
             raise FirewallError(err)
         if not old.get("editable"):

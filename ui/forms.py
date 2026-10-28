@@ -322,7 +322,10 @@ class FormDialog(tk.Toplevel):
                 from ui.ipick import IpPickDialog
                 got = IpPickDialog.open(
                     self, initial=t.get("1.0", "end").strip(),
-                    title=f.get("lib_title") or "地址库")
+                    title=f.get("lib_title") or "地址库",
+                    # lib_groups 让后端自己决定能选哪几组：群晖只有国家级的
+                    # 位置库，就不该把「中国省级」列出来让用户白选一场。
+                    allowed=f.get("lib_groups"))
                 if got is None:
                     return
                 t.delete("1.0", "end")

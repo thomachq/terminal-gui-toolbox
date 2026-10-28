@@ -28,14 +28,20 @@ class IpPickDialog(tk.Toplevel):
     """三组页签 + 勾选 + 「加入地址框」。"""
 
     def __init__(self, parent, initial: str = "", title: str = "地址库",
-                 width: int = 820, height: int = 620):
+                 width: int = 820, height: int = 620, allowed=None):
         super().__init__(parent)
         self.withdraw()
         self.title(title)
         self.configure(bg=U.T.page)
         self.transient(parent)
         self.result: str | None = None
-        self._group = iplib.GROUPS[0][0]
+        # allowed = 只列这几组（后端说了算）。群晖的位置库只有国家级，
+        # 把「中国省级」摆出来就是让用户白选一场 —— 选了也下发不了。
+        self._groups = [g for g in iplib.GROUPS
+                        if not allowed or g[0] in tuple(allowed)]
+        if not self._groups:
+            self._groups = list(iplib.GROUPS)
+        self._group = self._groups[0][0]
         self._picked: dict[str, iplib.Item] = {}
         self._items: list[iplib.Item] = []
         self._busy = False
@@ -55,10 +61,13 @@ class IpPickDialog(tk.Toplevel):
         U.RoundButton(head, "加入", self._ok, variant="primary",
                       height=30, padx=20).pack(side="right", padx=(0, U.px(8)))
 
+        note = ("勾选的条目会展开成具体网段。IPv4 / IPv6 都有；省级含"
+                "中国香港、中国澳门、中国台湾。")
+        if allowed and "province" not in tuple(allowed):
+            note = ("当前后端的「位置」只有国家/地区级数据（没有省级），"
+                    "所以这里只列国家/地区与常用网段 —— 选省级也下发不了。")
         U.wlabel(
-            wrap,
-            "勾选的条目会展开成具体网段。IPv4 / IPv6 都有；省级含"
-            "中国香港、中国澳门、中国台湾。",
+            wrap, note,
             "pagedim", U.FONT_XS, justify="left",
             wraplength=U.px(width - 60)).pack(anchor="w", pady=(U.px(4), 0))
 
@@ -67,7 +76,7 @@ class IpPickDialog(tk.Toplevel):
 
         bar = U.wframe(card.body, "card")
         bar.pack(fill="x", pady=(0, U.px(8)))
-        self.seg = tbl.Segmented(bar, [(k, lab) for k, lab, _fn in iplib.GROUPS],
+        self.seg = tbl.Segmented(bar, [(k, lab) for k, lab, _fn in self._groups],
                                  command=self._switch)
         self.seg.pack(side="left")
         self.btn_update = U.RoundButton(bar, "更新地址库", self._update,
@@ -279,8 +288,9 @@ class IpPickDialog(tk.Toplevel):
 
     # ------------------------------------------------------------ 入口
     @classmethod
-    def open(cls, parent, initial: str = "", title: str = "地址库") -> str | None:
-        dlg = cls(parent, initial=initial, title=title)
+    def open(cls, parent, initial: str = "", title: str = "地址库",
+             allowed=None) -> str | None:
+        dlg = cls(parent, initial=initial, title=title, allowed=allowed)
         try:
             parent.wait_window(dlg)
         except tk.TclError:

@@ -209,11 +209,16 @@ def test_app() -> None:
     app.pack(fill="both", expand=True)
     app.update_idletasks()
 
-    check("导航 5 项", len(app.nav.items) == 5, str(list(app.nav.items)))
-    check("页面 5 个", len(app._pages) == 5, str(list(app._pages)))
+    # 导航项与页面必须一一对应。这里以前写死「5 项 / 5 个」，加了「服务」页
+    # 之后就一直假红（还得靠人记得回来改数字）。改成校验**对应关系**：
+    # 新增页面忘了在 builder / _pages 里接上，这里立刻会红，且不会因为
+    # 页数变化而假红。
+    nav_keys = list(app.nav.items)
+    check("导航项与页面一一对应", sorted(nav_keys) == sorted(app._pages),
+          f"nav={nav_keys} pages={list(app._pages)}")
     check("默认停在连接页", app.nav.current == "conn")
 
-    for key in ("conn", "cert", "pack", "deploy", "cons"):
+    for key in nav_keys:
         app.nav.select(key)
         app.update_idletasks()
         check(f"切换到 {key} 不报错", app.nav.current == key)

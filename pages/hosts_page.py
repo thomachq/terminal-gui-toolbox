@@ -197,7 +197,9 @@ def host_fields(rec: dict | None = None, cred_opts=None, proxy_opts=None,
          "save": True, "save_default": bool(rec.get("key_passphrase")),
          # 这行右边只剩很窄一条（口令框 + 「保存」勾占满了），说明写长了
          # 会被折成「…加密保 / 存」。短句即可，「保存」勾本身已经说清了
-         "hint": "口令不是必填"},
+         # 原来写「口令不是必填」是错的：加密的私钥不填就根本连不上，
+         # 而这句话正是「把账户登录密码贴进来还觉得没问题」的诱因之一。
+         "hint": "加密私钥必填；留空＝不改"},
         {"key": "password", "label": "登录密码", "kind": "password",
          "show_if": login_pw, "watch": ["proto", "auth"],
          "default": "",
@@ -266,6 +268,43 @@ def host_fields(rec: dict | None = None, cred_opts=None, proxy_opts=None,
         seen.add(f["key"])
         out.append(f)
     return out
+
+
+def keypw_error(store, rec: dict) -> str | None:
+    """保存前的私钥自检：填了「私钥密码」就必须真能解开这把私钥。
+
+    为什么要在保存时拦：原来只在点「连接」那一刻校验（`app.py` 里
+    `inspect_key`），填错能一路静默存进档案。实测过一次真实的坑 ——
+    同一把私钥在「192.168.3.12」和「飞牛OS」两条档案里共用，新建那条时把
+    **账户登录密码**（12 位）贴进了「私钥密码」（正确是 16 位），于是
+    「可达」显示正常、点连接却报「私钥文件本身可能也坏了」，人去怀疑密钥、
+    甚至准备重新生成。密钥没坏，错的只是这个字段。
+
+    返回人话错误（给 messagebox 直接用），没问题返回 None。
+    """
+    from profiles import inspect_key, passphrase_owner
+
+    if H.proto_of(rec) != "ssh" or str(rec.get("auth") or "") != "key":
+        return None
+    kp = str(rec.get("key_path") or "").strip()
+    if not kp:
+        return None
+    pw = str(rec.get("key_passphrase") or "")
+    info = inspect_key(kp, pw or None)
+    if info.get("ok"):
+        return None
+    if info.get("format") == "ppk":
+        return ("PuTTY 的 .ppk 不能直接用。\n"
+                "用 PuTTYgen → Conversions → Export OpenSSH key 导出后再选。")
+    if info.get("encrypted") and not pw:
+        return ("这把私钥带口令保护，必须填「私钥密码」——"
+                "留空表示「不改已存的」，不是「不用填」。")
+    owner = passphrase_owner(store, kp, pw)
+    if owner:
+        return (f"「私钥密码」解不开这把私钥。\n\n"
+                f"同一把私钥在「{owner}」那条档案里用的是另一个密码，"
+                f"照抄那一串即可 —— 密钥文件本身没坏，不用重新生成。")
+    return str(info.get("error") or "私钥读不出来")
 
 
 def merge_host_form(data: dict, base: dict | None = None,
@@ -701,20 +740,43 @@ class HostsPage:
                                    str(px.get("name") or "")))
         fields = host_fields(rec, cred_opts, proxy_opts)
         title = "编辑主机" if rec.get("name") else "添加主机"
-        data = forms.FormDialog.open(
-            self, title, fields,
-            subtitle="只填能连上的必要信息；口令勾了「保存」才加密落盘，不进日志")
-        if not data:
-            return None
-        merged = merge_host_form(data, base=rec)
-        # 名字就是主键，编辑时要按「改之前的名字」跳过自己：
-        # merged 是合并出来的新 dict，validate 里的身份比对认不出它是同一条。
-        errs = H.validate(merged, others=self.profiles.profiles,
-                          skip_name=str(rec.get("name") or ""))
-        if errs:
-            messagebox.showwarning("保存不了", "\n".join(errs), parent=self)
-            return None
-        return merged
+        # 口令不对时**重开表单让它重填**，而不是打一句错就把窗口关掉 ——
+        # 关掉等于把用户刚填的地址、用户名、端口全丢了，只剩一肚子火。
+        # 但只重开两次：私钥口令反复试也有代价，两次不过就请他自己核对。
+        base = rec
+        kpw_try = 0
+        while True:
+            data = forms.FormDialog.open(
+                self, title, host_fields(base, cred_opts, proxy_opts),
+                subtitle=("把「私钥密码」改对再存。其它内容都还在 —— 只有这一格要重填。"
+                          if kpw_try else
+                          "只填能连上的必要信息；口令勾了「保存」才加密落盘，不进日志"))
+            if not data:
+                return None
+            merged = merge_host_form(data, base=base)
+            # 名字就是主键，编辑时要按「改之前的名字」跳过自己：
+            # merged 是合并出来的新 dict，validate 里的身份比对认不出它是同一条。
+            errs = H.validate(merged, others=self.profiles.profiles,
+                              skip_name=str(rec.get("name") or ""))
+            if errs:
+                messagebox.showwarning("保存不了", "\n".join(errs), parent=self)
+                return None
+            # 私钥自检放在「格式校验通过」之后、「写盘」之前：填错的口令
+            # 不该有资格被存进去（见 keypw_error 的说明）。
+            kerr = keypw_error(self.profiles, merged)
+            if not kerr:
+                return merged
+            kpw_try += 1
+            if kpw_try >= 2:
+                messagebox.showerror(
+                    "私钥密码两次都没通过",
+                    f"{kerr}\n\n"
+                    "已经填错两次，先核对清楚再存吧 —— 反复试没有意义，"
+                    "密钥文件本身多半没问题，错的只是这一格。",
+                    parent=self)
+                return None
+            messagebox.showerror("私钥密码不对，请重填", kerr, parent=self)
+            base = merged          # 其它字段原样带回去，只让口令重填
 
     def host_add(self) -> None:
         rec = self._host_form(None)

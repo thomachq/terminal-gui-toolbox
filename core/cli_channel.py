@@ -34,6 +34,11 @@ _PASSWORD = re.compile(
 
 _PROMPT_TAIL = re.compile(r"[#>\]$]\s*$")
 
+# 「sudo 正在问密码」这一整行：`[sudo] password for fnosadmin:`、`Password:`、`密码：`
+_PROMPT_LINE = re.compile(
+    r"^\s*(?:\[sudo\]\s*)?(?:password|passwd|密码)"
+    r"(?:\s*for\s+[^\s:：]+)?\s*[:：]\s*$", re.I)
+
 # sudo 拒绝的几种回显：密码错、不在 sudoers、需要终端
 _SUDO_BAD = re.compile(
     r"(sorry,\s*(try again|a password is required)|incorrect password|"
@@ -48,9 +53,21 @@ def _tail(text: str, limit: int = 180) -> str:
 
     失败原因必须**原文**报给用户：`not in the sudoers file` 和
     `Sorry, try again` 是两件完全不同的事，笼统说「提权失败」等于没说。
+
+    但「密码提示本身」不算原文：`[sudo] password for fnosadmin:` 只是 sudo
+    在问话，把它拼进「原文」会变成
+    `Sorry, try again. ／ [sudo] password for fnosadmin:` —— 用户会以为
+    这是 sudo 对他说的第二句话。先剔掉再拼。
     """
     lines = [x.strip() for x in re.split(r"[\r\n]+", text or "") if x.strip()]
-    s = " ／ ".join(lines[-2:]) if lines else ""
+    lines = [x for x in lines if not _PROMPT_LINE.match(x)]
+    # sudo 试错会连问两遍密码，于是回显里躺着两条一模一样的
+    # `Sorry, try again.`；原样拼起来像在结巴。相邻重复压成一条。
+    uniq: list[str] = []
+    for x in lines:
+        if not uniq or uniq[-1] != x:
+            uniq.append(x)
+    s = " ／ ".join(uniq[-2:]) if uniq else ""
     return s[-limit:]
 
 
@@ -253,10 +270,27 @@ class CLIClient:
         head = self._drain(time.time() + 5, quiet=0.45)
         if _PASSWORD.search(head):
             self._send(password + "\r\n")
-            head += self._drain(time.time() + max(timeout - 5, 6), quiet=0.6)
+            # quiet 必须放宽：密码错时 PAM 会**先沉默十几秒**才打
+            # 「Sorry, try again.」（飞牛OS 实测约 10 秒）。以前这里是 0.6 秒，
+            # 一到点就收工，于是既没看到 Sorry、也没看到新提示符，
+            # 上层只能报一句「sudo -i 之后 id -u = 读不到」——
+            # 密码错被说成「没真的变成 root」，用户根本不知道该改什么。
+            head += self._drain(time.time() + max(timeout - 5, 12), quiet=2.0)
         # 密码错 / 不在 sudoers / 要 tty：这三种都不能假装成功
         if _SUDO_BAD.search(head):
-            self.last_error = _tail(head) or "sudo 拒绝了这次提权"
+            tail = _tail(head)
+            # sudo 的原文照抄在括号里（定位时还得看原文），前面给一句人话。
+            # 只给原文的话，界面上就是「提权未生效：Sorry, try again.」——
+            # 用中文的用户看不出这话的重点是「密码不对」。
+            if re.search(r"sorry|incorrect password|no password", head, re.I):
+                self.last_error = f"密码不对（sudo 原文：{tail}）"
+            else:
+                self.last_error = tail or "sudo 拒绝了这次提权"
+            return False
+        # 兜底：没抓到 Sorry、但 sudo 又问了第二遍密码 —— 同样是密码不对。
+        # 有些 PAM 配置延迟更久，光靠 _SUDO_BAD 会漏。
+        if head.count("password for") >= 2:
+            self.last_error = "密码不对（sudo 又问了一遍密码）"
             return False
         # 密码对了也可能仍停在原 shell（sudoers 只放行了部分命令），落一锤
         self._send("id -u\r\n")

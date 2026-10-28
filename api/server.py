@@ -591,6 +591,10 @@ OPENAPI = {
                             "host": {"type": "string"},
                             "port": {"type": "integer", "default": 22},
                             "user": {"type": "string"},
+                            "auth": {"type": "string", "enum": ["key", "password"],
+                                     "description": "认证方式。给了就以它为准；"
+                                                    "不给则「有 key_path 用私钥、"
+                                                    "否则用 password」"},
                             "password": {"type": "string"},
                             "key_path": {"type": "string",
                                          "description": "本机私钥路径（与 password 二选一）"},
