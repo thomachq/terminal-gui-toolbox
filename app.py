@@ -135,7 +135,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.31"
+APP_VER = "1.0.32"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -4327,6 +4327,33 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             dlg.focus_set()
         dlg.grab_set()
 
+def _emit_version() -> bool:
+    """把版本号写到 stdout，写成功返回 True。
+
+    windowed 的 onefile exe（PyInstaller `console=False`）在**既没有控制台、也没有
+    重定向**时 `sys.stdout` 是 None —— 直接 print 会 AttributeError，被吞掉之后
+    表现就是「敲了 --version 什么也没发生」。所以顺序是：
+    现成的 stdout → 挂到父进程控制台（ATTACH_PARENT_PROCESS）→ 都不行返回 False。
+    """
+    out = sys.stdout
+    if out is None and os.name == "nt":
+        try:
+            import ctypes
+            # ATTACH_PARENT_PROCESS = -1，父进程有控制台才返回非 0
+            if ctypes.windll.kernel32.AttachConsole(-1):
+                out = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+        except OSError:
+            out = None
+    if out is None:
+        return False
+    try:
+        out.write(f"{APP_NAME} v{APP_VER}\n")
+        out.flush()
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def main():
     # 一次性 UAC 提权助手（由「以管理员身份运行」拉起）：**不开窗口、不建 Tk**，
     # 只从指定目录里领命令、把结果写回去，主程序退出时它自己退出。
@@ -4342,6 +4369,19 @@ def main():
             except (IndexError, ValueError):
                 parent = 0
         raise SystemExit(elev.serve(path, parent))
+
+    # `--version`：只打一行就退，**不建 Tk、不碰 data/**。
+    # 以前它只挂在 `_NO_SINGLETON` 名单里、没有处理分支 → 敲了会照常起 GUI，
+    # windowed 下又没有 stdout，看起来就是「无输出 + 卡住」。发版自检要用它。
+    if "--version" in sys.argv:
+        if not _emit_version():
+            # 双击运行（无控制台、无可重定向流）才走弹窗；自动化调用一定有
+            # stdout，不会弹 —— 弹窗会卡死自测脚本。
+            try:
+                messagebox.showinfo(f"{APP_NAME} 版本", f"v{APP_VER}")
+            except tk.TclError:
+                pass
+        return
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
