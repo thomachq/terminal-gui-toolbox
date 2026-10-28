@@ -16,12 +16,17 @@ import tkinter as tk
 
 import wbtui as U
 from core import ipaddr, iplib
+from core.firewall import _MAX_RULES as _RULE_CAP
 from ui import table as tbl
 
 # 展开条数保护：一条规则塞几千个网段会把设备打挂（iptables 逐条 -A，
 # 群晖那种老内核一万条要跑几十秒），所以分三档。
-_WARN_AT = 200
-_REFUSE_AT = 2000
+#
+# 上限**必须**与 core/firewall._MAX_RULES 同源。以前这里是独立写死的 2000，
+# 而校验那儿是 400：用户在地址库里挑到 1500 条，点确定一路放行，直到下发前
+# 才被拦下 —— 白挑一场，而且两个数字对不上会让人以为是设备限制。
+_WARN_AT = max(1, _RULE_CAP // 2)
+_REFUSE_AT = _RULE_CAP
 
 
 class IpPickDialog(tk.Toplevel):
@@ -255,14 +260,16 @@ class IpPickDialog(tk.Toplevel):
             return
         if len(cidrs) > _REFUSE_AT:
             self.lb_err.configure(
-                text=f"展开后有 {len(cidrs)} 条，太多了（上限 {_REFUSE_AT}）。"
-                     "少选几项，或者分几条规则下发。")
+                text=f"展开后有 {len(cidrs)} 条，超过单条规则上限 {_REFUSE_AT} 条。"
+                     "这是工具箱自己的批量上限（怕一条规则生成上千条命令把设备"
+                     "写死），不是设备的限制 —— 少选几项，或者分几条规则下发。")
             return
         if len(cidrs) > _WARN_AT:
             from tkinter import messagebox
             if not messagebox.askokcancel(
                     "确认要下发这么多？",
                     f"展开后有 {len(cidrs)} 条网段，会生成同样多的规则命令。\n\n"
+                    f"单条规则的上限是 {_REFUSE_AT} 条（工具箱的批量上限）。\n"
                     "设备上逐条执行会比较慢，建议按用途拆分。继续吗？",
                     parent=self):
                 return

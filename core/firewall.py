@@ -47,6 +47,11 @@ def _first(text) -> str:
 # 一条表单规则最多展开成多少条后端命令。地址库选一个省就是几百条网段，
 # 源 × 目标 再一乘就是天文数字（iptables 逐条 -A，几十万条能把设备写死），
 # 所以在生成命令前先卡一道：宁可让用户少选，也不要下发到一半断掉。
+#
+# 这是**工具箱自己的批量上限，不是任何设备的规定**（唯一的设备限制是群晖
+# 「每个配置最多 100 条规则」，见 SynoBackend.max_rules）。文案里必须这么说，
+# 否则用户会以为是设备只允许 400 条。ui/ipick.py 的 _REFUSE_AT 直接引用这里，
+# 数字只留一处。
 _MAX_RULES = 400
 
 
@@ -72,7 +77,8 @@ def _check_addrs(r: dict) -> str | None:
         n = len([c for c in ok if c != "any"])
         if n > _MAX_RULES:
             return (f"{label}有 {n} 个网段，超过单条规则上限 "
-                    f"{_MAX_RULES} 条，请少选几项或分成多条规则")
+                    f"{_MAX_RULES} 条（工具箱的批量上限，不是设备限制），"
+                    "请少选几项或分成多条规则")
     n_src = len(_split_pairs(r.get("src")))
     n_dst = len(_split_pairs(r.get("dst")))
     if n_src and n_dst and n_src * n_dst > _MAX_RULES:

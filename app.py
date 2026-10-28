@@ -135,7 +135,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.29"
+APP_VER = "1.0.30"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -1657,7 +1657,8 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.log_model.add(kind, text)
 
     def _audit_command(self, cmd: str, rc: int, out: str, err: str,
-                       ms: int, by_api: bool = False) -> None:
+                       ms: int, by_api: bool = False,
+                       device: str = "") -> None:
         """把一条命令执行记进操作审计（「日志管理」页读的就是它）。
 
         用户的要求是「日志里能看到执行了什么命令、输出了什么」，同时
@@ -1687,9 +1688,10 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         # 传别的会被默默归一成 info —— 失败的命令就看不出来了）
         self._audit("ai.command" if by_api else "terminal.command",
                     "fail" if rc != 0 else "ok", detail,
+                    device=device,
                     actor="智能体" if by_api else "用户")
 
-    def _trace_cmd(self, display, rc, out, err, ms):
+    def _trace_cmd(self, display, rc, out, err, ms, device=""):
         cmd = str(display or "")
         # 会话池给智能体跑的每条命令都带这个前缀（见 api/pool.py::_trace）。
         # 有它才分得清「人敲的」和「智能体跑的」—— 审计里连 actor 都不一样。
@@ -1707,7 +1709,8 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                 self._log_raw("bad", e if e.endswith("\n") else e + "\n")
             self._log_raw("meta", "\n")
             # 落一条操作审计 —— 运维工具跑的每条命令都会出现在「日志管理」里
-            self._audit_command(cmd, rc, out, err, ms, by_api=by_api)
+            self._audit_command(cmd, rc, out, err, ms, by_api=by_api,
+                                device=device)
             # 终端开着就把同一条记录也送过去（终端自己敲的命令会被它标记跳过）
             self._term_feed(shown, rc, out, err, ms)
         self.post(render)

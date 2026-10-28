@@ -13,9 +13,46 @@ import json
 import os
 import re
 import stat
+import time
 from pathlib import Path
 
 import crypto_store
+
+
+def save_blob(dst: Path, blob: bytes) -> None:
+    """把一份「整机数据」安全地写到 dst（临时文件 + 原子替换）。
+
+    为什么不能只 `os.replace` 一下：Windows 上目标文件被**任何**进程以普通
+    方式打开着（杀软扫一下、别的线程在并发读），replace 就报 WinError 5
+    「拒绝访问」—— 实测 22:06 存成功、22:11 就失败，纯靠运气。失败时数据还
+    在 .tmp 里，但用户看到的是弹窗「保存失败」，改的东西等于白改。
+
+    所以三层：replace 重试 5 次（间隔递增，覆盖杀软扫几秒的情形）→
+    直接覆写目标（放弃原子性，写坏一半的概率远小于保存不进去）→
+    都不行才把最后一个错误抛出去。
+    """
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.write_bytes(blob)
+    last: OSError | None = None
+    for i in range(5):
+        try:
+            os.replace(tmp, dst)
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(0.15 * (i + 1))
+    try:
+        with open(dst, "wb") as f:
+            f.write(blob)
+        tmp.unlink(missing_ok=True)
+        return
+    except OSError:
+        pass
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    raise last or OSError(f"写不进 {dst}")
 
 KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa", "id_dsa")
 
@@ -377,8 +414,7 @@ class ProfileStore:
             blob = plain             # 加密不可用时退回明文，至少程序还能用
             self.encrypted = False
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_bytes(blob)
-        os.replace(tmp, self.path)
+        save_blob(self.path, blob)
 
     @staticmethod
     def _clean(p: dict) -> dict:

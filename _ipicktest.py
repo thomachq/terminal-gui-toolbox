@@ -61,7 +61,7 @@ root.geometry("1200x800+40+40")
 U.apply_theme("light")
 root.update()
 
-from ui.ipick import IpPickDialog, _REFUSE_AT  # noqa: E402
+from ui.ipick import IpPickDialog, _REFUSE_AT, _WARN_AT  # noqa: E402
 
 st = iplib.installed()
 has_prov = st["province"] > 0
@@ -143,22 +143,43 @@ if has_prov:
     dlg.seg.select("province")
     root.update()
     gd = next(r for r in dlg.tb.rows() if "广东" in r["name"])
+    n_gd = len(iplib.expand_items([gd["_item"]]))
     dlg._picked[gd["_key"]] = gd["_item"]
     dlg._render()
     root.update()
     _WARN_CALLS.clear()
     dlg._ok()
     root.update()
-    chk(_WARN_CALLS and "确认" in _WARN_CALLS[-1],
-        "超过 200 条时弹了确认框（不是闷声下发）", _WARN_CALLS[-1:])
-    chk(dlg.result is not None, "点「加入」产出结果")
-    lines = [x for x in (dlg.result or "").splitlines() if x.strip()]
-    chk(len(lines) > 0, f"广东展开 {len(lines)} 条", str(len(lines)))
-    bad = [x for x in lines if ipaddr.norm(x)[1]]
-    chk(not bad, "每一行都是合法 CIDR", str(bad[:3]))
-    chk(all(ipaddr.family(x) in (4, 6) for x in lines), "地址族都能认出来")
+    # 广东 1954 条 > 上限（400）。以前这里放行、到「下发」前才被另一个数字
+    # 拦住 —— 用户挑了一整场，最后发现白挑。现在在地址库里就说清楚。
+    chk(n_gd > _REFUSE_AT, f"广东展开 {n_gd} 条，确实超过上限 {_REFUSE_AT}",
+        str(n_gd))
+    chk(dlg.result is None, "超上限不进地址框（窗口不关，可以改选）")
+    chk("不是设备的限制" in dlg.lb_err.cget("text"),
+        "并说明这是工具箱的批量上限、不是设备限制",
+        dlg.lb_err.cget("text")[:60])
 else:
     skip("省级数据未安装，跳过展开校验")
+
+# 上限的一半 ~ 上限之间：弹确认框，点了才放行
+dlg._clear()
+mid = iplib.Item("fake_mid", "假数据", "",
+                 [f"10.{(i * 4) // 256}.{(i * 4) % 256}.0/24"
+                  for i in range(_WARN_AT + 20)], "province")
+dlg._picked["fake_mid"] = mid
+dlg._render()
+root.update()
+_WARN_CALLS.clear()
+dlg._ok()
+root.update()
+chk(_WARN_CALLS and "确认" in _WARN_CALLS[-1],
+    f"{_WARN_AT} 条以上弹了确认框（不是闷声下发）", _WARN_CALLS[-1:])
+lines = [x for x in (dlg.result or "").splitlines() if x.strip()]
+chk(len(lines) == _WARN_AT + 20,
+    f"确认后产出 {_WARN_AT + 20} 条", str(len(lines)))
+bad = [x for x in lines if ipaddr.norm(x)[1]]
+chk(not bad, "每一行都是合法 CIDR", str(bad[:3]))
+chk(all(ipaddr.family(x) in (4, 6) for x in lines), "地址族都能认出来")
 
 # 已有的值要保留（用户手填的网段不能被地址库抹掉）
 dlg2 = IpPickDialog(root, initial="10.0.0.0/8\n192.168.1.5")
@@ -174,6 +195,10 @@ chk("10.0.0.0/8" in vals and "192.168.1.5/32" in vals,
 
 # ==================================================== 4. 上限保护
 sec("4. 条数上限")
+from core import firewall as FW  # noqa: E402
+chk(_REFUSE_AT == FW._MAX_RULES,
+    "地址库上限与 firewall._MAX_RULES 同源（以前是各自写死的 2000 / 400）",
+    f"{_REFUSE_AT} vs {FW._MAX_RULES}")
 dlg3 = IpPickDialog(root)
 root.update()
 big = iplib.Item("fake", "假数据", "",
@@ -191,6 +216,9 @@ chk(dlg3.winfo_exists() and dlg3.result is None,
     f"超过 {_REFUSE_AT} 条拒绝回填，窗口不关")
 chk("太多" in dlg3.lb_err.cget("text") or "上限" in dlg3.lb_err.cget("text"),
     "并说清楚原因", dlg3.lb_err.cget("text"))
+chk("不是设备的限制" in dlg3.lb_err.cget("text"),
+    "文案点明这是工具箱的批量上限，不是设备限制",
+    dlg3.lb_err.cget("text"))
 dlg3.destroy()
 
 # ==================================================== 5. 表单字段

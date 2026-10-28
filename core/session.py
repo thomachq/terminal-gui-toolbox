@@ -239,6 +239,26 @@ def windows_argv(cmd: str) -> list[str]:
 
 
 
+def call_tracer(fn, display, rc, out, err, ms, device=""):
+    """调 tracer，并且**告诉它是哪台设备跑的**。
+
+    为什么要带 device：审计日志的「设备」字段以前取的是「界面上当前选中的
+    那台」（app._trace_cmd 里读 self.session.label）。可 API 池里的会话和界面
+    的当前会话是两套 —— 界面停在 192.168.3.48 时，智能体在 192.168.3.12 上
+    跑的命令会被记成 3.48，事后翻日志根本分不清谁是谁（实测踩到）。
+
+    老 tracer 只认 5 个参数（自测脚本里就有），所以用 TypeError 兜一次；
+    只认「多了 device 这个关键字」的 TypeError，别的 TypeError 照旧往外抛 ——
+    否则 tracer 自己写错了会被当成签名不匹配，悄悄跑两遍。
+    """
+    try:
+        return fn(display, rc, out, err, ms, device=device)
+    except TypeError as e:
+        if "device" not in str(e):
+            raise
+        return fn(display, rc, out, err, ms)
+
+
 class BaseSession:
     kind = "base"
     platform_hint = ""        # 已知系统族时填上，探测可省掉好几条探针
@@ -276,7 +296,8 @@ class BaseSession:
     def _trace(self, display: str, rc: int, out: str, err: str, ms: int) -> None:
         if self.tracer:
             try:
-                self.tracer(display, rc, out, err, ms)
+                call_tracer(self.tracer, display, rc, out, err, ms,
+                            device=self.label or "")
             except Exception:  # noqa: BLE001
                 pass
 

@@ -43,3 +43,6 @@ _commitmsg.txt
 _release/
 _tagmsg.txt
 /query
+
+# rm 被安全守护拦时改名保留的旧构建目录
+build.prev-*/

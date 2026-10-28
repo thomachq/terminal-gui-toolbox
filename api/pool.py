@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from core.detect import DeviceInfo, detect, dialect_for
 from core.metrics import Sampler
 from core.redact import scrub
-from core.session import ConnSpec, SessionError, open_session
+from core.session import (ConnSpec, SessionError, call_tracer,
+                          open_session)
 
 MAX_OUT_CHARS = 200_000        # 单条命令回传上限，防止把智能体上下文撑爆
 
@@ -59,17 +60,22 @@ def _auth_of(spec: dict) -> str:
     return "key" if str(spec.get("key_path") or "").strip() else "password"
 
 
-def _tagged(tracer):
+def _tagged(tracer, label: str = ""):
     """把主程序的 tracer 包一层，给每条命令加上 API 标记。
 
     挂在会话上（而不是只在 exec 里加），是为了让这个会话干的所有事都带标记 ——
     包括 open() 时那几轮设备探测，否则日志里会冒出一串「谁也不知道是谁跑的」命令。
+
+    `label` 是这个 API 会话自己的 user@host：一定要随命令一起传出去。
+    审计的「设备」字段以前读的是界面当前选中的那台，界面停在 A 设备、智能体
+    在 B 设备上跑命令时，日志会把 B 写成 A（实测踩到，事后追不到底）。
     """
-    def wrapped(display, rc, out, err, ms):
+    def wrapped(display, rc, out, err, ms, device=""):
         text = str(display or "")
         if not text.startswith(API_CMD_TAG):
             text = API_CMD_TAG + text
-        return tracer(text, rc, out, err, ms)
+        return call_tracer(tracer, text, rc, out, err, ms,
+                           device=device or label)
     return wrapped
 
 
@@ -148,6 +154,20 @@ class SessionPool:
         self._thread: threading.Thread | None = None
 
     # ------------------------------------------------------------ 事件
+    def _hook(self, sess, user: str = "", host: str = "") -> None:
+        """给会话挂 tracer，并把「这条命令是哪台设备跑的」定死在这里。
+
+        重连出来的新会话也必须挂（以前只在 open() 挂，重连之后智能体跑的
+        命令既不进日志也不进审计 —— 断线重连过的会话等于全程没留痕）。
+        """
+        if self.tracer is None:
+            return
+        label = (getattr(sess, "label", "")
+                 or f"{user + '@' if user else ''}{host or '本机'}")
+        try:
+            sess.tracer = _tagged(self.tracer, label)
+        except Exception:  # noqa: BLE001
+            pass
     def _emit(self, kind: str, text: str) -> None:
         if self.on_event:
             try:
@@ -187,11 +207,9 @@ class SessionPool:
         # 就是这个原因（池走的是 run()/run_admin()，不像主程序走 run_traced()）。
         # 包一层加前缀：连 detect 阶段的探测命令也算「智能体干的」，
         # 不然同一台设备谁在乱扫，事后看不出来。
-        if self.tracer is not None:
-            try:
-                sess.tracer = _tagged(self.tracer)
-            except Exception:  # noqa: BLE001
-                pass
+        # 包一层加前缀：连 detect 阶段的探测命令也算「智能体干的」，
+        # 不然同一台设备谁在乱扫，事后看不出来。
+        self._hook(sess, cs.user, cs.host)
 
         try:
             dev = detect(sess)
@@ -388,6 +406,8 @@ class SessionPool:
             if spec.get("sudo_password") and hasattr(sess, "sudo_pw"):
                 sess.sudo_pw = spec["sudo_password"]
             sess.is_root = getattr(c.device, "is_root", False)
+            self._hook(sess, str(spec.get("user") or ""),
+                       str(spec.get("host") or ""))
             c.session = sess
             try:
                 c.sampler = Sampler(sess, c.dialect)

@@ -19,6 +19,8 @@ import tkinter as tk
 
 import wbtui as U
 from core import devicecert as DC
+from core import iplib
+from core import region as RG
 from core import secscan as S
 from core import servercert as SC
 from pages.firewall_page import FirewallPage
@@ -36,6 +38,14 @@ COLS = [
 
 TABS = [("scan", "体检结果"), ("fw", "防火墙"), ("cert", "证书管理"),
         ("fix", "加固建议")]
+
+REGION_COLS = [
+    Column("pick", "", 32, anchor="center"),
+    Column("name", "区域", 190),
+    Column("group", "分组", 88),
+    Column("count", "网段数", 84, anchor="e"),
+    Column("note", "说明", 300, stretch=True),
+]
 
 CERT_COLS = [
     # 列宽总和压到 ~960 逻辑像素：右边常驻 AI 面板，再宽就会把「用途」列
@@ -134,16 +144,38 @@ class SecurityPage(FirewallPage):
         ])
 
         # 防火墙（原页整体搬进来）
+        #
+        # 「区域策略」是防火墙的一部分（按国家/省拒绝），所以**不单独占页签** ——
+        # 单独一个顶级页签会让人以为防火墙被替换掉了（用户当场就问
+        # 「防火墙功能被你弄没了？」）。这里在防火墙页顶部挂一个入口，
+        # 点进去是同一个 holder 里的另一个视图，返回按钮回规则列表。
         self.sec_fw_box = U.wframe(holder, "page")
         self.sec_fw_box.grid(row=0, column=0, sticky="nsew")
         self.sec_fw_box.columnconfigure(0, weight=1)
+        self.sec_fw_box.rowconfigure(0, weight=1)
+        strip = U.wframe(self.sec_fw_box, "page")
+        strip.grid(row=0, column=0, sticky="we")
+        self.lbl_fw_sub = U.wlabel(strip, "规则列表", "pagedim", U.FONT_XS)
+        self.lbl_fw_sub.pack(side="left")
+        U.RoundButton(strip, "区域策略（按国家 / 省）…", self.region_open,
+                      variant="secondary", height=28,
+                      padx=12).pack(side="right")
+        self.fw_host = U.wframe(self.sec_fw_box, "page")
+        self.fw_host.grid(row=1, column=0, sticky="nsew")
         self.sec_fw_box.rowconfigure(1, weight=1)
-        self.build_fw(self.sec_fw_box)
+        self.fw_host.columnconfigure(0, weight=1)
+        self.fw_host.rowconfigure(1, weight=1)
+        self.build_fw(self.fw_host)
 
         # 证书管理
         self.sec_cert_box = U.wframe(holder, "page")
         self.sec_cert_box.grid(row=0, column=0, sticky="nsew")
         self.build_srvcert(self.sec_cert_box)
+
+        # 区域策略（防火墙的子视图，不占页签）
+        self.sec_region_box = U.wframe(holder, "page")
+        self.sec_region_box.grid(row=0, column=0, sticky="nsew")
+        self.build_region(self.sec_region_box)
 
         # 加固建议
         self.sec_fix_box = U.wframe(holder, "page")
@@ -157,6 +189,7 @@ class SecurityPage(FirewallPage):
         self.box_sec_fix.set_text("体检完成后，这里会列出需要处理的项与对应命令。")
 
         self.sec_rep = S.Report()
+        self._region_shown = False        # 区域策略是防火墙的子视图
         self.sec_scan_box.tkraise()
 
     # ------------------------------------------------------------ 页签
@@ -166,13 +199,32 @@ class SecurityPage(FirewallPage):
                "fix": self.sec_fix_box}.get(key)
         if box is not None:
             box.tkraise()
-        if key == "fw" and getattr(self, "fw_backend", None) is None:
-            self.after(80, self.fw_probe)
+        if key == "fw":
+            # 从别的页签切回「防火墙」= 回到规则列表（区域策略是它的子视图）
+            self._region_shown = False
+            if getattr(self, "fw_backend", None) is None:
+                self.after(80, self.fw_probe)
         if key == "cert":
             self.cert_refresh()
             # 切到这一页就连带读一次设备自己的证书清单 —— 用户报的就是
             # 「页面上看不到设备上明明装着的证书」，不该让他再点一次按钮。
             self.cert_maybe_sync()
+
+    # ---- 防火墙 → 区域策略（子视图）
+    def region_open(self):
+        if getattr(self, "sec_region_box", None) is None:
+            return
+        self._region_shown = True
+        self.sec_region_box.tkraise()
+        if getattr(self, "_reg_caps", None) is None:
+            self.after(80, self.region_probe)
+
+    def region_back(self):
+        self._region_shown = False
+        try:
+            self.sec_fw_box.tkraise()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _sec_fw_maybe_probe(self):
         """换了设备后把这一页的数据重取一遍。
@@ -188,6 +240,13 @@ class SecurityPage(FirewallPage):
             # 设备变了，旧缓存一律作废，强制重读
             self._devcert = {}
             self.after(120, lambda: self.cert_maybe_sync(force=True))
+            return
+        if cur == "fw" and getattr(self, "_region_shown", False):
+            # 人正在区域策略这个子视图里换了设备：能力与「已启用几条」都得重探，
+            # 否则会拿上一台的结果去指导这一台，甚至点「撤销」删错对象。
+            self._reg_caps = None
+            self._reg_state = {}
+            self.after(120, self.region_probe)
             return
         if cur != "fw":
             return
@@ -833,3 +892,306 @@ class SecurityPage(FirewallPage):
                 subtitle="证书", width=760, height=360)
 
         self.bg(work, ok=ok, err=lambda m: self.toast(f"上传失败：{m}", "err"))
+
+    # ============================================================ 区域策略
+    def build_region(self, pg):
+        """区域策略：把「某个省 / 国家」做成一张 nftables 独立表。
+
+        为什么单独一页而不是塞进防火墙表单：一个省就是两万多条网段，
+        逐条下发既慢又装不下（群晖每个配置只允许 100 条规则）。nft 的
+        interval set 能把它们压成一条规则、一次事务生效，值得单独一块地方。
+        详见 core/region.py 文件头。
+        """
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(0, weight=1)
+
+        card = U.Card(pg, title="区域策略",
+                      hint="防火墙的一部分 · nftables 独立表 · 一条规则顶几万条网段")
+        card.grid(row=0, column=0, sticky="nsew")
+        b = card.body
+
+        bar = U.wframe(b, "card")
+        bar.pack(fill="x", pady=(0, U.px(8)))
+        U.RoundButton(bar, "← 返回规则列表", self.region_back, variant="ghost",
+                      height=30, padx=10).pack(side="left", padx=(0, U.px(8)))
+        U.RoundButton(bar, "检测设备", self.region_probe, variant="secondary",
+                      height=30, padx=14).pack(side="left")
+        U.RoundButton(bar, "应用策略", self.region_apply, variant="primary",
+                      height=30, padx=16).pack(side="left", padx=(U.px(6), 0))
+        U.RoundButton(bar, "撤销（删表）", self.region_clear, variant="ghost",
+                      height=30, padx=12).pack(side="left", padx=(U.px(6), 0))
+        U.RoundButton(bar, "预览脚本", self.region_preview, variant="ghost",
+                      height=30, padx=12).pack(side="left", padx=(U.px(6), 0))
+        U.RoundButton(bar, "导出脚本…", self.region_export, variant="ghost",
+                      height=30, padx=12).pack(side="left", padx=(U.px(6), 0))
+        self.badge_reg = U.Pill(bar, "未检测", "mute", height=24)
+        self.badge_reg.pack(side="right")
+        self.lbl_reg_sum = U.wlabel(bar, "", "dim", U.FONT_XS)
+        self.lbl_reg_sum.pack(side="right", padx=(0, U.px(10)))
+
+        # 只做「拒绝」这件事必须写在脸上：accept 在 priority -10 这一层不是
+        # 终局，系统自己的链照样能把包丢掉 —— 写成「放行」就是骗人。
+        self.lbl_reg_tip = U.wlabel(
+            b,
+            "只做「拒绝」：勾选区域 → 点「应用策略」，来自这些区域的包直接丢。"
+            "「放行」在这里做不出真效果（本表 accept 不是终局，系统链仍可拒绝），"
+            "所以不提供。只动 tb_region 这一张表，系统规则一个字节都不改。",
+            "dim", U.FONT_XS, justify="left")
+        self.lbl_reg_tip.pack(anchor="w", pady=(0, U.px(6)))
+
+        self.tbl_region = DataTable(
+            b, REGION_COLS, height=10, searchable=True,
+            search_hint="搜省份 / 国家…",
+            empty_title="地址库是空的",
+            empty_hint="到「防火墙 → 地址库」点一次更新（约 3 分钟），"
+                       "就有省级与国家数据了。")
+        self.tbl_region.pack(fill="both", expand=True)
+        self.tbl_region.tree.bind("<Button-1>", self._region_click, add="+")
+
+        self._reg_picked = {}      # key(group:code) -> {"item","group"}
+        self._reg_caps = None
+        self._reg_state = {}
+        self.region_render()
+    # ---- 列表
+    def _region_items(self) -> list[tuple]:
+        out = [(it, "province", "中国省级") for it in iplib.province_items()]
+        out += [(it, "country", "国家/地区") for it in iplib.country_items()]
+        return out
+
+    def region_render(self):
+        tbl = getattr(self, "tbl_region", None)
+        if tbl is None:
+            return
+        rows = []
+        for it, group, glabel in self._region_items():
+            key = f"{group}:{it.key}"
+            rows.append({
+                "pick": "✓" if key in self._reg_picked else "",
+                "name": it.name,
+                "group": glabel,
+                "count": f"{it.count:,}" if it.cidrs else "—",
+                "note": it.note or ("没有网段数据，先更新地址库"
+                                    if not it.cidrs else ""),
+                "_key": key,
+                "_item": it,
+                "_group": group,
+            })
+        tbl.set_rows(rows)
+        self._region_sum()
+
+    def _region_sum(self):
+        n = len(self._reg_picked)
+        if not n:
+            self.lbl_reg_sum.configure(text="点左边的勾选列选区域，可多选")
+            return
+        raw = sum(int(v["item"].count) for v in self._reg_picked.values())
+        self.lbl_reg_sum.configure(
+            text=f"已选 {n} 个区域 · 原始 {raw:,} 条网段（下发前会合并）")
+
+    def _region_click(self, event):
+        col = self.tbl_region.column_at(event.x)
+        if col != "pick":
+            return None
+        row = self.tbl_region.row_at(event.y)
+        if not row or not row.get("_key"):
+            return None
+        key = str(row["_key"])
+        it = row.get("_item")
+        if key in self._reg_picked:
+            self._reg_picked.pop(key, None)
+        else:
+            if it is not None and not it.cidrs:
+                self.toast(f"「{it.name}」还没有网段数据，先更新地址库", "warn")
+                return "break"
+            self._reg_picked[key] = {"item": it,
+                                     "group": str(row.get("_group") or "")}
+        self.region_render()
+        return "break"
+
+    def _region_picks(self) -> list[dict]:
+        return [{"key": v["item"].key, "name": v["item"].name,
+                 "group": v["group"]}
+                for v in self._reg_picked.values()]
+
+    # ---- 设备
+    def _region_session(self):
+        s = getattr(self, "session", None)
+        if s is None or not getattr(s, "alive", False):
+            self.toast("先在「主机管理」连一台设备（SSH），本机没有 nft 可管",
+                       "warn")
+            return None
+        return s
+
+    def region_probe(self):
+        s = self._region_session()
+        if s is None:
+            self.badge_reg.set("未连接", "mute")
+            return
+        self.badge_reg.set("检测中…", "mute")
+
+        def work():
+            caps = RG.probe(s)
+            st = RG.state(s, caps) if caps.nft else {}
+            return caps, st
+
+        def ok(res):
+            caps, st = res
+            self._reg_caps, self._reg_state = caps, st
+            self.badge_reg.set(caps.label, "ok" if caps.ok else "warn")
+            self.lbl_reg_tip.configure(
+                text=caps.summary() + "　当前：" + RG.describe(st) +
+                "　（只动 tb_region 这张表）")
+
+        self.bg(work, ok=ok,
+                err=lambda m: self.toast(f"检测失败：{m}", "err"))
+
+    # ---- 应用
+    def region_apply(self):
+        s = self._region_session()
+        if s is None:
+            return
+        if not self._reg_picked:
+            return self.toast("先勾选要拒绝的区域", "warn")
+        caps = self._reg_caps or RG.probe(s)
+        if not caps.ok:
+            return self.toast("这台设备不能自动下发：" +
+                              (caps.why or "未知原因") + " —— 可以「导出脚本」",
+                              "warn")
+        try:
+            plan = RG.make_plan(self._region_picks())
+        except RG.RegionError as e:
+            return self.toast(str(e) + ("：" + e.hint if e.hint else ""), "err")
+
+        # 防自锁：这条策略会不会把当前连接一起封掉
+        try:
+            addrs = RG.peer_addrs(s)
+        except Exception:  # noqa: BLE001
+            addrs = [str(getattr(s, "host", "") or "")]
+        bad = RG.lockout(plan, addrs)
+        if bad:
+            forms.InfoDialog.show(
+                self, "已阻止：这条策略会把自己关在门外",
+                bad + "\n\n更安全的做法：\n"
+                      "· 先在一台能物理接触的设备上试；\n"
+                      "· 或者换成不含自己出口 IP 的区域（例如只封某个国家，"
+                      "但你的出口不在其中）；\n"
+                      "· 只想看命令的话用「预览脚本」，自己挑时间跑。",
+                subtitle="没有下发任何东西", width=720, height=380)
+            return
+
+        if not forms.confirm(
+                self, "下发区域策略",
+                f"将对这台设备生效：\n\n{plan.summary()}\n\n"
+                f"动作：{RG.VERDICT_LABEL.get(plan.verdict, plan.verdict)}\n"
+                "只改 tb_region 这张表，系统其它防火墙规则不动；"
+                "已建立的连接保持不断。\n\n确定下发吗？",
+                danger=True, ok_text="下发"):
+            return
+
+        self.toast(f"正在下发 {plan.total:,} 条网段…")
+
+        def work():
+            return RG.apply(s, plan, caps)
+
+        def ok(res):
+            rc, body, err = res
+            if rc != 0:
+                self.toast(f"下发失败：{(err or body)[:200]}", "err")
+                return
+            self.toast(f"已生效：{plan.summary()}", "ok")
+            self._audit("region.apply", "ok", plan.summary(), s.label)
+            self.region_probe()
+
+        self.bg(work, ok=ok,
+                err=lambda m: self.toast(f"下发失败：{m}", "err"))
+
+    # ---- 撤销
+    def region_clear(self):
+        s = self._region_session()
+        if s is None:
+            return
+        caps = self._reg_caps or RG.probe(s)
+        if not caps.ok:
+            return self.toast("这台设备不能自动改：" + (caps.why or ""), "warn")
+        if not forms.confirm(
+                self, "撤销区域策略",
+                "把 tb_region 整张表删掉 —— 机器上没有别的规则会被动。\n"
+                "（删完之后本页显示的所有拒绝策略立即失效。）",
+                danger=True, ok_text="删表"):
+            return
+
+        def work():
+            return RG.clear(s, caps)
+
+        def ok(res):
+            rc, body, err = res
+            if rc != 0:
+                self.toast(f"撤销失败：{(err or body)[:200]}", "err")
+                return
+            self.toast("已撤销（tb_region 表已删除）", "ok")
+            self._audit("region.clear", "ok", "删除 tb_region 表", s.label)
+            self.region_probe()
+
+        self.bg(work, ok=ok,
+                err=lambda m: self.toast(f"撤销失败：{m}", "err"))
+
+    # ---- 预览 / 导出
+    def _region_plan_for_view(self):
+        if not self._reg_picked:
+            self.toast("先勾选区域", "warn")
+            return None
+        try:
+            return RG.make_plan(self._region_picks())
+        except RG.RegionError as e:
+            self.toast(str(e) + ("：" + e.hint if e.hint else ""), "err")
+            return None
+
+    def region_preview(self):
+        plan = self._region_plan_for_view()
+        if plan is None:
+            return
+        caps = self._reg_caps
+        try:
+            if caps is not None and caps.nft:
+                text = RG.nft_script(plan, exists=bool(
+                    (self._reg_state or {}).get("exists")))
+                tip = ("这是要交给 `nft -f` 的整表脚本。整批是一个事务："
+                       "任何一行不合法，一个字节都不生效。\n"
+                       "只出现 tb_region，不会 flush ruleset。")
+            else:
+                text = RG.plain_script(plan)
+                tip = ("这台设备没有 nft（或没提权），退回 iptables 脚本："
+                       "命令很多，中途断了没有回滚。")
+        except RG.RegionError as e:
+            return self.toast(str(e), "err")
+        forms.InfoDialog.show(self, "区域策略脚本",
+                              tip + "\n\n" + text,
+                              subtitle=plan.summary(),
+                              width=880, height=600)
+
+    def region_export(self):
+        plan = self._region_plan_for_view()
+        if plan is None:
+            return
+        from tkinter import filedialog
+        caps = self._reg_caps
+        use_nft = bool(caps is not None and caps.nft)
+        name = "region-" + "-".join(
+            str(p.get("key")) for p in plan.picks)[:40] + (
+            ".nft" if use_nft else ".sh")
+        path = filedialog.asksaveasfilename(
+            parent=self, title="导出区域策略脚本", initialfile=name,
+            defaultextension=".nft" if use_nft else ".sh",
+            filetypes=[("nft 脚本", "*.nft"), ("Shell 脚本", "*.sh"),
+                       ("全部文件", "*.*")])
+        if not path:
+            return
+        try:
+            text = (RG.nft_script(plan, exists=bool(
+                (self._reg_state or {}).get("exists"))) if use_nft
+                else RG.plain_script(plan))
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except (OSError, RG.RegionError) as e:
+            return self.toast(f"导出失败：{e}", "err")
+        self.toast(f"已导出 {len(text.splitlines())} 行到 {path}", "ok")
