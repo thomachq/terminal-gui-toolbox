@@ -46,3 +46,6 @@ _tagmsg.txt
 
 # rm 被安全守护拦时改名保留的旧构建目录
 build.prev-*/
+
+# 截图产物（打包不带）
+_shots/

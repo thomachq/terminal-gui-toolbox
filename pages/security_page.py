@@ -364,6 +364,12 @@ class SecurityPage(FirewallPage):
                           ("上传到设备", self.cert_upload)):
             U.RoundButton(bar, text, cmd, variant="secondary",
                           height=30, padx=14).pack(side="left", padx=(U.px(6), 0))
+        # 「装进设备证书库」和「上传到设备」不是一回事：前者按设备自己的
+        # 数据结构入库（群晖写 _archive + INFO、飞牛写 ssls + conf），装完
+        # 在设备的证书界面里能看见；后者只是把两个文件丢到一个目录里。
+        U.RoundButton(bar, "装进设备…", lambda: self.cert_install(None),
+                      variant="secondary", height=30,
+                      padx=14).pack(side="left", padx=(U.px(6), 0))
         U.RoundButton(bar, "删除", self.cert_delete, variant="ghost",
                       height=30, padx=12).pack(side="left", padx=(U.px(6), 0))
         self.lbl_cert_sum = U.wlabel(bar, "", "dim", U.FONT_XS)
@@ -390,6 +396,7 @@ class SecurityPage(FirewallPage):
         self.tbl_cert.set_menu([
             ("查看证书内容", self.cert_detail, lambda r: bool(r)),
             ("保存到本机库", self.cert_save_local, self._is_dev_row),
+            ("装进设备证书库…", self.cert_install, self._is_local_row),
             ("导出到目录…", lambda r: self.cert_export(r), self._is_local_row),
             ("上传到设备…", lambda r: self.cert_upload(r), self._is_local_row),
             ("删除", lambda r: self.cert_delete(r), self._is_local_row),
@@ -892,6 +899,121 @@ class SecurityPage(FirewallPage):
                 subtitle="证书", width=760, height=360)
 
         self.bg(work, ok=ok, err=lambda m: self.toast(f"上传失败：{m}", "err"))
+
+    # ---- 装进设备证书库（只入库、不绑定）
+    def cert_install(self, row=None):
+        """把本机库里的证书装进**当前设备**自己的证书库。
+
+        与「上传到设备」的区别：这一步按设备的数据结构登记（群晖写
+        `_archive/<id>/` 并在 INFO 里加 `services: []`；飞牛写
+        `ssls/<域名>/<秒>/` 并在 conf 里加 `used:false`），装完在设备自己的
+        证书界面里能看见这张证书，但**不绑定任何服务** —— 实测服务不重启、
+        不中断。想真正用它，还得在设备上手动选一张并绑服务。
+        """
+        from tkinter import messagebox
+        from core import certinstall as CI
+
+        rec = self._cert_sel(row)
+        if not rec:
+            return self.toast("先在列表里选一张证书", "warn")
+        if rec.get("source") == "device":
+            return self.toast(
+                "这张本来就在设备上。要装的是本机那张：先在「本机库」里选，"
+                "或把设备那张「保存到本机库」再装", "warn")
+        sess = getattr(self, "session", None)
+        if sess is None or not getattr(sess, "alive", False):
+            return self.toast("先连接一台设备（SSH）—— 装到哪里得有个目标",
+                              "warn")
+        if not rec.get("has_key"):
+            return self.toast(
+                "这张证书在本机库里没有私钥，装不进设备（设备要私钥才能起 TLS）",
+                "warn")
+        try:
+            kind = DC.detect(sess)
+        except Exception as e:  # noqa: BLE001
+            return self.toast(f"认不出这台设备的证书模块：{e}", "err")
+        if not kind:
+            return self.toast(
+                "这台设备上没有认识的证书模块。目前支持群晖 DSM 与飞牛 fnOS",
+                "warn")
+        try:
+            cert, key = self.cert_store().read(rec["name"])
+        except OSError as e:
+            return self.toast(f"读不了本机库里的这张证书：{e}", "err")
+
+        info = CI.parse_bundle(cert, key)
+        if info["problems"]:
+            messagebox.showerror(
+                "这张证书装不进去",
+                "· " + "\n· ".join(info["problems"]) + "\n\n"
+                "先在本机库里换一张能用的证书再装。", parent=self)
+            return
+
+        try:
+            domain = CI.pick_domain(info) if kind == CI.KIND_FNOS else ""
+        except CI.InstallError as e:
+            return self.toast(str(e), "err")
+        plan = CI.make_plan(kind, info, item_id=CI.new_id(), domain=domain)
+        lines = CI.plan_lines(plan)
+        if info["warnings"]:
+            lines += ["", "提醒："] + ["  · " + w for w in info["warnings"]]
+        lines += ["", f"证书：{rec.get('cn') or info['cn']} · "
+                      f"{info['not_after']} 到期（剩 {info['days_left']} 天）"]
+        if not messagebox.askokcancel("装进设备证书库", "\n".join(lines),
+                                      parent=self):
+            return
+
+        def work():
+            res = CI.apply(sess, kind, cert, key, "", rec.get("name") or "",
+                           domain)
+            ok, msg = CI.verify(sess, res)
+            back = ""
+            if not ok:
+                # 校验不过就立刻撤掉，别在设备上留半张证书
+                try:
+                    rb, rm = CI.rollback(sess, res)
+                    back = ("；已自动撤销：" + rm) if rb else \
+                           ("；自动撤销没成功（" + rm + "），请手工删掉 "
+                            + str(res.get("dir") or ""))
+                except Exception as e:  # noqa: BLE001
+                    back = f"；自动撤销时出错：{e}"
+            return res, ok, msg + back
+
+        def ok_cb(payload):
+            res, good, msg = payload
+            self.cert_refresh()
+            tone = "ok" if good else "err"
+            self.toast(("已装进 " + CI.label_of(kind) + "：" + msg) if good
+                       else ("没装成功：" + msg), tone)
+            body = [
+                f"设备：{CI.label_of(kind)} · {getattr(sess, 'host', '') or ''}",
+                f"结论：{'装进去了' if good else '没装成功'}",
+                "",
+                msg,
+                "",
+                "写到设备上的文件：",
+                *["  · " + p for p in (res.get("files") or [])],
+                "",
+                "设备上的备份（含私钥，只在设备上）：",
+                "  " + str(res.get("backup") or "—"),
+                "",
+                "怎么让它生效：",
+                "  现在它只是躺在证书库里，没有任何服务在用它。",
+                ("  群晖：控制面板 → 安全性 → 证书 → 设置 → 选中这张 → 绑定服务。"
+                 if kind == CI.KIND_SYNO else
+                 "  飞牛：系统设置 → 安全 → 证书 → 选中这张 → 设为当前。"),
+                "",
+                "要撤销这次写入，可以在这一步之后直接删掉上面那个目录；"
+                "登记项（INFO / conf）里的条目也要一起删。",
+            ]
+            forms.InfoDialog.show(self, "装进设备证书库", "\n".join(body),
+                                  subtitle=f"{CI.label_of(kind)} · "
+                                           f"{rec.get('name')}",
+                                  width=820, height=520)
+
+        self.status.set_state(f"正在装进 {CI.label_of(kind)}…", None)
+        self.bg(work, ok=ok_cb,
+                err=lambda m: self.toast(f"装不进去：{m}", "err"))
 
     # ============================================================ 区域策略
     def build_region(self, pg):

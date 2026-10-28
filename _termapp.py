@@ -72,9 +72,12 @@ def main():
     a.open_terminal()
     pump(a, 0.6)
     w = a._term_live()
+    # v1.0.31 起页签键按设备分（"term" / "term:<sid>"），连上本机也算一台设备，
+    # 所以这里不能再写死 a.TERM_TAB —— 一律问当前设备那把键。
+    tk_ = a._term_cur_key()
     chk(w is not None and w.winfo_exists() == 1, "终端页签已出现")
-    chk(a.TERM_TAB in a._term_panes, "页签登记在 _term_panes 里")
-    chk(a.TERM_TAB in a.tabbar.tabs, "页签栏上有终端")
+    chk(tk_ in a._term_panes, "页签登记在 _term_panes 里", tk_)
+    chk(tk_ in a.tabbar.tabs, "页签栏上有终端", tk_)
     chk(a._term is None, "默认是内嵌页签，不是独立窗口")
     label = a._term_label()
     chk("终端" in label, "页签标题", label)
@@ -153,28 +156,40 @@ def main():
     a.api_pool.close(conn.id)
 
     print("\n8. 断开联动")
+    # v1.0.31：断开设备时它的终端页签一起关掉 —— 留着一个只能显示「未连接」
+    # 的页签正是用户截图里那个「点不开的终端」。所以这里断言的是「清掉」。
     a._disconnect()
     pump(a, 0.4)
     chk(a._term_cwd_val == "", "断开后目录缓存清空")
+    chk(tk_ not in a._term_panes, "那台的终端页签已注销", str(list(a._term_panes)))
+    chk(tk_ not in a.tabbar.tabs, "页签栏上也移除了", str(list(a.tabbar.tabs)))
+    chk(a._term_live() is None, "没有残留的活终端")
+    # 断开后再点终端：开的是「本机/未连接」这个键，正文里要写明原因
+    a.open_terminal()
+    pump(a, 0.4)
+    w2 = a._term_live()
+    chk(w2 is not None, "未连接状态下也能开终端")
     chk("未连接" in a._term_label(), "终端标题跟着变", a._term_label())
-    w.v_in.set("echo nope")
-    w._submit()
+    chk(w2 is not None and "未连接" in w2.text.get("1.0", "end"),
+        "正文提示未连接")
+    w2.v_in.set("echo nope")
+    w2._submit()
     pump(a, 0.5)
-    chk("未连接" in w.text.get("1.0", "end"), "断开后敲命令被拦住")
+    chk("未连接" in w2.text.get("1.0", "end"), "断开后敲命令被拦住")
 
     print("\n9. 再开一次不重复建页签")
-    old = w
+    old = w2
     a.open_terminal()
     pump(a, 0.3)
     chk(a._term_live() is old, "已开着就只切过去，不新建")
-    chk(len(a._term_panes) == 1, "终端页签始终只有一个",
+    chk(len(a._term_panes) == 1, "同样状态下只留一个终端页签",
         str(len(a._term_panes)))
 
     print("\n10. 关闭")
-    a._tab_close(a.TERM_TAB)
+    a._tab_close(a._term_cur_key())
     pump(a, 0.3)
     chk(a._term_live() is None, "关掉后主程序不再持有引用")
-    chk(a.TERM_TAB not in a._term_panes, "登记表里也清了")
+    chk(len(a._term_panes) == 0, "登记表里也清了", str(list(a._term_panes)))
 
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     if BAD:

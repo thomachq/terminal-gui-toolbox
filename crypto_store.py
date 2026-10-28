@@ -202,13 +202,38 @@ def seal_bytes(data: bytes) -> bytes:
 
 
 def open_bytes(raw: bytes) -> bytes | None:
-    """还原整个文件；失败返回 None。"""
+    """还原整个文件；失败返回 None。
+
+    注意：`unprotect()` 把结果 `.decode("utf-8")`，所以这里**只适合文本**。
+    任意二进制（tar/zip/图片）请用 `seal_blob` / `open_blob`，否则能加密、
+    但解回来时会被 utf-8 解码弄坏（静默变成 None 或乱码）。
+    """
     try:
         txt = raw.decode("ascii").strip()
     except UnicodeDecodeError:
         return None
     plain = unprotect(txt)
     return plain.encode("utf-8") if plain is not None else None
+
+
+def seal_blob(data: bytes) -> bytes:
+    """任意二进制 → 可直接落盘的密文。
+
+    内部先 base64 再走 `seal_bytes`，因为 `unprotect()` 强制 utf-8 解码，
+    不包装的话二进制会在解密时损坏。
+    """
+    return seal_bytes(base64.b64encode(data))
+
+
+def open_blob(raw: bytes) -> bytes | None:
+    """`seal_blob` 的逆运算；失败返回 None。"""
+    txt = open_bytes(raw)
+    if txt is None:
+        return None
+    try:
+        return base64.b64decode(txt, validate=True)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def selftest() -> tuple[bool, str]:

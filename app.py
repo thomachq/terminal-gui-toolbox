@@ -135,7 +135,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.30"
+APP_VER = "1.0.31"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -226,6 +226,48 @@ TOOL_COLS = {
 }
 
 
+class _TermCtl:
+    """把一个终端视图钉在某一台设备上（`sid` 为空表示「跟着当前这台」）。
+
+    为什么需要这一层：终端面板（`ui/terminal.py`）只认 `ctrl.term_*` 这几个
+    方法，它不知道「多设备」这件事。以前主程序把自己（`self`）当 ctrl 传进去，
+    于是面板读的永远是「当前活动的那台」—— 切设备之后同一个面板换了目标，
+    想同时开两台设备的终端根本做不到（v1.0.30 用户报的「点不开第二个终端」）。
+
+    现在每个面板拿一个 `_TermCtl(app, sid)`：面板问哪个方法，就用哪台设备的
+    会话去答。会话被关掉时返回「未连接」，而不是偷偷换成别的那台。
+    """
+
+    def __init__(self, app, sid: str = ""):
+        self.app = app
+        self.sid = str(sid or "")
+
+    # 面板要的四个（+两个生命周期）
+    def term_ready(self) -> bool:
+        return self.app.term_ready(self.sid)
+
+    def term_prompt(self) -> str:
+        return self.app.term_prompt(self.sid)
+
+    def term_describe(self) -> str:
+        return self.app.term_describe(self.sid)
+
+    def term_cwd(self) -> str:
+        return self.app.term_cwd(self.sid)
+
+    def term_chdir(self, path: str):
+        return self.app.term_chdir(path, self.sid)
+
+    def term_run(self, cmd: str, done) -> None:
+        self.app.term_run(cmd, done, self.sid)
+
+    def term_embed(self, w=None) -> None:
+        self.app.term_embed(w)
+
+    def term_closed(self, w) -> None:
+        self.app.term_closed(w)
+
+
 class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                  DockerPage, FilesPage, AiDockPage, ApiPage, WebPage,
                  SettingsCenter, HostsPage, ProxyPage, CredPage, ScriptPage,
@@ -289,7 +331,9 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self._api_inited = False
         self._vpn_booted = False
         self._term: tk.Toplevel | None = None
-        self._term_cwd_val = ""
+        # 每台设备各自的当前目录。以前只有一个全局值 —— 在两台设备之间切换时
+        # 会把 A 的目录带到 B 上（`cd` 明明没敲，提示符却变了）。
+        self._term_cwds: dict[str, str] = {}
         # --no-probe：只把界面画出来，不主动跑任何探测。
         # 探测会去调系统命令（Windows 上是 reg.exe / schtasks.exe / netstat），
         # 在受限环境或自动化脚本里容易卡住、弹 UAC 或者干脆被拦掉；
@@ -472,7 +516,7 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             return
         # 点会话标签的直觉就是「看那台设备的终端」——以前切完只是把上下文换掉，
         # 画面还停在原页面，用户点了半天以为没反应（截图反馈就是这个）。
-        # 切完顺手打开终端页签；已经开着就只是切过去，不新建第二个视图。
+        # 切完顺手打开**这台设备自己的**终端页签；已经开着就只是切过去。
         try:
             self.open_terminal()
         except (AttributeError, tk.TclError):
@@ -490,6 +534,7 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             if not ok:
                 return
         self.sessions.close(sid)
+        self._term_forget(sid)      # 它的终端页签跟着走，别留一个点不开的壳
         self._after_switch()
 
     # ------------------------------------------- 运维工具顶部的「操作目标」条
@@ -623,7 +668,7 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             except (AttributeError, tk.TclError):
                 pass
             try:
-                self._term_refresh_head()
+                self._term_refresh_heads()
             except (AttributeError, tk.TclError):
                 pass
             self._refresh_current_page()
@@ -642,7 +687,7 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.pill_proto.set(s.kind.upper(), "ok" if alive else "err")
         self._log_raw("meta", f"[切换] 当前设备 → {dev.hostname or dev.os_name}\n")
         try:
-            self._term_refresh_head()
+            self._term_refresh_heads()      # 所有终端页签的标签一起对齐（含「已断开」）
         except (AttributeError, tk.TclError):
             pass
         self._refresh_current_page()
@@ -654,6 +699,9 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.tabbar.on_close = self._tab_close
         self.tabbar.pack(fill="x", padx=U.px(10), pady=(U.px(8), 0))
         self._term_panes: dict[str, object] = {}
+        # 拉出去成独立窗口的终端：键与页签键一致（"term" / "term:<sid>"），
+        # 这样一台设备一个窗口，嵌回时能回到自己那个页签。
+        self._term_wins: dict[str, object] = {}
 
         # 外壳：左侧导航 + 页签内容在左，日志 / 助手在右。
         # 分栏容器必须挂在窗口这一层 —— 挂在「主机资源」页里面的话，终端一旦
@@ -1712,7 +1760,8 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             self._audit_command(cmd, rc, out, err, ms, by_api=by_api,
                                 device=device)
             # 终端开着就把同一条记录也送过去（终端自己敲的命令会被它标记跳过）
-            self._term_feed(shown, rc, out, err, ms)
+            # device 一定要带上：多开终端时按设备投递，不能串到别的那台的窗口里
+            self._term_feed(shown, rc, out, err, ms, device=device)
         self.post(render)
 
     # ============================================================ 采样
@@ -2910,6 +2959,7 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         sid = self.sessions.active_id
         if sid:
             self.sessions.close(sid)
+            self._term_forget(sid)      # 这台的终端页签一起关掉
         else:
             s = self.sessions.session
             if s is not None:
@@ -2920,63 +2970,103 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self._local_device = DeviceInfo()
         self._after_switch()
 
-    # ============================================================ 终端（页签 / 独立窗口）
+    # ============================================================ 终端（每台设备一个页签）
+    # 页签键 = "term"（本机 / 未连接）或 "term:<sid>"（某台设备）。
+    # 以前所有设备共用一个 "term" 键，于是「第二台设备的终端」只能是同一个面板
+    # 换了个目标 —— 用户看到的就是「终端点不开、也不能开两个」。
     TERM_TAB = "term"
+    TERM_PREFIX = "term:"
 
-    def _term_live(self):
-        """当前活着的终端：页签优先，其次是拉出去的独立窗口。
+    def _term_key(self, sid: str = "") -> str:
+        sid = str(sid or "")
+        return f"{self.TERM_PREFIX}{sid}" if sid else self.TERM_TAB
 
-        同一个会话只该有一个终端视图 —— 两处同时显示会让「命令打到哪」变糊。
-        """
-        pane = self._term_panes.get(self.TERM_TAB)
+    def _term_key_sid(self, key: str) -> str:
+        key = str(key or "")
+        return key[len(self.TERM_PREFIX):] if key.startswith(self.TERM_PREFIX) else ""
+
+    def _term_cur_key(self) -> str:
+        return self._term_key(self.sessions.active_id)
+
+    def _term_pane(self, key: str):
+        pane = self._term_panes.get(key)
         if pane is not None:
             try:
                 if pane.winfo_exists():
                     return pane
             except tk.TclError:
                 pass
-            self._term_panes.pop(self.TERM_TAB, None)
-        w = self._term
+            self._term_panes.pop(key, None)
+        return None
+
+    def _term_win(self, key: str):
+        w = self._term_wins.get(key)
         if w is not None:
             try:
                 if w.winfo_exists():
                     return w
             except tk.TclError:
-                self._term = None
+                pass
+            self._term_wins.pop(key, None)
         return None
 
-    def _term_label(self) -> str:
+    def _term_live(self, key: str = ""):
+        """这个页签键对应的活终端：嵌着的优先，其次是拉出去的独立窗口。
+
+        `key` 省略时取「当前这台设备」的键（老的调用点都走这条）。
+        一台设备同一时间只留一个视图 —— 页签和窗口同时显示会让「命令打到哪」变糊。
+        """
+        key = key or self._term_cur_key()
+        pane = self._term_pane(key)
+        if pane is not None:
+            return pane
+        return self._term_win(key)
+
+    def _term_label(self, sid: str = "") -> str:
         try:
-            d = self.term_describe()
+            d = self.term_describe(sid)
         except Exception:  # noqa: BLE001
             d = ""
         return f"终端 · {d}" if d else "终端"
 
-    def _term_add_tab(self):
-        """在工作区里新建一个终端页签，返回它的 TerminalPane。"""
+    def _term_add_tab(self, key: str = ""):
+        """在工作区里新建一个终端页签（绑定到该页签对应的设备）。"""
+        key = key or self._term_cur_key()
+        sid = self._term_key_sid(key)
+        if key in self.tabbar.tabs:      # 页签还在但面板丢了：先清干净再建
+            self.tabbar.remove(key)
         holder = U.wframe(self.workspace, "page")
         holder.grid(row=0, column=0, sticky="nsew")
-        pane = TerminalPane(holder, self)
+        pane = TerminalPane(holder, _TermCtl(self, sid))
         pane.pack(fill="both", expand=True)
-        self._term_panes[self.TERM_TAB] = pane
-        self.tabbar.add(self.TERM_TAB, self._term_label(), closable=True,
-                        on_popout=self.term_popout)
-        self.tabbar.select(self.TERM_TAB)
+        self._term_panes[key] = pane
+        self.tabbar.add(key, self._term_label(sid), closable=True,
+                        on_popout=lambda k=key: self.term_popout(k))
+        self.tabbar.select(key)
         return pane
 
     def open_terminal(self):
-        """打开终端。默认嵌成页签 —— 需要双屏时点页签上的 ⧉ 拉出去。"""
-        if self._term_live() is not None:
-            if self.TERM_TAB in self._term_panes:
-                self.tabbar.select(self.TERM_TAB)
-            else:
-                self.term_embed(self._term)      # 独立窗口 → 收回页签
-            self.status.set_state("终端已打开 · 命令跑在当前会话上", "ok")
-            return
-        self._term_add_tab()
-        self.status.set_state("终端已打开 · 命令跑在当前会话上", "ok")
+        """打开**当前这台设备**的终端。每台设备各一个页签，互不覆盖。
 
-    def _term_elev_note(self) -> None:
+        需要双屏时点页签上的 ⧉ 拉出成独立窗口；独立窗口也各自属于一台设备。
+        """
+        key = self._term_cur_key()
+        sid = self._term_key_sid(key)
+        live = self._term_live(key)
+        if live is not None:
+            if key in self._term_panes:
+                self.tabbar.select(key)
+            else:
+                self.term_embed(live)      # 独立窗口 → 收回页签
+        else:
+            self._term_add_tab(key)
+        if sid:
+            self.status.set_state(
+                f"终端已打开 · {self.term_describe(sid)} · 命令跑在这台上", "ok")
+        else:
+            self.status.set_state("终端已打开 · 命令跑在当前会话上", "ok")
+
+    def _term_elev_note(self, sid: str = "") -> None:
         """连上 / 重连之后，让已经开着的终端立刻反映新的提权状态。
 
         终端是「每次执行时重画提示符」的，所以重连之后老的 `$` 提示符会一直
@@ -2984,7 +3074,8 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         被当成「没提权」的时候。这里主动重画一次。
         用户正在输入时不打断（会把人家敲的字一起换掉）。
         """
-        pane = self._term_live()
+        key = self._term_key(sid) if sid else self._term_cur_key()
+        pane = self._term_live(key)
         if pane is None:
             return
         try:
@@ -2996,9 +3087,11 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         except Exception:  # noqa: BLE001
             pass
 
-    def term_popout(self) -> None:
+    def term_popout(self, key: str = "") -> None:
         """页签 → 独立窗口。正文与命令历史一起搬过去，不丢上下文。"""
-        pane = self._term_panes.pop(self.TERM_TAB, None)
+        key = key or self._term_cur_key()
+        sid = self._term_key_sid(key)
+        pane = self._term_panes.pop(key, None)
         text, hist = "", []
         if pane is not None:
             try:
@@ -3012,9 +3105,12 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                 holder.destroy()
             except tk.TclError:
                 pass
-        self.tabbar.remove(self.TERM_TAB)
-        w = TerminalWindow(self, self, title=f"终端 · {self.term_describe()}")
-        self._term = w
+        self.tabbar.remove(key)
+        w = TerminalWindow(self, _TermCtl(self, sid),
+                          title=f"终端 · {self.term_describe(sid)}")
+        w._term_key = key          # 嵌回 / 关闭时按这个键找回自己的页签
+        self._term_wins[key] = w
+        self._term = w             # 兼容：最近拉出去的那个
         if text.strip():
             w.write(text.rstrip("\n") + "\n", "out")
         if hist:
@@ -3025,8 +3121,9 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.status.set_state("终端已拉出为独立窗口 · 想收回点窗口里的「嵌回」", "ok")
 
     def term_embed(self, w=None) -> None:
-        """独立窗口 → 页签。"""
+        """独立窗口 → 页签（回到它自己那台设备的页签，不串台）。"""
         w = w or self._term
+        key = getattr(w, "_term_key", "") or self._term_cur_key()
         text, hist = "", []
         if w is not None:
             try:
@@ -3034,15 +3131,17 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                 hist = list(w._hist)
             except (tk.TclError, AttributeError):
                 pass
-        self._term = None
+        self._term_wins.pop(key, None)
+        if self._term is w:
+            self._term = None
         if w is not None:
             try:
                 w.destroy()
             except tk.TclError:
                 pass
-        if self.TERM_TAB in self.tabbar.tabs:
-            self.tabbar.remove(self.TERM_TAB)
-        pane = self._term_add_tab()
+        if key in self.tabbar.tabs:
+            self.tabbar.remove(key)
+        pane = self._term_add_tab(key)
         if text.strip():
             pane.write(text.rstrip("\n") + "\n", "out")
         if hist:
@@ -3052,29 +3151,93 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
 
     def term_closed(self, w) -> None:
         """独立窗口被关掉（点 × 或调 close）。"""
+        key = getattr(w, "_term_key", "")
+        if key:
+            self._term_wins.pop(key, None)
         if self._term is w:
             self._term = None
 
-    def _term_refresh_head(self) -> None:
-        t = self._term_live()
-        if t is None:
-            return
-        try:
-            t._refresh_head()
-        except (tk.TclError, AttributeError):
-            pass
-        if self.TERM_TAB in self.tabbar.tabs:
-            self.tabbar.set_label(self.TERM_TAB, self._term_label())
+    def _term_forget(self, sid: str) -> None:
+        """设备断开时清掉它的终端（页签 + 独立窗口）。
 
-    def _term_feed(self, display, rc, out, err, ms) -> None:
+        不清的话页签会留在那里，标题还写着那台设备，点进去敲命令只能得到
+        「未连接」——用户会以为是新 bug（v1.0.30 截图里的第二个问题就是这个）。
+        """
+        key = self._term_key(sid)
+        pane = self._term_panes.pop(key, None)
+        if pane is not None:
+            holder = pane.master
+            try:
+                pane.destroy()
+                holder.destroy()
+            except tk.TclError:
+                pass
+        w = self._term_wins.pop(key, None)
+        if w is not None:
+            if self._term is w:
+                self._term = None
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        if key in self.tabbar.tabs:
+            self.tabbar.remove(key)
+
+    def _term_refresh_heads(self, key: str = "") -> None:
+        """刷新终端标题 / 标签。`key` 省略时把**所有**终端页签的标签都对齐。
+
+        标签上要能看出「这台已离线」—— 只刷当前那个的话，断开的设备页签
+        会一直顶着旧名字，看起来还挺好。
+        """
+        keys = [key] if key else list(self._term_panes)
+        for k in keys:
+            t = self._term_live(k)
+            if t is not None:
+                try:
+                    t._refresh_head()
+                except (tk.TclError, AttributeError):
+                    pass
+            if k in self.tabbar.tabs:
+                self.tabbar.set_label(k, self._term_label(self._term_key_sid(k)))
+        # 页签没了但独立窗口还在（拉出去的状态）：标题也要跟着变
+        for k, w in list(self._term_wins.items()):
+            try:
+                w._refresh_head()
+            except (tk.TclError, AttributeError):
+                pass
+
+    def _term_refresh_head(self) -> None:
+        """老的调用点：只管当前这台。"""
+        self._term_refresh_heads(self._term_cur_key())
+
+    def _term_key_for_device(self, device: str) -> str:
+        """按 tracer 报上来的设备名找回它对应的终端页签键。"""
+        name = str(device or "").strip()
+        if not name:
+            return self._term_cur_key()
+        for slot in self.sessions:
+            cands = (slot.label,
+                     getattr(getattr(slot, "device", None), "hostname", ""),
+                     getattr(getattr(slot, "session", None), "host", ""),
+                     getattr(getattr(slot, "session", None), "label", ""))
+            if name in [str(c) for c in cands if c]:
+                return self._term_key(slot.sid)
+        return self._term_cur_key()
+
+    def _term_feed(self, display, rc, out, err, ms, device: str = "") -> None:
         """tracer 的旁路：终端开着就把同一条命令推过去。
 
         助手执行的命令不走这条路 —— 它自己会写一份更完整的（带主机名、
         执行前就写、输出与 rc 分明），再喂一遍就成了双份。
+
+        `device` 有值时按设备投递：多开几个终端时，A 上跑的 `docker ps`
+        不能跑到 B 的终端里去（用户会拿它当「我连的是哪台」的唯一依据）。
         """
         if self._ai_owns_cmd(display):
             return
-        t = self._term_live()
+        key = self._term_key_for_device(device) if device \
+            else self._term_cur_key()
+        t = self._term_live(key)
         if t is None:
             return
         # 智能体经 API 发的命令带 [API] 前缀，单独受「同步 API」开关管
@@ -3115,14 +3278,15 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         用户的原话就是「AI 执行的命令会实时显示在终端」。只在还没终端时
         才自动开，用户自己关掉的不会被反复弹出（那是下一次点了才开）。
         """
-        if self._term_live() is None:
+        key = self._term_cur_key()
+        if self._term_live(key) is None:
             try:
                 self.open_terminal()
             except Exception:  # noqa: BLE001
                 return
         try:
-            if self.TERM_TAB in self._term_panes:
-                self.tabbar.select(self.TERM_TAB)
+            if key in self._term_panes:
+                self.tabbar.select(key)
         except Exception:  # noqa: BLE001
             pass
 
@@ -3240,31 +3404,77 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             break
         return None
 
-    # ---- 终端要的四个接口
-    def term_ready(self) -> bool:
-        s = self.session
+    # ---- 终端要的接口（都带 sid：每台设备的终端只认自己那台会话）
+    def _sid_session(self, sid: str = ""):
+        """按 sid 取会话。sid 为空 = 「当前这台」；sid 已失效 = None（别串台）。"""
+        sid = str(sid or "")
+        if not sid:
+            return self.session
+        slot = self.sessions.get(sid)
+        return slot.session if slot is not None else None
+
+    def _sid_device(self, sid: str = "") -> DeviceInfo:
+        sid = str(sid or "")
+        if sid:
+            slot = self.sessions.get(sid)
+            if slot is not None and slot.device is not None:
+                return slot.device
+            return DeviceInfo()
+        return self.device
+
+    def _sid_family(self, sid: str = "") -> str:
+        fam = str(getattr(self._sid_device(sid), "os_family", "") or "")
+        return fam or self._effective_device().os_family
+
+    def term_ready(self, sid: str = "") -> bool:
+        s = self._sid_session(sid)
         try:
             return s is not None and bool(s.alive)
         except Exception:  # noqa: BLE001
             return s is not None
 
-    def term_describe(self) -> str:
-        s = self.session
+    def term_describe(self, sid: str = "") -> str:
+        s = self._sid_session(sid)
+        sid = str(sid or "")
         if s is None:
+            if sid:                      # 页签还挂着但这台已经断了
+                slot = self.sessions.get(sid)
+                name = getattr(slot, "label", "") if slot is not None else ""
+                return f"{name} · 已断开" if name else "已断开"
             return "未连接"
-        dev = self._effective_device()
+        dev = self._sid_device(sid) if sid else self._effective_device()
         name = dev.hostname or dev.os_name or s.label or "设备"
         desc = f"{name} · {s.kind.upper()}"
         if bool(getattr(s, "is_root", False)) or bool(getattr(s, "elevated", False)):
             desc += " · root"
         return desc
 
-    def term_cwd(self) -> str:
-        return self._term_cwd_val or self._term_probe_cwd()
+    # ---- 当前目录：每台设备各自记（以前一个全局值，切换设备会串）
+    # sid 为空 = 「当前这台」，与 term_* 系列的口径保持一致；
+    # `_term_cwd_val` 是老的全局写法，映射到当前那台的槽位（自测仍在用它）。
+    def _cwd_key(self, sid: str = "") -> str:
+        return str(sid or "") or str(self.sessions.active_id or "")
 
-    def _term_probe_cwd(self) -> str:
-        s = self.session
-        win = self._effective_device().os_family == "windows"
+    @property
+    def _term_cwd_val(self) -> str:
+        return self._term_cwds.get(self._cwd_key(), "")
+
+    @_term_cwd_val.setter
+    def _term_cwd_val(self, v) -> None:
+        self._term_cwds[self._cwd_key()] = str(v or "")
+
+    def _cwd_get(self, sid: str = "") -> str:
+        return self._term_cwds.get(self._cwd_key(sid), "")
+
+    def _cwd_set(self, sid: str, v: str) -> None:
+        self._term_cwds[self._cwd_key(sid)] = str(v or "")
+
+    def term_cwd(self, sid: str = "") -> str:
+        return self._cwd_get(sid) or self._term_probe_cwd(sid)
+
+    def _term_probe_cwd(self, sid: str = "") -> str:
+        s = self._sid_session(sid)
+        win = self._sid_family(sid) == "windows"
         fallback = "C:\\" if win else "/"
         if s is None:
             return fallback
@@ -3274,10 +3484,10 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             got = lines[-1] if lines else ""
         except Exception:  # noqa: BLE001
             got = ""
-        self._term_cwd_val = got or fallback
-        return self._term_cwd_val
+        self._cwd_set(sid, got or fallback)
+        return self._cwd_get(sid)
 
-    def term_prompt(self) -> str:
+    def term_prompt(self, sid: str = "") -> str:
         """终端提示符。**必须反映真实身份**，否则用户没法判断提权到底成没成。
 
         以前只用 `is_root`（= 登录用户本身就是 root），而 `sudo -i` 之后
@@ -3286,15 +3496,15 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         用户一看就断定「没提权成功」—— 这条提示符本身就是错的。
         现在按 `is_root or elevated` 判，提权后显示 `root@host …#`。
         """
-        s = self.session
+        s = self._sid_session(sid)
         if s is None:
             return "$ "
-        cwd = self.term_cwd()
+        cwd = self.term_cwd(sid)
+        win = self._sid_family(sid) == "windows"
         if s.kind == "local":
-            return f"{cwd}> " if self._effective_device().os_family == "windows" \
-                else f"{cwd}$ "
+            return f"{cwd}> " if win else f"{cwd}$ "
         user = getattr(s, "user", "") or "user"
-        host = getattr(s, "host", "") or self._effective_device().hostname or "host"
+        host = getattr(s, "host", "") or self._sid_device(sid).hostname or "host"
         rooted = bool(getattr(s, "is_root", False)) or \
             bool(getattr(s, "elevated", False))
         mark = "#" if rooted else "$"
@@ -3303,11 +3513,11 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         who = "root" if rooted else user
         return f"{who}@{host} {cwd}{mark} "
 
-    def term_chdir(self, path: str) -> tuple[bool, str]:
-        s = self.session
+    def term_chdir(self, path: str, sid: str = "") -> tuple[bool, str]:
+        s = self._sid_session(sid)
         if s is None:
             return False, "未连接"
-        win = self._effective_device().os_family == "windows"
+        win = self._sid_family(sid) == "windows"
         if win:
             cmd = f"Set-Location -LiteralPath '{path}' -ErrorAction Stop; pwd"
         else:
@@ -3319,17 +3529,21 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         lines = [x.strip() for x in (out or "").splitlines() if x.strip()]
         if rc != 0 or not lines:
             return False, (err or "目录不存在").strip().splitlines()[-1]
-        self._term_cwd_val = lines[-1]
-        return True, self._term_cwd_val
+        self._cwd_set(sid, lines[-1])
+        return True, lines[-1]
 
-    def term_run(self, cmd: str, done) -> None:
-        """在后台跑，结果回投到 Tk 线程。拼上当前目录，但终端只回显用户敲的那行。"""
-        s = self.session
+    def term_run(self, cmd: str, done, sid: str = "") -> None:
+        """在后台跑，结果回投到 Tk 线程。拼上当前目录，但终端只回显用户敲的那行。
+
+        `sid` 决定这条命令落到哪台设备上 —— 每个终端页签带着自己那台，
+        用户开三个终端并在其中两个里敲命令时不会打到同一台机器上。
+        """
+        s = self._sid_session(sid)
         if s is None:
             done(1, "", "未连接", 0)
             return
-        cwd = self.term_cwd()
-        win = self._effective_device().os_family == "windows"
+        cwd = self.term_cwd(sid)
+        win = self._sid_family(sid) == "windows"
         if win:
             full = f"Set-Location -LiteralPath '{cwd}' -ErrorAction SilentlyContinue; {cmd}"
         else:
