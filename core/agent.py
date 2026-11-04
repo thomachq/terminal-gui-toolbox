@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from core import atomicio
 from core import aiops
 
 AGENT_NAME = "智能运维助手"
@@ -236,10 +237,8 @@ class AgentConfig:
     def save(self) -> None:
         self._clean()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, self.path)
+        atomicio.save_text(self.path,
+                           json.dumps(self.data, ensure_ascii=False, indent=2))
 
     def _clean(self) -> None:
         """把外部改坏的字段收拾成能用的值 —— 配置坏了不该让助手打不开。"""

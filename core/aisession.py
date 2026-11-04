@@ -21,6 +21,8 @@ import time
 import uuid
 from pathlib import Path
 
+from core import atomicio
+
 MAX_TRANSCRIPT = 300          # 一个会话最多留 300 条气泡
 MAX_HISTORY = 60              # 给模型的历史最多 60 条（30 轮）
 TITLE_MAX = 16
@@ -144,17 +146,12 @@ class Store:
         if not self.ensure():
             return False
         p = self._path(sess.id)
-        tmp = p.with_suffix(".tmp")
         try:
-            tmp.write_text(json.dumps(sess.to_dict(), ensure_ascii=False),
-                           encoding="utf-8")
-            os.replace(tmp, p)      # 原子替换：写一半崩了也还是旧文件
+            # 原子替换：写一半崩了也还是旧文件。.tmp 由 atomicio 管，
+            # 失败时它自己清掉，这里不用再 unlink。
+            atomicio.save_text(p, json.dumps(sess.to_dict(), ensure_ascii=False))
             return True
         except (OSError, ValueError, TypeError):
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
             return False
 
     def load(self, sid: str) -> Session | None:

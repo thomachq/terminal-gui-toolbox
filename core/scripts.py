@@ -19,6 +19,8 @@ import secrets as _secrets
 import time
 from pathlib import Path
 
+from core import atomicio
+
 KINDS: dict[str, dict] = {
     "shell": {"label": "Shell", "hint": "bash / sh，Linux 与 macOS"},
     "powershell": {"label": "PowerShell", "hint": "Windows"},
@@ -492,10 +494,8 @@ class ScriptStore:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, self.path)
+        atomicio.save_text(self.path,
+                           json.dumps(self.data, ensure_ascii=False, indent=2))
 
     @staticmethod
     def _clean(s: dict) -> dict:

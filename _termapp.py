@@ -11,6 +11,15 @@ import sys
 import time
 import tkinter as tk
 
+# 中文 Windows 控制台是 GBK，这个脚本会打印 ▸（提示符）这类字符，直接
+# print 会 UnicodeEncodeError 把整轮跑挂（37 项全废）。保留原编码，只把
+# 编不出来的字符换成 ?，测试该跑完还是跑完。
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 PASS = FAIL = 0
 BAD: list[str] = []
 

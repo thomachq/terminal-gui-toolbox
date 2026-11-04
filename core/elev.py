@@ -35,6 +35,8 @@ import threading
 import time
 from pathlib import Path
 
+from core import atomicio
+
 _IS_WIN = sys.platform == "win32"
 
 # 轮询间隔：20ms 看着很勤，但只是 stat 一个文件，实测 CPU 占用可以忽略；
@@ -102,9 +104,7 @@ def _pid_alive(pid: int) -> bool:
 
 def _write_json(path: Path, obj) -> None:
     """先写 .tmp 再改名 —— 对面按目录扫文件，读到半个 JSON 就整条命令丢了。"""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    atomicio.save_text(path, json.dumps(obj, ensure_ascii=False))
 
 
 def _read_json(path: Path, keep: bool = False, retries: int = 4):

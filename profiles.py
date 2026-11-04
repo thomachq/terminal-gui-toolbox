@@ -17,42 +17,17 @@ import time
 from pathlib import Path
 
 import crypto_store
+from core import atomicio
 
 
 def save_blob(dst: Path, blob: bytes) -> None:
-    """把一份「整机数据」安全地写到 dst（临时文件 + 原子替换）。
+    """把一份「整机数据」安全地写到 dst。
 
-    为什么不能只 `os.replace` 一下：Windows 上目标文件被**任何**进程以普通
-    方式打开着（杀软扫一下、别的线程在并发读），replace 就报 WinError 5
-    「拒绝访问」—— 实测 22:06 存成功、22:11 就失败，纯靠运气。失败时数据还
-    在 .tmp 里，但用户看到的是弹窗「保存失败」，改的东西等于白改。
-
-    所以三层：replace 重试 5 次（间隔递增，覆盖杀软扫几秒的情形）→
-    直接覆写目标（放弃原子性，写坏一半的概率远小于保存不进去）→
-    都不行才把最后一个错误抛出去。
+    这套「临时文件 + 三层兜底」最早长在这里（v1.0.29 实测 22:06 存成功、
+    22:11 就 WinError 5），v1.0.34 起搬进 `core.atomicio` 由全项目共用，
+    这里只留一个一行的兼容包装 —— 老调用方（app.py、各页面）不用改。
     """
-    tmp = dst.with_name(dst.name + ".tmp")
-    tmp.write_bytes(blob)
-    last: OSError | None = None
-    for i in range(5):
-        try:
-            os.replace(tmp, dst)
-            return
-        except PermissionError as e:
-            last = e
-            time.sleep(0.15 * (i + 1))
-    try:
-        with open(dst, "wb") as f:
-            f.write(blob)
-        tmp.unlink(missing_ok=True)
-        return
-    except OSError:
-        pass
-    try:
-        tmp.unlink(missing_ok=True)
-    except OSError:
-        pass
-    raise last or OSError(f"写不进 {dst}")
+    atomicio.save_bytes(dst, blob)
 
 KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa", "id_dsa")
 

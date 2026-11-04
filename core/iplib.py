@@ -28,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+from core import atomicio
 from core import ipaddr
 
 # ------------------------------------------------------------------ 常用网段
@@ -309,10 +310,8 @@ def update(province: bool = True, country: bool = True,
 
 
 def _save(path: Path, obj: dict) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
-                   encoding="utf-8")
-    os.replace(tmp, path)
+    atomicio.save_text(path, json.dumps(obj, ensure_ascii=False,
+                                        separators=(",", ":")))
 
 
 def clear() -> int:

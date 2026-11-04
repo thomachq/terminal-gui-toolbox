@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from core import atomicio
+
 SPI_GETWORKAREA = 0x0030
 DEFAULT_MARGIN = 16          # 窗口边缘与工作区之间至少留的空隙
 
@@ -200,9 +202,7 @@ class WinState:
         self.data = box
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(box, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-            os.replace(tmp, self.path)
+            atomicio.save_text(self.path,
+                               json.dumps(box, ensure_ascii=False, indent=2))
         except OSError:
             pass

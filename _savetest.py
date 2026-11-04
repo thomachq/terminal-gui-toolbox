@@ -83,16 +83,56 @@ except OSError:
     chk(True, "路径根本写不了时要报错（不能静默假成功）")
 os.replace = real_replace
 
-# 5. ProfileStore.save 真的走了 save_blob（防以后有人改回直连 replace）
+# 5. v1.0.34：这套兜底搬进 core/atomicio.py 全项目共用，写入点必须都接上
+from core import atomicio as A                          # noqa: E402
+
 src = (HERE / "profiles.py").read_text(encoding="utf-8")
-chk("save_blob(self.path, blob)" in src, "ProfileStore.save 用 save_blob")
-import re as _re                                        # noqa: E402
-code = "\n".join(ln for ln in src.splitlines()
-                 if not ln.strip().startswith("#")
-                 and "`os.replace`" not in ln)
-hits = _re.findall(r"(?m)^.*os\.replace.*$", code)
-chk(len(hits) == 1, "profiles.py 里真正的 replace 只在 save_blob 里",
-    str(hits)[:80])
+chk("atomicio.save_bytes(dst, blob)" in src, "save_blob 已退化成 atomicio 的薄包装")
+chk("os.replace" not in src, "profiles.py 里不再有直连 os.replace")
+
+SAVE_POINTS = {
+    "core/agent.py": "atomicio.save_text",
+    "core/aiops.py": "atomicio.save_text",
+    "core/aisession.py": "atomicio.save_text",
+    "core/creds.py": "atomicio.save_bytes",
+    "core/mcp.py": "atomicio.save_text",
+    "core/proxies.py": "atomicio.save_bytes",
+    "core/iplib.py": "atomicio.save_text",
+    "core/elev.py": "atomicio.save_text",
+    "core/winstate.py": "atomicio.save_text",
+    "core/scripts.py": "atomicio.save_text",
+    "lockmgr.py": "atomicio.save_text",
+}
+miss = []
+for rel, needle in SAVE_POINTS.items():
+    t = (HERE / rel).read_text(encoding="utf-8")
+    if needle not in t or "os.replace" in t:
+        miss.append(rel)
+chk(not miss, f"{len(SAVE_POINTS)} 处写入点全部走 atomicio 且无直连 replace", str(miss))
+
+# 6. save_text 的换行必须与 Path.write_text 一致（Windows 上 \\n → \\r\\n）
+#    改成先 encode 再 write_bytes 会悄悄把全项目数据文件的行尾改成 LF。
+t = work / "nl.json"
+A.save_text(t, '{"a": 1}\n{"b": 2}\n')
+chk(b"\r\n" in t.read_bytes(), "save_text 与 write_text 同样落 CRLF")
+
+# 7. 真写一遍各模块的 save()：replace 全被占时也要能存进去
+os.replace = lambda tmp, d: (_ for _ in ()).throw(PermissionError(5, "拒绝访问"))
+try:
+    import lockmgr as L                                 # noqa: E402
+    st = L.Settings(work / "lock.json")
+    st.data = {"idle": 30}
+    st.save()
+    chk(st.path.is_file() and "idle" in st.path.read_text(encoding="utf-8"),
+        "lockmgr 被占时仍能保存")
+
+    import core.winstate as W                           # noqa: E402
+    ws = W.WinState(work / "win.json")
+    ws.save({"x": 1, "y": 2, "w": 800, "h": 600})
+    chk(ws.path.is_file(), "winstate 被占时仍能保存")
+except Exception as e:                                  # noqa: BLE001
+    chk(False, "被占时各模块仍能保存", f"{type(e).__name__}: {e}")
+os.replace = real_replace
 
 print(f"\n结果：{PASS[0]} 通过 / {len(FAIL)} 失败")
 if FAIL:

@@ -26,6 +26,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from core import atomicio
+
 try:
     import crypto_store  # 与口令保存同一套加密
 except Exception:  # noqa: BLE001  单独跑测试时可能没有
@@ -427,10 +429,8 @@ class AIConfig:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, self.path)
+        atomicio.save_text(self.path,
+                           json.dumps(self.data, ensure_ascii=False, indent=2))
 
     # -- 便捷
     @property

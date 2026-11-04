@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import crypto_store
+from core import atomicio
 
 KINDS: dict[str, dict] = {
     "password": {"label": "登录密码", "hint": "SSH / Telnet 登录口令", "tone": "brand"},
@@ -260,9 +261,7 @@ class CredStore:
         except OSError:
             blob = plain
             self.encrypted = False
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_bytes(blob)
-        os.replace(tmp, self.path)
+        atomicio.save_bytes(self.path, blob)
 
     @staticmethod
     def _clean(c: dict) -> dict:

@@ -31,6 +31,8 @@ import time
 import urllib.error
 import urllib.request
 
+from core import atomicio
+
 PROTOCOLS = ("2025-06-18", "2024-11-05")
 CLIENT_INFO = {"name": "terminal-toolbox", "version": "1.0"}
 
@@ -96,10 +98,8 @@ class MCPStore:
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-            os.replace(tmp, self.path)
+            atomicio.save_text(self.path,
+                               json.dumps(self.data, ensure_ascii=False, indent=2))
         except OSError as e:
             self.errors.append(f"存不了 {self.path}：{e}")
 
