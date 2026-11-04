@@ -198,6 +198,25 @@ def main() -> int:
            "收档案时带上 COM 字段")
         eq(p["tool_src"], "", "COM 不带 tool_src")
 
+        # ---- 串口是下拉（v1.0.35）：检测到的口直接点，但仍能手输
+        from core import serialport as _sp
+        _ports = _sp.list_ports()
+        eq(str(root.cb_com.winfo_class()), "TCombobox", "连接页串口是下拉框")
+        eq(str(root.cb_com.cget("state")), "normal", "连接页串口可编辑（能手输）")
+        eq(list(root.cb_com.cget("values")), _ports, "下拉里就是检测到的串口")
+        root.v_com_port.set("COM9")
+        root._proto_changed()
+        eq(root.v_com_port.get(), "COM9", "手填没检测到的口也不会被顶掉")
+        root.v_com_port.set("COM1")
+
+        _cf = [x for x in host_fields({"proto": "com", "com_port": "COM3"})
+               if x["key"] == "com_port"][0]
+        eq(_cf["kind"], "select", "档案表单的串口也是下拉")
+        check(_cf.get("editable") is True, "档案表单的串口仍可手输")
+        _opts = [v for v, _lab in
+                 (o if isinstance(o, tuple) else (o, o) for o in _cf["options"])]
+        check("COM3" in _opts, "档案里存的口在候选里（不会被第一项顶掉）")
+
         v.set("adb")
         root._proto_changed()
         root.update_idletasks()
@@ -250,6 +269,12 @@ def main() -> int:
                 dlg = _forms.FormDialog(root, "表单自检",
                                         host_fields(rec=rec), None)
                 dlg.update_idletasks()
+                if proto == "com":
+                    cb = dlg._widgets.get("com_port")
+                    eq(str(cb.winfo_class()), "TCombobox",
+                       "档案表单的串口渲染成下拉")
+                    eq(str(cb.cget("state")), "normal",
+                       "档案表单的串口可编辑（能手输）")
                 dlg.destroy()
                 check(True, f"{proto} 的表单控件全部能创建")
             except Exception as e:  # noqa: BLE001

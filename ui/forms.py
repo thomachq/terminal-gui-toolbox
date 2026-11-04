@@ -272,21 +272,29 @@ class FormDialog(tk.Toplevel):
             labels = [o[1] if isinstance(o, (tuple, list)) else str(o) for o in opts]
             keys = [o[0] if isinstance(o, (tuple, list)) else str(o) for o in opts]
             var = tk.StringVar()
+            # editable：候选之外还能自己敲（串口就是这种 —— 检测到的口做成
+            # 下拉直接点，但设备没插 / 驱动没装 / 想先配好再插线时得能填）。
+            editable = bool(f.get("editable"))
             cb = ttk.Combobox(cell, textvariable=var, values=labels,
-                              state="readonly", width=max(8, width - 4),
-                              font=U.FONT_S)
+                              state=("normal" if editable else "readonly"),
+                              width=max(8, width - 4), font=U.FONT_S)
             cb.pack(side="left")
             try:
                 idx = keys.index(val)
             except ValueError:
                 idx = 0
-            if labels:
+            if editable:
+                # 原值可能不在候选里（比如刚插上、对话框还没重开），
+                # 不能被第一项顶掉 —— 直接把它填回输入框。
+                var.set(str(val or ""))
+            elif labels:
                 cb.current(idx)
-            def _get_sel(ks=keys, ls=labels, v=var):
+
+            def _get_sel(ks=keys, ls=labels, v=var, ed=editable):
                 cur = v.get()
                 if cur in ls:
                     return ks[ls.index(cur)]
-                return ks[0] if ks else ""
+                return cur if ed else (ks[0] if ks else "")
 
             self._getters[f["key"]] = _get_sel
             self._widgets[f["key"]] = cb

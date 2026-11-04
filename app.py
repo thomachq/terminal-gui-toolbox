@@ -137,7 +137,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.34"
+APP_VER = "1.0.35"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -1933,9 +1933,12 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         rc = self.row_com
         rc.columnconfigure(1, weight=1)
         U.wlabel(rc, "串口", "card", U.FONT_S).grid(row=0, column=0, sticky="w")
-        ttk.Entry(rc, textvariable=self.v_com_port, width=12).grid(
-            row=0, column=1, sticky="w", padx=(10, 6))
-        U.RoundButton(rc, "扫描串口", self._com_scan, variant="secondary",
+        # 串口做成下拉：检测到的口直接点。仍允许直接敲 —— 设备没插、
+        # 驱动没装、或者想先配好档案再插线，都得填得进去。
+        self.cb_com = ttk.Combobox(rc, textvariable=self.v_com_port, width=26,
+                                   state="normal", font=U.FONT_S)
+        self.cb_com.grid(row=0, column=1, sticky="w", padx=(10, 6))
+        U.RoundButton(rc, "刷新", self._com_scan, variant="secondary",
                       font=U.FONT_S, height=27, padx=10).grid(
             row=0, column=2, sticky="w")
         U.wlabel(rc, "波特率", "card", U.FONT_S).grid(
@@ -2181,13 +2184,8 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         if is_com:
             if not self.row_com.winfo_manager():
                 self.row_com.pack(fill="x", pady=(9, 0), before=self.row_elev)
-            try:
-                ports = serial_core.list_ports()
-                self.lbl_com_hint.configure(
-                    text=("已检测到串口：" + "、".join(ports)) if ports
-                    else "没有检测到串口（设备没插也可以手填，例如 COM3）")
-            except (AttributeError, tk.TclError):
-                pass
+            # 每次切到 COM 都重新枚举一次：插拔线之后不用重开程序
+            self._com_refresh()
         else:
             self.row_com.pack_forget()
 
@@ -2250,27 +2248,37 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         except Exception:  # noqa: BLE001
             pass
 
-    def _com_scan(self) -> None:
-        """扫描串口：把检测结果做成一个可选列表（同时刷新提示）。"""
+    def _com_refresh(self) -> int:
+        """把检测到的串口填进下拉，返回检测到几个。
+
+        只调 `list_ports()`（读注册表，毫秒级）。**别在这里加
+        `port_labels()`**：它要起 PowerShell 问 WMI，实测 8 秒才超时返回
+        （而且是空 dict），放进「切到 COM 就刷新」的路径里就是把界面冻住
+        8 秒。下拉里只有 COM3 这样的端口名，够用。
+        """
         ports = serial_core.list_ports()
-        if not ports:
-            messagebox.showinfo(
-                "没有检测到串口",
-                "系统里没有已注册的串口。\n\n"
-                "· USB 转 console 线要先装驱动（CH340 / CP210x / FTDI）；\n"
-                "· 也可以直接手填串口名，例如 COM3。",
-                parent=self)
+        try:
+            self.cb_com["values"] = ports
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            self.lbl_com_hint.configure(
+                text=("已检测到串口：" + "、".join(ports)) if ports
+                else "没有检测到串口（设备没插也可以手填，例如 COM3）")
+        except (AttributeError, tk.TclError):
+            pass
+        return len(ports)
+
+    def _com_scan(self) -> None:
+        """刷新下拉（插拔线后点一下）。"""
+        if self._com_refresh():
             return
-        labels = serial_core.port_labels()
-        opts = [(p, f"{p}  {labels.get(p, '')}".strip()) for p in ports]
-        data = forms.FormDialog.open(
-            self, "选择串口",
-            [{"key": "port", "label": "串口", "kind": "select",
-              "options": opts, "default": opts[0][0]}],
-            subtitle="插拔线后重新点一次「扫描串口」即可刷新")
-        if data and data.get("port"):
-            self.v_com_port.set(str(data["port"]))
-            self._proto_changed()
+        messagebox.showinfo(
+            "没有检测到串口",
+            "系统里没有已注册的串口。\n\n"
+            "· USB 转 console 线要先装驱动（CH340 / CP210x / FTDI）；\n"
+            "· 也可以直接手填串口名，例如 COM3。",
+            parent=self)
 
     def _dbg_scan(self) -> None:
         """扫描 ADB / HDC 设备：选一台填进「设备序列号」。"""

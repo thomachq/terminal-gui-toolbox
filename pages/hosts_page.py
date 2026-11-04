@@ -164,8 +164,17 @@ def host_fields(rec: dict | None = None, cred_opts=None, proxy_opts=None,
 
     from core import serialport as _sp
     _ports = _sp.list_ports()
-    _port_hint = ("已检测到：" + "、".join(_ports)) if _ports else \
+    _port_hint = ("下拉里是当前检测到的串口（插拔线后重开这个对话框刷新）；"
+                  "没插线、驱动没装也可以直接敲，例如 COM3") if _ports else \
         "没有检测到串口（设备没插 / 驱动没装也可以手填，例如 COM3）"
+    # 串口做成下拉：检测到的口直接点，不用背名字。仍保留手输（editable），
+    # 否则「先配好档案、待会儿再插线」这种情况就填不了了。
+    _cur_port = str(rec.get("com_port") or "").strip()
+    _port_opts = [(p, p) for p in _ports]
+    if _cur_port and _cur_port not in _ports:
+        _port_opts.insert(0, (_cur_port, _cur_port))
+    if not _port_opts:
+        _port_opts = [("COM1", "COM1")]
 
     saved = bool(rec.get("sudo_password"))
     fields = [
@@ -187,9 +196,10 @@ def host_fields(rec: dict | None = None, cred_opts=None, proxy_opts=None,
          "default": str(rec.get("user") or ""),
          "hint": "COM 口可留空（设备 console 免登录时不用填）"},
         # ---- COM（console）：串口名 + 线路参数
-        {"key": "com_port", "label": "串口", "kind": "text",
+        {"key": "com_port", "label": "串口", "kind": "select", "editable": True,
          "show_if": {"proto": ["com"]},
-         "default": str(rec.get("com_port") or "COM1"),
+         "options": _port_opts,
+         "default": _cur_port or "COM1",
          "hint": _port_hint},
         {"key": "baud", "label": "波特率", "kind": "select",
          "show_if": {"proto": ["com"]},
