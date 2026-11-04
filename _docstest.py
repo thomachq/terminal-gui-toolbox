@@ -54,9 +54,9 @@ def sec(t):
 
 
 TPL_HAND = PK.DOC_TPL / "模板-项目交接说明.md"
-# v1.0.35 起 deb 说明是**通用版**（docs/deb构建说明.md）：不带版本号、不走
+# v1.0.35 起 deb 说明是**通用版**（docs/terminal-gui-toolbox-deb构建说明.md）：不带版本号、不走
 # 模板渲染，版本号由执行者从 app.py 的 APP_VER 现读。
-DEB = PK.DOC_TPL / "deb构建说明.md"
+DEB = PK.DOC_TPL / "terminal-gui-toolbox-deb构建说明.md"
 VER = PK.VER
 
 # 判「还有没有没替换的占位符」只能按占位符的形状判：文档正文里出现花括号
@@ -186,7 +186,7 @@ with zipfile.ZipFile(kb) as zf:
     nl = zf.namelist()
     base = [n.split("/")[-1] for n in nl]
     chk("terminal-gui-toolbox项目交接说明.md" in nl, "知识库含交接说明成品")
-    chk("docs/deb构建说明.md" in nl, "知识库含通用版 deb 说明")
+    chk("docs/terminal-gui-toolbox-deb构建说明.md" in nl, "知识库含通用版 deb 说明")
     chk(not [n for n in base if n.startswith("模板-")],
         "知识库不含模板本体", str([n for n in base if n.startswith("模板-")][:3]))
     chk(not [n for n in nl if n.endswith("/query") or n == "query"],

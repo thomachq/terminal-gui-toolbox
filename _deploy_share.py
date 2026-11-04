@@ -138,7 +138,7 @@ def main() -> int:
 
     # 常驻文档：不代表具体版本，但每次发版都要给最新的一份。
     # 它们不在 _release/v<ver>/ 里（不随版本变化），所以单独从 docs/ 拷。
-    for doc in ("发布链说明.md", "deb构建说明.md"):
+    for doc in ("发布链说明.md", "terminal-gui-toolbox-deb构建说明.md"):
         src = ROOT / "docs" / doc
         if not src.is_file():
             print("  !! 缺常驻文档（跳过）：", doc)
@@ -172,6 +172,13 @@ def main() -> int:
     if legacy_deb.is_file():
         print("  旧命名的 deb 说明，挪进 old/ 归档")
         archive(legacy_deb, legacy_deb.name)
+
+    # 通用版最初叫 `deb构建说明.md`，用户要求文件名带项目名前缀，统一成
+    # `terminal-gui-toolbox-deb构建说明.md`（仍不带版本号）。
+    legacy_deb2 = DST / "deb构建说明.md"
+    if legacy_deb2.is_file():
+        print("  旧命名的通用版 deb 说明，挪进 old/ 归档")
+        archive(legacy_deb2, legacy_deb2.name)
 
     # 复核：逐个比大小，别把「复制了」当成「复制对了」
     bad = [n for n in files(v)
