@@ -77,9 +77,12 @@ chk("app = ToolboxApp()" not in seg_br,
     "分支里没有建 Tk 应用（建 app 之前就 return）", "仍会起 GUI")
 
 # ---------------------------------------------------------------- C
-sec("C. _emit_version 的三段兜底")
-seg = src[src.find("def _emit_version"):src.find("def main()")]
+sec("C. 输出兜底（v1.0.33 起提到 _emit_console，--version 与 --check-tools 共用）")
+seg = src[src.find("def _emit_console"):src.find("def _emit_version")]
+chk("def _emit_console" in src, "_emit_console 存在")
 chk("def _emit_version" in src, "_emit_version 存在")
+chk("_emit_console(f\"{APP_NAME} v{APP_VER}" in src,
+    "--version 走同一套输出兜底")
 chk("out = sys.stdout" in seg, "先试现成的 sys.stdout")
 chk("AttachConsole" in seg, "再挂父进程控制台（windowed 没控制台时唯一出路）")
 chk("return False" in seg, "两条路都不通时返回 False，由调用方决定怎么显示")
@@ -116,6 +119,24 @@ if m:
 chk(src.count('if "--version" in sys.argv:') == 1,
     "只有一个 --version 处理点（不会两处打架）",
     str(src.count('if "--version" in sys.argv:')))
+
+# ---------------------------------------------------------------- F
+sec("F. --check-tools（v1.0.33：排障时先看它用的是哪一份 adb/hdc）")
+r = subprocess.run([sys.executable, str(SRC), "--check-tools"],
+                   capture_output=True, text=True, encoding="utf-8",
+                   errors="replace", cwd=str(HERE), timeout=120)
+chk(r.returncode == 0, "源码 --check-tools 退出码 0", f"rc={r.returncode}")
+for want in ("应用目录", "内置 bin", "ADB", "HDC", "端口"):
+    chk(want in r.stdout, f"输出里有「{want}」")
+chk("Traceback" not in r.stderr, "stderr 没有异常", r.stderr[:200])
+if EXE.is_file():
+    r = subprocess.run([str(EXE), "--check-tools"], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace",
+                       cwd=str(HERE), timeout=300)
+    chk(r.returncode == 0, "exe --check-tools 退出码 0", f"rc={r.returncode}")
+    chk("bin" in r.stdout, "exe 能在自己目录下找到 bin")
+    chk(str(HERE) in r.stdout or "TerminalToolbox" in r.stdout,
+        "exe 报的应用目录是它自己的位置", r.stdout[:160])
 
 print(f"\n结果：{_p} 通过 / {_f} 失败")
 if _f:

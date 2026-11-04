@@ -49,3 +49,11 @@ build.prev-*/
 
 # 截图产物（打包不带）
 _shots/
+
+# ── 随包分发的第三方调试组件（adb / hdc）──
+# 仓库只放源码：clone 下来 bin/ 里只有 README，跑 `python _fetch_bins.py`
+# 从本机 SDK 补齐即可。打包脚本（_pack_release.py）会显式把这几个文件
+# 塞进工具包与 portable 包，所以发布出去的成品里仍然是开箱可用的。
+/bin/*.exe
+/bin/*.dll
+/bin/NOTICE-*.txt

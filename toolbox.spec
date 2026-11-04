@@ -33,6 +33,10 @@ hidden = [
     # 静态分析有时扫不到，全部显式列出）
     'core.detect', 'core.session', 'core.telnet_session', 'core.metrics',
     'core.cli_channel', 'core.ssh_shell', 'core.sessionmgr',
+    # 新连接方式（v1.0.33）：COM 串口 / ADB / HDC
+    # 注意 bin/ 不往 exe 里塞：程序按 exe 同级目录找 bin\\，随包分发即可。
+    'core.serialport', 'core.console_session', 'core.devtools',
+    'core.debug_session',
     'core.parsers', 'core.routes', 'core.firewall', 'core.docker',
     'core.files', 'core.redact', 'core.webstack', 'core.aiops',
     'core.secscan', 'core.dbscan', 'core.cronjob',

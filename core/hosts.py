@@ -20,7 +20,23 @@ UNGROUPED = "未分组"
 TAG_SEP = re.compile(r"[,，;；、\s]+")
 # 主机名/地址允许的字符：够宽（支持 IPv6、域名、中文主机名），但挡住空白与路径符
 _BAD_ADDR = re.compile(r"[\s/\\]")
-_PROTO_LABEL = {"ssh": "SSH", "telnet": "Telnet", "local": "本机"}
+_PROTO_LABEL = {"ssh": "SSH", "telnet": "Telnet", "local": "本机",
+                "com": "COM 口", "adb": "ADB", "hdc": "HDC"}
+#: 调试桥（USB / 远程），提权与认证都不适用
+DEBUG_PROTO = ("adb", "hdc")
+#: console 串口
+CONSOLE_PROTO = ("com",)
+#: 有「地址 + 端口」概念的协议（COM 是串口名，不算网络地址）
+NET_PROTO = ("ssh", "telnet", "adb", "hdc")
+#: 主机协议下拉的**唯一**来源（表单和连接页都从这里取）
+PROTO_PICK = (
+    ("ssh", "SSH"),
+    ("telnet", "Telnet"),
+    ("com", "COM 口（console）"),
+    ("adb", "ADB（安卓调试）"),
+    ("hdc", "HDC（鸿蒙调试）"),
+    ("local", "本机"),
+)
 _AUTH_LABEL = {"key": "私钥", "password": "密码"}
 # 「目标系统」：提权方式由它决定，多一类就多一套分支。
 # 用户能自己选（不止 Windows / Linux，macOS / FreeBSD 这类类 Unix 也要），
@@ -97,6 +113,8 @@ def proto_of(p: dict) -> str:
     pr = str((p or {}).get("proto") or "").strip().lower()
     if pr in _PROTO_LABEL:
         return pr
+    # 老档案没有 proto 字段：按端口猜。23 是 telnet，其它一律当 SSH，
+    # 不要再往 com/adb/hdc 上猜 —— 它们一定有显式 proto。
     return "telnet" if str((p or {}).get("port") or "") == "23" else "ssh"
 
 
@@ -120,8 +138,15 @@ def os_label(p: dict, local_os: str = "") -> str:
     fam = os_of(p)
     if fam:
         return OS_LABEL.get(fam, fam)
-    if proto_of(p) == "local":
+    proto = proto_of(p)
+    if proto == "local":
         return local_os or "本机"
+    if proto == "adb":
+        return "Android"
+    if proto == "hdc":
+        return "HarmonyOS"
+    if proto == "com":
+        return "console"
     return "自动"
 
 
@@ -143,6 +168,14 @@ def assume_os(vals: dict, is_win: bool) -> str:
     fam = _OS_ALIAS.get(fam, fam)
     if fam in OS_CHOICES and fam:
         return fam
+    # 没显式选目标系统时的默认：
+    #   COM 口 = console 线，九成接交换机 / 防火墙 → 按网络设备（enable）走；
+    #   ADB / HDC = 手机 / 平板 / 鸿蒙设备 → 类 Unix（没有 sudo 这一层）；
+    #   Telnet 还是老交换机居多；SSH 默认 Linux 服务器。
+    if proto in CONSOLE_PROTO:
+        return "network"
+    if proto in DEBUG_PROTO:
+        return "linux"
     return "network" if proto == "telnet" else "linux"
 
 
@@ -154,8 +187,26 @@ def addr_of(p: dict) -> str:
     用户一眼能看出这条不是没填完，而是本来就没有远端地址。
     """
     p = p or {}
-    if proto_of(p) == "local":
+    proto = proto_of(p)
+    if proto == "local":
         return "localhost"
+    if proto in CONSOLE_PROTO:
+        port_name = str(p.get("com_port") or "").strip()
+        if not port_name:
+            return "—"
+        from core.serialport import params_text
+        return f"{port_name} · {params_text(p)}"
+    if proto in DEBUG_PROTO:
+        host0 = str(p.get("host") or "").strip()
+        tail0 = host0
+        if host0:
+            port0 = str(p.get("port") or "").strip()
+            if port0 and port0 not in ("5555", "8710"):
+                tail0 = f"{host0}:{port0}"
+        else:
+            tail0 = "USB"
+        dev = str(p.get("device_id") or "").strip()
+        return f"{tail0}（{dev}）" if dev else tail0
     host = str(p.get("host") or "").strip()
     user = str(p.get("user") or "").strip()
     port = str(p.get("port") or "").strip()
@@ -268,6 +319,9 @@ def filter_hosts(rows: list[dict], q: str = "", group: str = "",
                 str(r.get("user") or ""), group_of(r),
                 " ".join(parse_tags(r.get("tags"))),
                 str(r.get("note") or ""),
+                # 搜「COM3」「5555」「鸿蒙设备序列号」也要能命中
+                str(r.get("com_port") or ""), str(r.get("device_id") or ""),
+                str(r.get("port") or ""),
             ]).lower()
             return all(w.lower() in pool for w in words)
         out = [r for r in out if hit(r)]
@@ -340,7 +394,37 @@ def validate(rec: dict, others: list[dict] | None = None,
     if not name:
         errs.append("名称不能为空")
     proto = proto_of(rec)
-    if proto != "local":
+    if proto in CONSOLE_PROTO:
+        # COM 没有「地址 / 端口」，但有串口名和线路参数 —— 只校验这几项
+        cp = str((rec or {}).get("com_port") or "").strip()
+        if not cp:
+            errs.append("串口不能为空（例如 COM3）")
+        elif _BAD_ADDR.search(cp):
+            errs.append("串口名里不能有空格或斜杠")
+        try:
+            baud = int(str((rec or {}).get("baud") or "115200"))
+            if not (50 <= baud <= 4000000):
+                errs.append("波特率必须在 50–4000000 之间")
+        except ValueError:
+            errs.append("波特率必须是数字")
+    elif proto in DEBUG_PROTO:
+        # USB 连接不需要地址；填了地址才校验端口（远程调试）
+        host = str((rec or {}).get("host") or "").strip()
+        if host:
+            if _BAD_ADDR.search(host):
+                errs.append("地址里不能有空格或斜杠")
+            port = str((rec or {}).get("port") or "").strip()
+            if not port:
+                errs.append("远程调试要填端口（ADB 常见 5555，HDC 常见 8710）")
+            else:
+                try:
+                    pn = int(port)
+                except ValueError:
+                    errs.append("端口必须是数字")
+                else:
+                    if not (0 < pn < 65536):
+                        errs.append("端口必须在 1–65535 之间")
+    elif proto != "local":
         host = str((rec or {}).get("host") or "").strip()
         if not host:
             errs.append("地址不能为空")
@@ -379,13 +463,31 @@ def blank_record(proto: str = "ssh") -> dict:
       · Windows 本机 —— 没有 sudo，`elevate` 表示「以管理员权限运行」（UAC），
         再选一个 `shell`（cmd / powershell）。
     """
+    if proto == "telnet":
+        port = "23"
+    elif proto == "adb":
+        port = "5555"
+    elif proto == "hdc":
+        port = "8710"
+    else:
+        port = "22"
     return {
-        "name": "", "host": "", "port": "22" if proto != "telnet" else "23",
+        "name": "", "host": "", "port": port,
         "user": "", "auth": "key", "key_path": "", "proto": proto,
         "group": "", "tags": "", "note": "", "cred_id": "", "proxy_id": "",
         "ostype": "", "os_name": "",
         "remember": False, "password": "", "key_passphrase": "",
         "sudo_password": "", "sudo": False, "elevate": False, "shell": "",
+        # ---- COM（console）：串口名 + 线路参数
+        "com_port": "COM1" if proto in CONSOLE_PROTO else "",
+        "baud": "115200" if proto in CONSOLE_PROTO else "",
+        "databits": "8" if proto in CONSOLE_PROTO else "",
+        "parity": "none" if proto in CONSOLE_PROTO else "",
+        "stopbits": "1" if proto in CONSOLE_PROTO else "",
+        "flow": "none" if proto in CONSOLE_PROTO else "",
+        # ---- ADB / HDC：设备序列号（空＝自动挑）+ 组件来源
+        "device_id": "",
+        "tool_src": "auto" if proto in DEBUG_PROTO else "",
         "created": str(now_ts()), "last_used": "",
     }
 
@@ -394,9 +496,26 @@ def record_from_form(data: dict, base: dict | None = None) -> dict:
     """表单值 → 档案记录。保留 base 里的口令等不可见字段。"""
     out = dict(base or blank_record())
     for k in ("name", "host", "port", "user", "auth", "key_path", "proto",
-              "group", "note", "cred_id", "proxy_id", "shell", "ostype"):
+              "group", "note", "cred_id", "proxy_id", "shell", "ostype",
+              "com_port", "baud", "databits", "parity", "stopbits", "flow",
+              "device_id", "tool_src"):
         if k in data:
             out[k] = str(data.get(k) or "").strip()
+    # 切协议时清掉不属于它的字段：一条 SSH 档案里留着 COM3 / 115200，
+    # 下次切到 COM 会「看起来填好了」，实际是上一条档案的残留。
+    if out.get("proto") in CONSOLE_PROTO:
+        out["tool_src"] = ""
+        out["device_id"] = ""
+    elif out.get("proto") in DEBUG_PROTO:
+        out["com_port"] = out["baud"] = out["databits"] = ""
+        out["parity"] = out["stopbits"] = out["flow"] = ""
+        if not out.get("tool_src"):
+            out["tool_src"] = "auto"
+    else:
+        out["com_port"] = out["baud"] = out["databits"] = ""
+        out["parity"] = out["stopbits"] = out["flow"] = ""
+        out["device_id"] = ""
+        out["tool_src"] = ""
     for k in ("sudo", "elevate"):
         if k in data:
             out[k] = bool(data.get(k))

@@ -60,8 +60,17 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec(
         "device", "读取设备上下文", "设备",
         "取当前连接的设备名、协议、系统版本、是否提权、以及最近的命令记录。"
+        "协议可能是 ssh / telnet / local / com / adb / hdc，"
         "动手前不确定对面是什么机器时，先调它。",
         (), "read", '{"tool": "device"}'),
+    ToolSpec(
+        "devtool", "管理调试设备", "调试",
+        "列出 / 连接 / 断开 ADB（安卓）与 HDC（鸿蒙）设备。"
+        "bus 选 adb 或 hdc；action 选 list / connect / disconnect；"
+        "connect 与 disconnect 要在 target 里写 ip:端口（如 192.168.1.5:5555）。"
+        "已经连上的 ADB / HDC 会话可以直接用 exec 执行命令，不必重复 connect。",
+        ("bus", "action", "target"), "write",
+        '{"tool": "devtool", "bus": "adb", "action": "list"}'),
     ToolSpec(
         "relay", "跨设备中转文件", "设备",
         "把一台设备上的文件搬到另一台：源机读出来 → 经本机内存 → 写进目标机。"
@@ -93,7 +102,7 @@ TOOL_SPECS: list[ToolSpec] = [
 ]
 
 TOOLS: dict[str, ToolSpec] = {t.id: t for t in TOOL_SPECS}
-GROUPS: tuple = ("设备", "界面")
+GROUPS: tuple = ("设备", "调试", "界面")
 DEFAULT_TOOLS: list[str] = [t.id for t in TOOL_SPECS]
 
 
@@ -112,6 +121,8 @@ DEFAULT_PROMPT = """你是「{name}」，一个跑在终端工具箱里的运维
 1. 一次只做一小步：先只读取证，再动手改；改完再看一眼结果。
 2. 要看设备上的东西就 exec 跑只读命令；要看界面上的东西就 open_page / page_read。
 3. 命令必须是目标设备上能直接执行的一行，不带 sudo 前缀（提权由程序处理）。
+   目标可能是 SSH/Telnet 服务器、console(COM) 接的交换机/防火墙、ADB 安卓设备、
+   HDC 鸿蒙设备 —— 已连接的会话一律用 exec，先看 device 工具返回的 proto 再决定命令方言。
 4. 删除、重启、清空、覆盖这类回滚成本高的动作，risk 标 danger，why 里写清后果。
 5. 用户只是问概念、不需要动作时，直接给结论，calls 返回空数组。
 6. 不确定就先查，不要编造命令输出；拿到真实输出再下结论。
@@ -244,7 +255,9 @@ class AgentConfig:
         self.data["tools"] = [t for t in tools if t in TOOLS]
         skills = self.data.get("skills")
         self.data["skills"] = [str(s) for s in skills] if isinstance(skills, list) else []
-        if self.data.get("mode") not in ("auto", "confirm", "readonly"):
+        # free = 完全放行：不弹确认、也不因风险等级拦截（仍逐条记日志）。
+        # 这是用户显式选择的模式，所以允许存在；默认仍是 auto。
+        if self.data.get("mode") not in ("auto", "confirm", "readonly", "free"):
             self.data["mode"] = "auto"
         try:
             steps = int(self.data.get("max_steps") or 8)
@@ -551,7 +564,11 @@ class Agent:
                     skipped.append(_call_brief(call))
                     emit("skip", {"call": call, "why": "只读模式下不执行写操作"})
                     continue
-                need_ask = risk == "danger" or (mode == "confirm" and risk != "read")
+                if mode == "free" and risk == "danger":
+                    # 完全放行也留个痕：事后能从日志里看出「这一步本来是危险操作」
+                    emit("free", {"call": call})
+                need_ask = (mode != "free") and (
+                    risk == "danger" or (mode == "confirm" and risk != "read"))
                 if need_ask:
                     emit("need_confirm", {"call": call})
                     if not (confirm(call) if confirm else False):

@@ -40,9 +40,11 @@ from core import ai_skills, aitrace
 from core import aiops, parsers, routes
 from core import audit as audit_core
 from core import creds as creds_core
+from core import devtools
 from core import elev
 from core import hosts as hosts_core
 from core import proxies as proxies_core
+from core import serialport as serial_core
 from core import scripts as scripts_core
 from core import redact
 from core import singleinstance
@@ -135,7 +137,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.32"
+APP_VER = "1.0.33"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -1826,17 +1828,20 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         pg.rowconfigure(2, weight=1)
 
         # ---- 会话
-        c = U.Card(pg, title="会话", hint="SSH / Telnet / 本机")
+        c = U.Card(pg, title="会话", hint="SSH / Telnet / COM / ADB / HDC / 本机")
         c.grid(row=0, column=0, sticky="we")
         b = c.body
 
         self.v_proto = tk.StringVar(value="ssh")
         r = U.wframe(b, "card")
         r.pack(fill="x")
-        for val, label in (("ssh", "SSH"), ("telnet", "Telnet"), ("local", "本机")):
-            ttk.Radiobutton(r, text=label, value=val, variable=self.v_proto,
+        # 六种连接方式：三种远程协议 + console 串口 + 两个调试桥 + 本机
+        for val, label in hosts_core.PROTO_PICK:
+            ttk.Radiobutton(r, text=label.split("（")[0], value=val,
+                            variable=self.v_proto,
                             style="Card.TRadiobutton",
-                            command=self._proto_changed).pack(side="left", padx=(0, 20))
+                            command=self._proto_changed).pack(
+                side="left", padx=(0, 13))
 
         # 目标系统：决定提权问的是 sudo 密码、enable 密码，还是根本不用密码。
         # 默认「自动」—— 连上后 detect() 会把真实系统写进档案，下次打开就是准的。
@@ -1877,6 +1882,16 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.v_keypw = tk.StringVar()
         self.v_pw = tk.StringVar()
         self.v_sudopw = tk.StringVar()
+        # ---- 新增连接方式（v1.0.33）
+        # COM：串口名 + 线路参数；ADB / HDC：组件来源 + 设备序列号
+        self.v_com_port = tk.StringVar(value="COM1")
+        self.v_baud = tk.StringVar(value="115200")
+        self.v_databits = tk.StringVar(value="8")
+        self.v_parity = tk.StringVar(value="none")
+        self.v_stopbits = tk.StringVar(value="1")
+        self.v_flow = tk.StringVar(value="none")
+        self.v_tool_src = tk.StringVar(value="auto")
+        self.v_device = tk.StringVar(value="")
 
         # 档案
         rowp = U.wframe(b, "card")
@@ -1899,16 +1914,90 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.row_addr = row
         row.pack(fill="x", pady=(9, 0))
         row.columnconfigure(1, weight=1)
-        U.wlabel(row, "地址", "card", U.FONT_S).grid(row=0, column=0, sticky="w")
+        self.lbl_addr = U.wlabel(row, "地址", "card", U.FONT_S)
+        self.lbl_addr.grid(row=0, column=0, sticky="w")
         self.e_host = ttk.Entry(row, textvariable=self.v_host)
         self.e_host.grid(row=0, column=1, sticky="we", padx=(10, 8))
-        U.wlabel(row, "端口", "card", U.FONT_S).grid(row=0, column=2, sticky="w")
-        ttk.Entry(row, textvariable=self.v_port, width=7).grid(
-            row=0, column=3, sticky="w", padx=(8, 0))
-        U.wlabel(row, "用户", "card", U.FONT_S).grid(row=1, column=0,
-                                                     sticky="w", pady=(7, 0))
-        ttk.Entry(row, textvariable=self.v_user).grid(
-            row=1, column=1, columnspan=3, sticky="we", padx=(10, 0), pady=(7, 0))
+        self.lbl_port = U.wlabel(row, "端口", "card", U.FONT_S)
+        self.lbl_port.grid(row=0, column=2, sticky="w")
+        self.e_port = ttk.Entry(row, textvariable=self.v_port, width=7)
+        self.e_port.grid(row=0, column=3, sticky="w", padx=(8, 0))
+        self.lbl_user = U.wlabel(row, "用户", "card", U.FONT_S)
+        self.lbl_user.grid(row=1, column=0, sticky="w", pady=(7, 0))
+        self.e_user = ttk.Entry(row, textvariable=self.v_user)
+        self.e_user.grid(row=1, column=1, columnspan=3, sticky="we",
+                         padx=(10, 0), pady=(7, 0))
+
+        # ---- COM（console）参数：串口名 + 线路参数
+        self.row_com = U.wframe(b, "card")
+        rc = self.row_com
+        rc.columnconfigure(1, weight=1)
+        U.wlabel(rc, "串口", "card", U.FONT_S).grid(row=0, column=0, sticky="w")
+        ttk.Entry(rc, textvariable=self.v_com_port, width=12).grid(
+            row=0, column=1, sticky="w", padx=(10, 6))
+        U.RoundButton(rc, "扫描串口", self._com_scan, variant="secondary",
+                      font=U.FONT_S, height=27, padx=10).grid(
+            row=0, column=2, sticky="w")
+        U.wlabel(rc, "波特率", "card", U.FONT_S).grid(
+            row=0, column=3, sticky="w", padx=(22, 0))
+        self.cb_baud = ttk.Combobox(
+            rc, textvariable=self.v_baud, state="readonly", width=9,
+            values=[str(x) for x in serial_core.BAUDS], font=U.FONT_S)
+        self.cb_baud.grid(row=0, column=4, sticky="w", padx=(8, 0))
+        U.wlabel(rc, "数据位", "card", U.FONT_S).grid(
+            row=1, column=0, sticky="w", pady=(7, 0))
+        ttk.Combobox(rc, textvariable=self.v_databits, state="readonly", width=5,
+                     values=[str(x) for x in serial_core.DATABITS],
+                     font=U.FONT_S).grid(row=1, column=1, sticky="w",
+                                         pady=(7, 0))
+        U.wlabel(rc, "校验", "card", U.FONT_S).grid(
+            row=1, column=2, sticky="w", padx=(10, 0), pady=(7, 0))
+        self.cb_parity = ttk.Combobox(
+            rc, textvariable=self.v_parity, state="readonly", width=10,
+            font=U.FONT_S, values=["none", "even", "odd", "mark", "space"])
+        self.cb_parity.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(7, 0))
+        U.wlabel(rc, "停止位", "card", U.FONT_S).grid(
+            row=1, column=4, sticky="w", padx=(10, 0), pady=(7, 0))
+        ttk.Combobox(rc, textvariable=self.v_stopbits, state="readonly", width=4,
+                     values=list(serial_core.STOPBITS), font=U.FONT_S).grid(
+            row=1, column=5, sticky="w", padx=(8, 0), pady=(7, 0))
+        U.wlabel(rc, "流控", "card", U.FONT_S).grid(
+            row=2, column=0, sticky="w", pady=(7, 0))
+        self.cb_flow = ttk.Combobox(
+            rc, textvariable=self.v_flow, state="readonly", width=12,
+            font=U.FONT_S, values=["none", "rtscts", "xonxoff"])
+        self.cb_flow.grid(row=2, column=1, columnspan=2, sticky="w",
+                          padx=(0, 0), pady=(7, 0))
+        self.lbl_com_hint = U.wlabel(rc, "", "dim", U.FONT_XS, justify="left")
+        self.lbl_com_hint.grid(row=3, column=0, columnspan=6, sticky="w",
+                               pady=(6, 0))
+
+        # ---- ADB / HDC 参数：组件来源 + 设备序列号
+        self.row_dbg = U.wframe(b, "card")
+        rd = self.row_dbg
+        rd.columnconfigure(1, weight=1)
+        U.wlabel(rd, "组件", "card", U.FONT_S).grid(row=0, column=0, sticky="w")
+        self._tool_src_ui = [(v, l) for v, l in
+                             (("auto", "自动（环境变量优先，找不到用内置）"),
+                              ("env", "环境变量（PATH）"),
+                              ("bundled", "内置组件（应用目录 bin）"))]
+        self._tool_src_key = {l: v for v, l in self._tool_src_ui}
+        self.cb_tool_src = ttk.Combobox(
+            rd, state="readonly", width=40, font=U.FONT_S,
+            values=[l for _, l in self._tool_src_ui])
+        self.cb_tool_src.grid(row=0, column=1, sticky="w", padx=(10, 6))
+        self.cb_tool_src.set(self._tool_src_ui[0][1])
+        self.cb_tool_src.bind("<<ComboboxSelected>>", self._tool_src_pick)
+        U.wlabel(rd, "设备", "card", U.FONT_S).grid(
+            row=1, column=0, sticky="w", pady=(7, 0))
+        ttk.Entry(rd, textvariable=self.v_device).grid(
+            row=1, column=1, sticky="we", padx=(10, 6), pady=(7, 0))
+        U.RoundButton(rd, "扫描设备…", self._dbg_scan, variant="secondary",
+                      font=U.FONT_S, height=27, padx=10).grid(
+            row=1, column=2, sticky="w", pady=(7, 0))
+        self.lbl_dbg_hint = U.wlabel(rd, "", "dim", U.FONT_XS, justify="left")
+        self.lbl_dbg_hint.grid(row=2, column=0, columnspan=3, sticky="w",
+                               pady=(6, 0))
 
         # 认证
         self.row_auth = U.wframe(b, "card")
@@ -2028,48 +2117,225 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
 
     # ---------------- 交互
     def _proto_changed(self):
+        """协议切换时决定「哪些行该出现」。
+
+        六种协议不是六套界面，而是同一套表单按需显隐：
+          · 本机：没有档案 / 地址 / 认证；
+          · SSH：地址 + 端口 + 用户 + 认证 + 提权；
+          · Telnet / COM：地址（COM 换成串口参数）+ 用户 + 登录密码 + enable；
+          · ADB / HDC：地址可空（USB）+ 组件来源 + 设备序列号，没有账号密码。
+        """
         proto = self.v_proto.get()
-        if proto == "local":
-            # 本机不需要 IP / 端口 / 用户 / 私钥，那些是给远程设备准备的；
-            # 档案行也一并收起来 —— 本机没有「设备档案」这个概念。
-            self.v_port.set("")
-            self.e_host.configure(state="disabled")
+        is_local = proto == "local"
+        is_com = proto == "com"
+        is_dbg = proto in hosts_core.DEBUG_PROTO
+
+        # ---- 档案行
+        if is_local:
             self.row_prof.pack_forget()
-            self.row_addr.pack_forget()
-            self.row_auth.pack_forget()
+        elif not self.row_prof.winfo_manager():
+            self.row_prof.pack(fill="x", pady=(10, 0), before=self.row_elev)
+
+        # ---- 目标系统：本机与调试桥都不需要（它们的系统是确定的）
+        if is_local or is_dbg:
             try:
                 self.row_ostype.pack_forget()
             except (AttributeError, tk.TclError):
                 pass
         else:
-            if not self.row_prof.winfo_manager():
-                self.row_prof.pack(fill="x", pady=(10, 0), before=self.row_elev)
-            if not self.row_addr.winfo_manager():
-                self.row_addr.pack(fill="x", pady=(9, 0), before=self.row_elev)
             try:
                 if not self.row_ostype.winfo_manager():
                     self.row_ostype.pack(fill="x", pady=(8, 0),
                                          before=self.row_prof)
             except (AttributeError, tk.TclError):
                 pass
-            self.e_host.configure(state="normal")
-            if proto == "telnet":
-                self.v_port.set("23")
-                self.row_auth.pack_forget()
-            else:
-                if self.v_port.get() in ("", "23"):
-                    self.v_port.set("22")
-                if not self.row_auth.winfo_manager():
-                    self.row_auth.pack(fill="x", pady=(9, 0),
-                                       before=self.row_elev)
-                self._mode_changed()
-        # 本机 Windows 没有要输的口令，这行提示留着只会让人以为还有东西没填
-        local_win = proto == "local" and sys.platform == "win32"
-        if local_win:
+
+        # ---- 地址行：COM 只留「用户」，USB 调试只留「地址 / 端口」
+        if is_local:
+            self.row_addr.pack_forget()
+        else:
+            if not self.row_addr.winfo_manager():
+                self.row_addr.pack(fill="x", pady=(9, 0), before=self.row_elev)
+            show_addr = not is_com
+            for w in (self.lbl_addr, self.e_host, self.lbl_port, self.e_port):
+                if show_addr:
+                    w.grid()
+                else:
+                    w.grid_remove()
+            for w in (self.lbl_user, self.e_user):
+                if is_dbg:
+                    w.grid_remove()
+                else:
+                    w.grid()
+            self.e_host.configure(state="disabled" if is_com else "normal")
+            if not is_com:
+                # 端口默认值只在「明显是上一个协议的默认」时才改，
+                # 用户自己填过的端口不许被悄悄覆盖。
+                cur = self.v_port.get().strip()
+                want = {"telnet": "23", "ssh": "22", "adb": "5555",
+                        "hdc": "8710"}.get(proto)
+                if want and cur in ("", "22", "23", "5555", "8710") and cur != want:
+                    self.v_port.set(want)
+
+        # ---- COM 参数行
+        if is_com:
+            if not self.row_com.winfo_manager():
+                self.row_com.pack(fill="x", pady=(9, 0), before=self.row_elev)
+            try:
+                ports = serial_core.list_ports()
+                self.lbl_com_hint.configure(
+                    text=("已检测到串口：" + "、".join(ports)) if ports
+                    else "没有检测到串口（设备没插也可以手填，例如 COM3）")
+            except (AttributeError, tk.TclError):
+                pass
+        else:
+            self.row_com.pack_forget()
+
+        # ---- ADB / HDC 参数行
+        if is_dbg:
+            if not self.row_dbg.winfo_manager():
+                self.row_dbg.pack(fill="x", pady=(9, 0), before=self.row_elev)
+            self._dbg_refresh_hint()
+        else:
+            self.row_dbg.pack_forget()
+
+        # ---- 认证行：只有 SSH 有「私钥 / 登录密码」二选一
+        if proto == "ssh":
+            if not self.row_auth.winfo_manager():
+                self.row_auth.pack(fill="x", pady=(9, 0), before=self.row_elev)
+            self._mode_changed()
+        else:
+            self.row_auth.pack_forget()
+
+        # ---- 凭证提示：本机 Windows / 调试桥没有要输的口令
+        if (is_local and sys.platform == "win32") or is_dbg:
             self.row_cred.pack_forget()
         elif not self.row_cred.winfo_manager():
             self.row_cred.pack(fill="x", pady=(9, 0))
         self._rebuild_elevation()
+
+    # ---------------- 新连接方式的辅助交互
+    def _tool_src_value(self) -> str:
+        """下拉框的中文标签 → 存储值（auto / env / bundled）。"""
+        try:
+            label = self.cb_tool_src.get()
+        except (AttributeError, tk.TclError):
+            return "auto"
+        return (getattr(self, "_tool_src_key", {}) or {}).get(label, "auto")
+
+    def _tool_src_pick(self, _e=None) -> None:
+        self._dbg_refresh_hint()
+
+    def _dbg_refresh_hint(self) -> None:
+        """只做「找得到吗 / 用的哪一份」，**不跑版本命令**。
+
+        版本要起子进程（`adb version` 首次还会拉起 server），放在切协议的
+        回调里会让界面卡一下；设置页有专门的「重新检测」按钮干这件事。
+        """
+        lbl = getattr(self, "lbl_dbg_hint", None)
+        if lbl is None:
+            return
+        bus = self.v_proto.get()
+        if bus not in hosts_core.DEBUG_PROTO:
+            return
+        try:
+            info = devtools.resolve_tool(bus, self._tool_src_value())
+            if info.get("exists"):
+                where = "环境变量" if info.get("src_used") == "env" else "内置 bin"
+                lbl.configure(text=f"{where}：{info['path']}",
+                              fg=U.T.text_dim)
+            else:
+                lbl.configure(text=info.get("error", "没找到组件").splitlines()[0],
+                              fg=U.T.warn)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _com_scan(self) -> None:
+        """扫描串口：把检测结果做成一个可选列表（同时刷新提示）。"""
+        ports = serial_core.list_ports()
+        if not ports:
+            messagebox.showinfo(
+                "没有检测到串口",
+                "系统里没有已注册的串口。\n\n"
+                "· USB 转 console 线要先装驱动（CH340 / CP210x / FTDI）；\n"
+                "· 也可以直接手填串口名，例如 COM3。",
+                parent=self)
+            return
+        labels = serial_core.port_labels()
+        opts = [(p, f"{p}  {labels.get(p, '')}".strip()) for p in ports]
+        data = forms.FormDialog.open(
+            self, "选择串口",
+            [{"key": "port", "label": "串口", "kind": "select",
+              "options": opts, "default": opts[0][0]}],
+            subtitle="插拔线后重新点一次「扫描串口」即可刷新")
+        if data and data.get("port"):
+            self.v_com_port.set(str(data["port"]))
+            self._proto_changed()
+
+    def _dbg_scan(self) -> None:
+        """扫描 ADB / HDC 设备：选一台填进「设备序列号」。"""
+        bus = self.v_proto.get()
+        if bus not in hosts_core.DEBUG_PROTO:
+            self.toast("先选 ADB 或 HDC 协议", "warn")
+            return
+        src = self._tool_src_value()
+        self.status.set_state("正在扫描设备…")
+        label = devtools.BUS[bus]["label"]
+
+        def work():
+            # 先体检：组件缺失 / 端口被占，在这里就说清楚，
+            # 而不是让 `list devices` 吐一串 adb 的英文错误。
+            pf = devtools.preflight(bus, src)
+            if not pf["tool"]["exists"]:
+                return {"error": pf["tool"]["error"]}
+            if pf["conflict"]:
+                return {"conflict": pf}
+            return {"rows": devtools.list_devices(bus, src)}
+
+        def ok(res):
+            if res.get("error"):
+                self.btn_connect.set_enabled(True)
+                messagebox.showerror(f"缺少 {label} 组件", res["error"], parent=self)
+                self.status.set_state("缺少调试组件", "err")
+                return
+            if res.get("conflict"):
+                act = self._ask_port_conflict(bus, res["conflict"])
+                if act == "kill":
+                    okk, msg = devtools.kill_pid(res["conflict"]["owner"]["pid"])
+                    self._log_raw("warn" if okk else "bad",
+                                  f"[{label}] 结束占用进程：{msg}\n")
+                    if okk:
+                        self.after(300, self._dbg_scan)
+                self.status.set_state("已取消扫描", "warn")
+                return
+            rows = res.get("rows") or []
+            if not rows:
+                self.status.set_state("没有发现设备", "warn")
+                messagebox.showinfo(
+                    "没有发现设备",
+                    f"{label} 没列出任何设备。\n\n"
+                    "· USB：确认数据线、开发者选项、USB 调试已打开；\n"
+                    "· 首次连接要在设备上点「允许 USB 调试」；\n"
+                    f"· 远程：先在「地址」填 IP:端口再连接。",
+                    parent=self)
+                return
+            opts = [(str(r["serial"]),
+                     f"{r['serial']}  {r.get('model') or r.get('state') or ''}".strip())
+                    for r in rows]
+            data = forms.FormDialog.open(
+                self, f"选择 {label} 设备",
+                [{"key": "serial", "label": "设备", "kind": "select",
+                  "options": opts, "default": opts[0][0]}],
+                subtitle=f"当前 {len(rows)} 台；选中的序列号会填进「设备序列号」")
+            if data and data.get("serial"):
+                self.v_device.set(str(data["serial"]))
+            self.status.set_state(f"扫描到 {len(rows)} 台设备", "ok")
+
+        def err(msg):
+            self.status.set_state(f"扫描失败：{msg}", "err")
+            messagebox.showerror("扫描失败", msg, parent=self)
+
+        self.bg(work, ok=ok, err=err)
 
     def _mode_changed(self):
         """选私钥就只露私钥相关两行，选登录密码就只露密码一行。
@@ -2213,6 +2479,21 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                      "都要整个程序以管理员身份运行。没勾选时遇到这类操作会提示你。",
                      "dim", U.FONT_XS, justify="left").pack(
                 anchor="w", pady=(6, 0))
+            self._refresh_cred_hint()
+            return
+
+        if proto in hosts_core.DEBUG_PROTO:
+            # 调试桥上没有 sudo / enable：adb shell 是设备给的受限 shell，
+            # 摆一个密码框只会让人以为填了就能改系统分区。
+            row = U.wframe(holder, "card")
+            row.pack(fill="x")
+            U.wlabel(row, "ADB / HDC 没有 sudo / enable 这一层", "card",
+                     U.FONT_S).pack(side="left")
+            U.wlabel(holder,
+                     "命令以设备给的 shell 用户执行（通常是 uid 2000）。"
+                     "能不能改系统目录取决于设备本身是否已 root / 已开调试授权，"
+                     "本程序不会去改设备权限。",
+                     "dim", U.FONT_XS, justify="left").pack(anchor="w", pady=(6, 0))
             self._refresh_cred_hint()
             return
 
@@ -2442,16 +2723,27 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
 
     # ---------------- 档案
     def _collect_profile(self) -> dict:
+        proto = self.v_proto.get()
         p = {
             "name": self.v_prof.get().strip(),
             "host": self.v_host.get().strip(),
-            "port": self.v_port.get().strip() or "22",
+            "port": self.v_port.get().strip() or (
+                "8710" if proto == "hdc" else ("5555" if proto == "adb" else "22")),
             "user": self.v_user.get().strip(),
             "auth": self.v_mode.get(),
             "key_path": norm_path(self.v_key.get()),
             "remember": bool(self.v_remember.get()),
-            "proto": self.v_proto.get(),
+            "proto": proto,
             "ostype": str(self.v_ostype.get() or ""),
+            # ---- COM / ADB / HDC（v1.0.33）
+            "com_port": self.v_com_port.get().strip(),
+            "baud": self.v_baud.get().strip(),
+            "databits": self.v_databits.get().strip(),
+            "parity": self.v_parity.get().strip(),
+            "stopbits": self.v_stopbits.get().strip(),
+            "flow": self.v_flow.get().strip(),
+            "device_id": self.v_device.get().strip(),
+            "tool_src": self._tool_src_value() if proto in hosts_core.DEBUG_PROTO else "",
         }
         # 提权那两个开关按**目标系统**存：Linux 有 sudo、交换机有 enable、
         # Windows 两者都没有（它要的是 UAC）。不这么分的话，一条远程档案
@@ -2496,6 +2788,28 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.v_elevate.set(bool(p.get("sudo") or p.get("sudo_password")))
         self.v_admin.set(bool(p.get("elevate")))
         self.v_shell.set(str(p.get("shell") or ""))
+        # 新增连接方式（v1.0.33）
+        self.v_com_port.set(str(p.get("com_port") or "COM1"))
+        self.v_baud.set(str(p.get("baud") or "115200"))
+        self.v_databits.set(str(p.get("databits") or "8"))
+        self.v_parity.set(str(p.get("parity") or "none"))
+        self.v_stopbits.set(str(p.get("stopbits") or "1"))
+        self.v_flow.set(str(p.get("flow") or "none"))
+        self.v_device.set(str(p.get("device_id") or ""))
+        src = str(p.get("tool_src") or "")
+        if not src:
+            # 档案里没写就跟随设置中心的默认值（用户可全局切「内置组件」）
+            try:
+                src = str(self.settings.data.get("debug_src") or "auto")
+            except Exception:  # noqa: BLE001
+                src = "auto"
+        self.v_tool_src.set(devtools.norm_src(src))
+        try:
+            self.cb_tool_src.set(
+                dict((v, l) for v, l in getattr(self, "_tool_src_ui", [])).get(
+                    self.v_tool_src.get(), ""))
+        except (AttributeError, tk.TclError):
+            pass
         # 档案里真存了哪几项，就把对应开关打开，界面上如实反映
         self.v_save_keypw.set(bool(p.get("key_passphrase")))
         self.v_save_pw.set(bool(p.get("password")))
@@ -2666,6 +2980,121 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.status.set_state("正在连接…")
         self.do_connect(keypw_try=tries + 1)
 
+    # ---------------- ADB / HDC 连接前的体检
+    def _ask_port_conflict(self, bus: str, pf: dict) -> str:
+        """端口被别的软件占住 → 让用户自己选。返回 kill / retry / cancel。
+
+        这里**必须**把「杀了会断什么」写在选项上方，而不是塞进一句提醒：
+        用户唯一能用来决策的信息就是这个。
+        """
+        owner = (pf or {}).get("owner") or {}
+        text = devtools.conflict_text(bus, owner)
+        label = devtools.BUS.get(bus, {}).get("label", bus)
+        data = forms.FormDialog.open(
+            self, f"{label} 端口被占用",
+            [{"key": "act", "label": "怎么处理", "kind": "select",
+              "options": [
+                  ("kill", "由本程序结束占用进程（会断开上面列出的工具）"),
+                  ("retry", "我自己去关掉它，然后重试连接"),
+                  ("cancel", "取消这次连接"),
+              ],
+              "default": "kill"}],
+            subtitle=text, submit="继续", width=640)
+        if not data:
+            return "cancel"
+        return str(data.get("act") or "cancel")
+
+    def _dbg_gate(self, proto: str) -> None:
+        """连接 ADB / HDC 之前的三个问题：组件在哪、端口归谁、服务能不能起。
+
+        全部通过后把 `_dbg_ready` 置真并重新进 `do_connect()` —— 这样
+        「连接」按钮只走一条主路径，预检不通过时用户看到的是解释，
+        而不是 adb 的英文原文。
+        """
+        label = devtools.BUS.get(proto, {}).get("label", proto)
+        src = self._tool_src_value()
+        try:
+            port = int((self.v_port.get() or "").strip()
+                       or devtools.BUS[proto]["port"])
+        except ValueError:
+            port = devtools.BUS[proto]["port"]
+        self.btn_connect.set_enabled(False)
+        self.status.set_state(f"正在检查 {label} 组件与端口…")
+
+        def work():
+            return devtools.preflight(proto, src, port)
+
+        def ok(pf):
+            if not pf.get("tool", {}).get("exists"):
+                self.btn_connect.set_enabled(True)
+                self.status.set_state(f"缺少 {label} 组件", "err")
+                self._log_raw("bad", f"[{label}] {pf['tool'].get('error', '')}\n")
+                messagebox.showerror(f"缺少 {label} 组件",
+                                     pf["tool"].get("error", "没找到组件"),
+                                     parent=self)
+                return
+            if pf.get("conflict"):
+                owner = pf.get("owner") or {}
+                self._log_raw("warn",
+                              f"[{label}] 端口 {pf.get('port')} 被 "
+                              f"{owner.get('name') or '未知进程'}"
+                              f"(PID {owner.get('pid')}) 占用\n")
+                act = self._ask_port_conflict(proto, pf)
+                if act == "kill":
+                    okk, msg = devtools.kill_pid(owner.get("pid"))
+                    self._log_raw("warn" if okk else "bad",
+                                  f"[{label}] 结束占用进程：{msg}\n")
+                    if not okk:
+                        self.btn_connect.set_enabled(True)
+                        self.status.set_state("结束占用进程失败", "err")
+                        messagebox.showerror(
+                            "没能结束占用进程",
+                            f"{msg}\n\n可以自己关掉 "
+                            f"{owner.get('name') or '那个程序'} 后再点连接。",
+                            parent=self)
+                        return
+                    # 别的软件可能立刻把服务抢回去，所以**重新体检**一遍，
+                    # 而不是拿到 kill 成功就闷头去连。
+                    self.after(400, self.do_connect)
+                    return
+                if act == "retry":
+                    self.after(200, self.do_connect)
+                    return
+                self.btn_connect.set_enabled(True)
+                self.status.set_state("已取消连接", "warn")
+                return
+
+            self.status.set_state(f"正在启动 {label} 服务…")
+
+            def w2():
+                return devtools.ensure_server(proto, src)
+
+            def ok2(res):
+                okk, text = res
+                if not okk:
+                    self.btn_connect.set_enabled(True)
+                    self.status.set_state(f"{label} 服务起不来", "err")
+                    self._log_raw("bad", f"[{label}] {text}\n")
+                    messagebox.showerror(f"{label} 服务起不来", text, parent=self)
+                    return
+                self._log_raw("ok", f"[{label}] 服务已就绪（{src}）\n")
+                self._dbg_ready = True
+                self.status.set_state(f"{label} 服务已就绪，正在连接…")
+                self.do_connect()
+
+            def err2(msg):
+                self.btn_connect.set_enabled(True)
+                self.status.set_state(f"{label} 服务起不来：{msg}", "err")
+                messagebox.showerror(f"{label} 服务起不来", str(msg), parent=self)
+
+            self.bg(w2, ok=ok2, err=err2)
+
+        def err(msg):
+            self.btn_connect.set_enabled(True)
+            self.status.set_state(f"体检失败：{msg}", "err")
+
+        self.bg(work, ok=ok, err=err)
+
     def do_connect(self, keypw_try: int = 0):
         """连接（以及连接后的探测 / 提权）。
 
@@ -2673,6 +3102,15 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         了几次，满 2 次就停手并让用户去核对，别把私钥认证失败刷成封 IP。
         """
         proto = self.v_proto.get()
+        # ADB / HDC 先过一道「组件在不在 + 端口有没有被别的软件占住」的体检。
+        # 这一步必须发生在打开会话之前：端口被占时 open_session 只会得到一句
+        # adb 的英文报错，用户既不知道是谁占的，也不知道点哪里能修。
+        if proto in hosts_core.DEBUG_PROTO \
+                and not getattr(self, "_dbg_ready", False):
+            self._dbg_gate(proto)
+            return
+        self._dbg_ready = False
+
         self.btn_connect.set_enabled(False)
         self.status.set_state("正在连接…")
 
@@ -2692,10 +3130,36 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             self._elevate_now(then=self.do_connect)
             return
 
+        # 端口 / 串口参数先归一：档案是能手改的，界面上也可能是旧值，
+        # 直接 `int()` 会在点击连接时抛 ValueError，用户只看到一句 traceback。
+        port = 0
+        serial_prm = serial_core.norm_params()      # 只是拿一份默认值
+        if not is_local and proto != "com":
+            raw_port = (self.v_port.get() or "").strip()
+            default_port = {"telnet": 23, "adb": 5555, "hdc": 8710}.get(proto, 22)
+            try:
+                port = int(raw_port or default_port)
+            except ValueError:
+                self.btn_connect.set_enabled(True)
+                return messagebox.showwarning(
+                    "端口不对", f"端口必须是数字，现在是「{raw_port}」", parent=self)
+        if proto == "com":
+            try:
+                serial_prm = serial_core.norm_params(
+                    self.v_baud.get(), self.v_databits.get(),
+                    self.v_parity.get(), self.v_stopbits.get(), self.v_flow.get())
+            except serial_core.SerialError as e:
+                self.btn_connect.set_enabled(True)
+                return messagebox.showwarning("串口参数不对", str(e), parent=self)
+            if not serial_core.norm_port(self.v_com_port.get()):
+                self.btn_connect.set_enabled(True)
+                return messagebox.showwarning(
+                    "缺少参数", "请填串口名（例如 COM3），或点「扫描串口」选一个。",
+                    parent=self)
+
         spec = ConnSpec(proto=proto,
-                        host="" if is_local else self.v_host.get().strip(),
-                        port=0 if is_local else int(
-                            self.v_port.get() or (23 if proto == "telnet" else 22)),
+                        host="" if is_local or proto == "com" else self.v_host.get().strip(),
+                        port=port,
                         user=self.v_user.get().strip(),
                         auth=self.v_mode.get(),
                         key_path=norm_path(self.v_key.get()),
@@ -2708,7 +3172,15 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                         # 以前只在 elevate 时才传，于是「密码填了、框没勾」的用户
                         # 一点 Docker 就报「无权访问 / 未安装」，白填一次密码。
                         sudo_password=self.v_sudopw.get().strip(),
-                        elevate=elevate)
+                        elevate=elevate,
+                        # ---- COM（console）
+                        com_port=serial_core.norm_port(self.v_com_port.get()),
+                        baud=serial_prm["baud"], databits=serial_prm["databits"],
+                        parity=serial_prm["parity"],
+                        stopbits=serial_prm["stopbits"], flow=serial_prm["flow"],
+                        # ---- ADB / HDC
+                        device_id=self.v_device.get().strip(),
+                        tool_src=self._tool_src_value())
 
         if proto == "ssh":
             if spec.auth == "key":
@@ -2748,6 +3220,21 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             # 先探测出「对方到底是什么」，再决定提权怎么提：
             # 交换机 / 路由器是 enable，Linux / Unix 是 sudo —— 同一个密码框。
             dev = detect(s)
+            # ADB / HDC 的 uname 只能告诉我们是 Linux，真正有用的是「什么手机 /
+            # 什么鸿蒙版本」。这里再问一次设备自己（getprop / param get），
+            # 失败就保留 detect 的结果 —— 不能因为读不到型号就连接失败。
+            if spec.proto in hosts_core.DEBUG_PROTO:
+                try:
+                    extra = s.probe_info()
+                    model = str(extra.get("model") or "").strip()
+                    ver = str(extra.get("version") or "").strip()
+                    dev.os_name = " · ".join(x for x in (ver, model) if x) or \
+                        ("Android" if spec.proto == "adb" else "HarmonyOS")
+                    dev.device_type = "phone"
+                    dev.hostname = model or getattr(s, "serial", "") or dev.hostname
+                    dev.is_root = False
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 s.bind_device(dev)
             except Exception:  # noqa: BLE001
@@ -3478,6 +3965,11 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         fallback = "C:\\" if win else "/"
         if s is None:
             return fallback
+        # console（交换机 / 防火墙）与调试桥（Android / 鸿蒙）没有「当前目录」，
+        # 跑 `pwd` 只会得到一句 CLI 错误，还会拖慢提示符刷新。
+        if getattr(s, "host_kind", "") == "network" \
+                or str(getattr(s, "kind", "")) in ("com", "adb", "hdc"):
+            return fallback
         try:
             rc, out, err = s.run("pwd", timeout=8)
             lines = [x.strip() for x in (out or "").splitlines() if x.strip()]
@@ -3503,6 +3995,13 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         win = self._sid_family(sid) == "windows"
         if s.kind == "local":
             return f"{cwd}> " if win else f"{cwd}$ "
+        if s.kind == "com":
+            # console 没有「用户@主机」这层概念，设备提示符由设备自己回显；
+            # 这里用串口名当提示，至少能一眼看出命令发到哪根线上。
+            return f"{getattr(s, 'host', '') or 'console'}> "
+        if s.kind in ("adb", "hdc"):
+            serial = str(getattr(s, "serial", "") or "device")
+            return f"{serial}$ "
         user = getattr(s, "user", "") or "user"
         host = getattr(s, "host", "") or self._sid_device(sid).hostname or "host"
         rooted = bool(getattr(s, "is_root", False)) or \
@@ -3544,7 +4043,12 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             return
         cwd = self.term_cwd(sid)
         win = self._sid_family(sid) == "windows"
-        if win:
+        # 网络设备 / console / 调试桥没有 shell 的 `cd` 语义：
+        # 拼上去只会让每条命令都先报一句错（交换机直接回 % Invalid input）。
+        if getattr(s, "host_kind", "") == "network" \
+                or str(getattr(s, "kind", "")) in ("com", "adb", "hdc"):
+            full = cmd
+        elif win:
             full = f"Set-Location -LiteralPath '{cwd}' -ErrorAction SilentlyContinue; {cmd}"
         else:
             full = f"cd -- {shlex.quote(cwd)} 2>/dev/null; {cmd}"
@@ -4327,8 +4831,8 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             dlg.focus_set()
         dlg.grab_set()
 
-def _emit_version() -> bool:
-    """把版本号写到 stdout，写成功返回 True。
+def _emit_console(text: str) -> bool:
+    """把一段文本写到 stdout，写成功返回 True。
 
     windowed 的 onefile exe（PyInstaller `console=False`）在**既没有控制台、也没有
     重定向**时 `sys.stdout` 是 None —— 直接 print 会 AttributeError，被吞掉之后
@@ -4347,11 +4851,50 @@ def _emit_version() -> bool:
     if out is None:
         return False
     try:
-        out.write(f"{APP_NAME} v{APP_VER}\n")
+        out.write(text)
         out.flush()
         return True
     except (OSError, ValueError, AttributeError):
         return False
+
+
+def _emit_version() -> bool:
+    return _emit_console(f"{APP_NAME} v{APP_VER}\n")
+
+
+def _tools_report() -> str:
+    """`--check-tools` 的输出：ADB / HDC 到底用的是哪一份、端口归谁。
+
+    为什么要有：用户报「ADB 连不上」时，第一件要确认的事就是
+    「你用的是 PATH 里那份旧的，还是程序 bin 里那份」。让他在命令行跑一下
+    就能把答案贴回来，比来回猜十轮快。
+    """
+    from core import devtools
+    lines = [f"{APP_NAME} v{APP_VER}",
+             f"应用目录：{devtools.app_dir()}",
+             f"内置 bin ：{devtools.bin_dir()}",
+             ""]
+    for bus in ("adb", "hdc"):
+        label = devtools.BUS[bus]["label"]
+        port = devtools.BUS[bus]["port"]
+        info = devtools.resolve_tool(bus, "auto")
+        if info.get("exists"):
+            ver = devtools.tool_version(bus, "auto") or "版本未知"
+            where = "环境变量" if info.get("src_used") == "env" else "内置 bin"
+            lines.append(f"{label}: {info['path']}  ({where})")
+            lines.append(f"      {ver}")
+        else:
+            lines.append(f"{label}: 未找到")
+            for ln in str(info.get("error") or "").splitlines():
+                lines.append(f"      {ln}")
+        owner = devtools.port_owner(port)
+        if owner:
+            lines.append(f"      端口 {port}: {owner.get('name') or '未知进程'}"
+                         f"（PID {owner.get('pid')}） {owner.get('path') or ''}")
+        else:
+            lines.append(f"      端口 {port}: 空闲")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def main():
@@ -4383,6 +4926,17 @@ def main():
                 pass
         return
 
+    # `--check-tools`：打印 ADB / HDC 的解析结果与端口占用，只读、不建 Tk。
+    # 排障时让用户跑一下把输出贴回来，能省掉「你 PATH 里是不是有个旧 adb」的猜谜。
+    if "--check-tools" in sys.argv:
+        report = _tools_report()
+        if not _emit_console(report + "\n"):
+            try:
+                messagebox.showinfo("调试组件检查", report)
+            except tk.TclError:
+                pass
+        return
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # 隧道控制台已经内嵌在「隧道服务管理」页里，不再有 --vpncert 子进程形态。
@@ -4396,7 +4950,7 @@ def main():
     # 现在只让 `--smoke` / `--version`（根本不出窗口的那种）跳过，
     # 其余情况一律走单实例；测试脚本改用 `--instance-key <名字>` 换命名空间，
     # 例如 `--instance-key exe`，各测各的，谁也不挡谁。
-    _NO_SINGLETON = ("--smoke", "--version", "--elev-serve")
+    _NO_SINGLETON = ("--smoke", "--version", "--check-tools", "--elev-serve")
     if not any(a in sys.argv for a in _NO_SINGLETON):
         key = singleinstance.key_from_argv(sys.argv)
         # 「把已有那个窗口叫到前台」这条兜底是按**窗口标题**找的，不认命名空间。

@@ -44,7 +44,8 @@ DEFAULT_ACCENT = "经典蓝"
 
 THEMES = [("light", "浅色"), ("dark", "深色"), ("system", "跟随系统")]
 
-SECTIONS = [("look", "外观"), ("work", "工作区"), ("agent", "智能运维助手"),
+SECTIONS = [("look", "外观"), ("work", "工作区"), ("debug", "设备调试"),
+            ("agent", "智能运维助手"),
             ("safe", "安全"), ("backup", "备份"), ("about", "关于")]
 
 
@@ -411,6 +412,7 @@ class _SettingsShell:
         box = scroll.inner
         builder = {
             "look": self._sec_look, "work": self._sec_work,
+            "debug": self._sec_debug,
             "agent": self._sec_agent, "safe": self._sec_safe,
             "backup": self._sec_backup, "about": self._sec_about,
         }.get(key)
@@ -533,6 +535,109 @@ class _SettingsShell:
         names = "、".join((s.label or s.sid) for s in app.sessions) or "（还没有）"
         U.wlabel(c2.body, f"当前 {n} 台：{names}", "dim", U.FONT_S,
                  justify="left", wraplength=U.px(620)).pack(anchor="w")
+
+    # ================================================================ 设备调试
+    def _set_debug_src(self, key: str) -> None:
+        app = self.app
+        app.settings.data["debug_src"] = key
+        try:
+            app.settings.save()
+        except OSError as e:
+            app.toast(f"保存失败：{e}", "err")
+            return
+        app.toast("已切换调试组件来源", "ok")
+        self.show("debug")
+
+    def _sec_debug(self, box) -> None:
+        """ADB / HDC 用哪一份 + 现在找不找得到 + 端口被谁占。"""
+        from core import devtools
+
+        app = self.app
+        cur = devtools.norm_src(app.settings.data.get("debug_src") or "auto")
+
+        card = U.Card(box, title="调试组件来源",
+                      hint="ADB（安卓）/ HDC（鸿蒙）使用哪一份可执行文件")
+        card.pack(fill="x")
+        row = U.wframe(card.body, "card")
+        row.pack(fill="x")
+        seg = Segmented(row, [("auto", "自动"), ("env", "环境变量"),
+                              ("bundled", "内置 bin")],
+                        command=self._set_debug_src)
+        seg.pack(side="left")
+        try:
+            seg.select(cur, fire=False)
+        except Exception:  # noqa: BLE001
+            pass
+        U.wlabel(card.body,
+                 "「自动」= 先找环境变量（PATH），找不到再用应用目录里的 bin 文件夹。\n"
+                 f"内置组件目录：{devtools.bin_dir()}",
+                 "mute", U.FONT_XS, justify="left",
+                 wraplength=U.px(620)).pack(anchor="w", pady=(U.px(8), 0))
+
+        c2 = U.Card(box, title="组件检测",
+                    hint="本机现在实际会用到的文件与版本")
+        c2.pack(fill="x", pady=(U.px(12), 0))
+
+        for bus in ("adb", "hdc"):
+            label = devtools.BUS[bus]["label"]
+            port = devtools.BUS[bus]["port"]
+            info = devtools.resolve_tool(bus, cur)
+            ver = devtools.tool_version(bus, cur) if info.get("exists") else ""
+            owner = devtools.port_owner(port) if info.get("exists") else None
+            same = bool(owner and info.get("path")
+                        and devtools._same_path(owner.get("path", ""),
+                                                info["path"]))
+            line = tk.Frame(c2.body, bg=U.T.card)
+            line.pack(fill="x", pady=U.px(4))
+            tk.Label(line, text=label, bg=U.T.card, fg=U.T.text,
+                     font=U.FONT_S, width=5, anchor="w", bd=0).pack(side="left")
+            if info.get("exists"):
+                src_name = "环境变量" if info.get("src_used") == "env" else "内置 bin"
+                txt = (f"{info['path']}\n{ver or '版本未知'} · {src_name}")
+                fg = U.T.text_dim
+            else:
+                txt = info.get("error", "没找到组件")
+                fg = U.T.warn
+            tk.Label(line, text=txt, bg=U.T.card, fg=fg, font=U.FONT_XS,
+                     justify="left", anchor="w", bd=0,
+                     wraplength=U.px(430)).pack(side="left", fill="x", expand=True)
+            if owner and not same:
+                B = U.RoundButton(
+                    line, "结束占用进程", variant="secondary", font=U.FONT_XS,
+                    height=26, padx=10,
+                    command=lambda b=bus, o=owner: self._kill_owner(b, o))
+                B.pack(side="right")
+
+            if owner:
+                who = owner.get("name") or "未知进程"
+                pid = owner.get("pid") or "?"
+                extra = ("（就是当前要用的这份，可以复用，不用处理）" if same else
+                         f" · 端口 {port} 被 {who}（PID {pid}）占用")
+                U.wlabel(c2.body, extra, "mute" if same else "warn", U.FONT_XS,
+                         justify="left", wraplength=U.px(600)).pack(
+                    anchor="w", padx=(U.px(42), 0))
+
+        bar = U.wframe(c2.body, "card")
+        bar.pack(fill="x", pady=(U.px(10), 0))
+        U.RoundButton(bar, "↻ 重新检测", command=lambda: self.show("debug"),
+                      variant="secondary", font=U.FONT_XS, height=27,
+                      padx=12).pack(side="left")
+        U.wlabel(c2.body,
+                 "端口被别的软件占用时，点「结束占用进程」会先弹出「会断哪些工具」，"
+                 "确认后才动手；也可以自己去关掉那个软件再回来检测。",
+                 "mute", U.FONT_XS, justify="left",
+                 wraplength=U.px(620)).pack(anchor="w", pady=(U.px(8), 0))
+
+    def _kill_owner(self, bus: str, owner: dict) -> None:
+        from core import devtools
+        app = self.app
+        if not forms.confirm(app, f"结束 {owner.get('name') or '占用进程'}？",
+                             devtools.conflict_text(bus, owner), danger=True,
+                             ok_text="结束它"):
+            return
+        ok, msg = devtools.kill_pid(owner.get("pid"))
+        app.toast(msg, "ok" if ok else "err")
+        self.show("debug")
 
     # ================================================================ 助手
     def _sec_agent(self, box) -> None:

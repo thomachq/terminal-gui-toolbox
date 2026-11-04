@@ -1094,7 +1094,7 @@ class TelnetSession(BaseSession):
 # ------------------------------------------------------------------ 工厂
 @dataclass
 class ConnSpec:
-    proto: str = "ssh"          # ssh / telnet / local
+    proto: str = "ssh"          # ssh / telnet / local / com / adb / hdc
     host: str = ""
     port: int = 22
     user: str = ""
@@ -1107,6 +1107,17 @@ class ConnSpec:
     elevate: bool = False
     # 本机 Windows 的执行外壳："" 自动 / "cmd" / "powershell"
     shell: str = ""
+    # ---- COM（console）：串口名 + 线路参数
+    com_port: str = ""
+    baud: int = 115200
+    databits: int = 8
+    parity: str = "none"
+    stopbits: str = "1"
+    flow: str = "none"
+    # ---- ADB / HDC：设备序列号（可空＝自动挑，唯一一台时才允许）+
+    # 组件来源（auto / env / bundled）。host 非空表示走网络调试。
+    device_id: str = ""
+    tool_src: str = "auto"
 
 
 def open_session(spec: ConnSpec) -> BaseSession:
@@ -1129,6 +1140,21 @@ def open_session(spec: ConnSpec) -> BaseSession:
         s = TelnetSession()
         s.connect(spec.host, spec.port or 23,
                   user=spec.user, password=spec.password)
+        return s
+    if spec.proto == "com":
+        from core.console_session import ComSession
+        s = ComSession()
+        s.connect(spec.com_port or spec.host,
+                  baud=spec.baud, databits=spec.databits, parity=spec.parity,
+                  stopbits=spec.stopbits, flow=spec.flow,
+                  user=spec.user, password=spec.password)
+        return s
+    if spec.proto in ("adb", "hdc"):
+        from core.debug_session import AdbSession, HdcSession
+        s = AdbSession() if spec.proto == "adb" else HdcSession()
+        s.connect(spec.device_id, host=spec.host,
+                  port=(spec.port or (5555 if spec.proto == "adb" else 8710)),
+                  tool_src=spec.tool_src)
         return s
     s = SSHSession()
     s.connect(spec.host, spec.port or 22, spec.user,

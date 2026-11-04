@@ -49,9 +49,11 @@ JUNK_PREFIX = ("dbg", "err.txt", "out.txt", "build_log", "_TODO")
 JUNK_NAMES = {"query", "out.txt", "err.txt", "nul", "con",
               "desktop.ini", "thumbs.db"}
 
-# 被 .gitignore 挡住、但工具包确实要带的东西。只有 exe：它是零安装交付件，
-# 而仓库不允许跟踪二进制。其余一律以 git 清单为准。
-KEEP_IGNORED = ("*.exe",)
+# 被 .gitignore 挡住、但工具包确实要带的东西：exe 是零安装交付件，
+# bin/ 里的 adb、hdc 及其依赖 dll 是 ADB / HDC 连接的内置组件。
+# 仓库仍然不跟踪二进制（源码快照里只有 bin/README.md），
+# 但工具包 / portable 必须开箱可用，所以这里显式放行。
+KEEP_IGNORED = ("*.exe", "bin/*.dll", "bin/NOTICE-*")
 
 
 def skip(rel: Path, keep_git: bool = False) -> bool:
@@ -267,6 +269,9 @@ PORTABLE_README = """Terminal GUI Toolbox v{ver} · Windows x64 便携版
 · 口令、私钥、API Key 全部用 AES-GCM 加密后落盘，界面只显示「已设置」。
 · 断网也能用：所有功能只依赖目标主机已有的 SSH/Telnet 与系统命令；
   只有「智能运维助手」需要联网调模型 API（也可指向本机 Ollama / Harness）。
+· ADB / HDC 连接：内置组件在 bin\\ 下（adb.exe / hdc.exe 及其依赖），
+  默认「自动」＝先找系统 PATH，找不到才用 bin\\；也可以在设置中心改成只用内置。
+  COM 口（console）不需要任何外部程序。
 
 版本：v{ver}    (2026-10-23)
 仓库：https://github.com/thomachq/terminal-gui-toolbox
@@ -280,6 +285,15 @@ def make_portable() -> Path:
                  f"Terminal-GUI-Toolbox-{VER}-windows-x64/TerminalToolbox.exe")
         add_file(zf, HERE / "LICENSE",
                  f"Terminal-GUI-Toolbox-{VER}-windows-x64/LICENSE")
+        # 内置调试组件：portable 是「拷到哪都能用」的那个包，bin 必须跟着走，
+        # 否则用户拿到的 ADB / HDC 只能靠系统 PATH，等于少一半功能。
+        bin_src = HERE / "bin"
+        if bin_src.is_dir():
+            for p in sorted(bin_src.iterdir()):
+                if p.is_file() and (p.suffix.lower() in (".exe", ".dll")
+                                    or p.name.upper().startswith("NOTICE")
+                                    or p.name == "README.md"):
+                    add_file(zf, p, f"Terminal-GUI-Toolbox-{VER}-windows-x64/bin/{p.name}")
         # 使用说明单独写一份给最终用户看的（不含构建内容）
         tmp = OUT / f"_portable_README_{VER}.txt"
         tmp.write_text(PORTABLE_README.format(ver=VER), encoding="utf-8")

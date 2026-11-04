@@ -45,6 +45,8 @@ SETTING_KEYS = (
     "accent",           # str：主题配色名
     "close_to_tray",    # bool：关闭窗口时收到托盘
     "log_open",         # bool：启动时展开日志栏
+    # ---- 设备调试（v1.0.33）：adb / hdc 的默认组件来源
+    "debug_src",        # str：auto / env / bundled
 )
 
 

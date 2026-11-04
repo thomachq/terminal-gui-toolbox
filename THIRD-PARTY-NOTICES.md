@@ -20,6 +20,21 @@ paramiko 的间接依赖（bcrypt、PyNaCl、cffi）分别遵循 Apache-2.0 与 
 <https://github.com/paramiko/paramiko> 获取其完整源码并替换实验。
 按 LGPL-2.1 第 6 条，这属于「使用库的作品」，本项目的 MIT 许可不覆盖该库本身。
 
+## 随包分发的调试工具（`bin/`）
+
+这两个不是 Python 库，而是**独立可执行文件**，由程序以子进程方式调用；
+不修改、不链接，许可证与源码见各自上游。
+
+| 组件 | 版本（随包） | 许可证 | 用途 |
+|---|---|---|---|
+| [Android SDK Platform-Tools（adb）](https://developer.android.com/tools/releases/platform-tools) | 37.0.1（adb 1.0.41） | Apache-2.0 | ADB 连接（USB / 网络） |
+| [OpenHarmony hdc](https://gitee.com/openharmony/developtools_hdc) | 3.2.0f | Apache-2.0 | HDC 连接（鸿蒙设备） |
+
+`bin/NOTICE-android-platform-tools.txt` 是 platform-tools 原样附带的 NOTICE。
+仓库**不跟踪**这些二进制（`.gitignore` 已排除）：clone 后跑 `python _fetch_bins.py`
+即可从本机已装的 SDK 补齐；发布用的工具包 / portable 包里则由 `_pack_release.py`
+显式带上，开箱可用。
+
 ## 打包工具
 
 | 组件 | 版本 | 许可证 | 说明 |

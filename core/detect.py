@@ -50,7 +50,13 @@ def _run(session, cmd: str, timeout: int = 12, traced: bool = True) -> str:
 
     默认记日志 —— 用户能在侧边栏看见「探测到底跑了什么」，
     而不是干瞪眼等结果。性能采样那种高频命令才关掉。
+
+    `probe_timeout`：串口（console）上设备不回就是没上电 / 波特率错，
+    等满 12 秒只会让用户以为程序卡死。会话可以给一个更短的上限。
     """
+    cap = getattr(session, "probe_timeout", 0) or 0
+    if cap:
+        timeout = min(int(timeout), int(cap))
     try:
         if traced and hasattr(session, "run_traced"):
             rc, out, err = session.run_traced(cmd, timeout=timeout)

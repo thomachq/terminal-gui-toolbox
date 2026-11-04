@@ -3,9 +3,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg)](requirements.txt)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](#安装与启动)
-[![Tests](https://img.shields.io/badge/self--tests-885%20checks-brightgreen.svg)](#离线自测)
+[![Tests](https://img.shields.io/badge/self--tests-1100%2B%20checks-brightgreen.svg)](#离线自测)
 
-**多协议终端工具箱**：SSH / Telnet / **多台设备同时连着**、实时性能状态栏、SFTP 双栏文件管理、
+**多协议终端工具箱**：SSH / Telnet / **COM 串口（console）** / **ADB** / **HDC** /
+**多台设备同时连着**、实时性能状态栏、SFTP 双栏文件管理、
 路由与端口规则、容器管理、Web 服务与站点、隧道客户端证书、**AI 运维**与本地 API。
 纯 tkinter 实现，单文件 exe，MIT 许可。
 
@@ -38,7 +39,7 @@ MobaXterm 好用但只有 Windows 且不开源；剩下的要么只管 SSH，要
 
 | 页面 | 能做什么 | 值得说的细节 |
 |---|---|---|
-| **连接与设备** | SSH / Telnet / 本机；连接档案；密钥发现与指纹核对 | 选私钥即显示类型、位数、SHA256 指纹，可像 `ssh-keygen -lf` 那样核对；自动探测 DSM / OpenWrt / Linux / Windows / FreeBSD |
+| **连接与设备** | SSH / Telnet / **COM 口（console）** / **ADB（USB 与远程）** / **HDC（鸿蒙）** / 本机；连接档案；密钥发现与指纹核对 | 选私钥即显示类型、位数、SHA256 指纹，可像 `ssh-keygen -lf` 那样核对；自动探测 DSM / OpenWrt / Linux / Windows / FreeBSD；COM 走系统串口 API（免装驱动库），ADB / HDC 可切「环境变量 / 内置 bin」，端口被别的软件占住时列出占用者与「会断哪些工具」再由你决定 |
 | **网络工具** | Ping、路由追踪、DNS、端口监听、连通性测试 | 按方言生成命令，Windows 用 `-n 4` / `tracert -d`，Linux 用 `-c 4` / `traceroute -n` |
 | **系统信息** | CPU、内存、磁盘、启动时间、进程、服务 | 一次命令分段返回（`@@@` 分隔），不做多次 SSH 往返 |
 | **文件管理** | 本地 / 远程双栏浏览、上传下载、队列、进度、取消 | 走 SFTP 自己实现，不依赖外部工具；检测到 WinSCP 可按当前档案一键拉起 |
@@ -46,7 +47,7 @@ MobaXterm 好用但只有 Windows 且不开源；剩下的要么只管 SSH，要
 | **防火墙** | 读规则、开/关端口 | 覆盖 nft、iptables、netsh advfirewall、pf、ipfw；3178 条规则也带横向滚动 |
 | **Docker** | 容器/镜像列表、启停、日志 | 区分「未安装 / 守护进程没起 / 无权限 / 正常」四种状态，不把报错刷满日志 |
 | **Web 服务** | 探测设备上所有 Web 服务（Nginx / Apache / Tomcat / Caddy / Lighttpd / IIS），下拉切换逐个管理，服务器 TLS 证书读取、校验与部署 | 进程、监听端口、配置文件三方对照着认，不靠「猜端口」；部署证书前自动备份，配置检查或重载失败就还原 |
-| **AI 运维** | 说一句话，AI 逐条生成命令、在远端执行、读回输出再决定下一步；可套 8 份内置排查剧本（磁盘/安全/服务/网络/网站 SSL/数据库/日志/文件 FTP） | 命令卡片标风险（只读/会改动/高风险）；三档模式，高风险永远必问；技能只是文本，能自动挑也能自装，脚本永不执行 |
+| **AI 运维** | 说一句话，AI 逐条生成命令、在远端执行、读回输出再决定下一步；可套 8 份内置排查剧本（磁盘/安全/服务/网络/网站 SSL/数据库/日志/文件 FTP）；能操作包括 COM / ADB / HDC 在内的所有连接类型 | 命令卡片标风险（只读/会改动/高风险）；四档模式（自动 / 每步确认 / 只读 / 完全放行），前三档高风险永远必问；技能只是文本，能自动挑也能自装，脚本永不执行 |
 | **隧道客户端证书管理** | 自建 CA（Client Cert CA）、签服务端与设备证书、每个平台一份配置文件、部署到 NAS | 内嵌页面，不是外挂程序；部署前自动备份，命令全可回溯 |
 | **智能体接入** | 本地 HTTP API + 会话池 | 连一次反复下命令，服务端每 25 秒 SSH keepalive，掉线自动重连 |
 
@@ -181,7 +182,23 @@ PyInstaller 的 GPL 带有 bootloader 例外，打包产物不受传染。
 
 ### 1 · 连接与设备
 
-**协议**：SSH / Telnet / 本机。
+**协议**：SSH / Telnet / **COM 口（console）** / **ADB** / **HDC** / 本机。
+
+**三种新连接方式（v1.0.33）**
+
+| 连接方式 | 怎么填 | 说明 |
+|---|---|---|
+| COM 口 | 串口（可点「扫描串口」选）+ 波特率 / 数据位 / 校验 / 停止位 / 流控 + 可选 console 用户名与密码 | 直连交换机、防火墙、安全设备的 console 口；`enable` 提权与 Telnet 完全同一套（分页自动翻、提示符自动认）。串口读写用系统 API 实现，**不需要装 pyserial 或任何驱动库** |
+| ADB | 地址留空 = USB 直连；填 `IP` + 端口（常见 5555）= 网络 adb。可指定设备序列号，或点「扫描设备…」挑一台 | 组件来源可选「自动 / 环境变量 / 内置 bin」：自动＝先找 PATH，找不到用应用目录 `bin\adb.exe` |
+| HDC | 地址留空 = USB；填 `IP` + 端口（常见 8710）= `hdc tconn`。序列号可点「扫描设备…」挑 | 同上，内置组件是 `bin\hdc.exe`。hdc 会把本机所有 COM 口列成 UART 目标，程序**不会**自动挑它们（要走串口请手填 COM3） |
+
+**端口被占用怎么办。** adb 的 `5037` 与 hdc 的 `8710` 都是「一个 server 全机共用」，
+Android Studio / DevEco Studio / 手机助手 / 投屏工具都会各带一份。连接前程序会先查
+是谁在监听：
+
+- 版本兼容 → **直接复用**，不打断任何软件；
+- 版本不兼容 / 根本不是调试服务 → 弹窗写清「占用者是谁、PID、路径、结束它会让哪些工具掉线」，
+  由你选「由本程序结束」「我自己关掉再重试」或「取消」。没有你的确认，程序不会杀任何进程。
 
 **选「本机」时，界面直接瘦下来**：档案、地址、端口、用户、私钥 / 密码全部收起 ——
 本机没有「连到哪台设备」这件事，留着那些框只会让人以为漏填了。
@@ -364,8 +381,12 @@ IIS 的证书不是配置文件里的路径，而是 http.sys 的端口绑定（
 
 - **命令一定看得见**：每条命令按风险着色（只读 / 会改动 / 高风险）、附上「为什么」，
   执行输出同时进右侧命令日志，不做后台静默执行。
-- **三档模式**：自动执行（只读与一般改动直接跑）/ 每步确认（有改动就问）/ 只读（改东西一律跳过并记账）。
-  **高风险（删除、清空、重启设备）在任何档位都要问**，也没有「本次不再问」这种开关。
+- **四档模式**：自动执行（只读与一般改动直接跑）/ 每步确认（有改动就问）/ 只读（改东西一律跳过并记账）/
+  **完全放行（不问、高风险也直接跑）**。前三档里高风险（删除、清空、重启设备）永远要问；
+  「完全放行」是 v1.0.33 按要求新增的档位，切换时会弹一次确认，之后每条动作仍写进终端与审计日志，
+  并在会话里留一行「完全放行未询问」——**不保留「本次不再问」这种临时开关**。
+- **能操作所有连接类型**：SSH / Telnet / 本机 / COM（console）/ ADB / HDC 在助手眼里都是同一套 `exec`，
+  另有一个 `devtool` 工具用来列设备、`adb connect` / `hdc tconn`、断开。
 - **技能 = 排查剧本**：内置 8 份（服务器资源与性能检查 / 安全诊断与加固 / 服务与计划任务诊断 /
   网络与防火墙诊断 / 网站与 SSL 诊断 / 数据库诊断 / 日志分析 / 文件与 FTP 诊断），
   正文是「探测 → 检查 → 诊断 → 修复 → 注意事项」。选「自动判断」就按你说的话打分挑一份，
@@ -521,6 +542,7 @@ terminal-gui-toolbox/
 ├─ THIRD-PARTY-NOTICES.md  第三方组件归属与许可证
 ├─ .gitignore           排除 data/、*.exe、build/ 等
 ├─ assets/app.ico       应用图标（_mkicon.py 生成）
+├─ bin/                 内置调试组件（adb.exe / hdc.exe 及依赖 dll；二进制不入库，_fetch_bins.py 补齐）
 ├─ docs/                长文档与交付文档模板
 │  ├─ 改造说明-AI运维与宝塔对齐.md
 │  ├─ 模板-项目交接说明.md   交付文档**模板**：打包时代入版本号生成，改内容改这里
@@ -530,6 +552,10 @@ terminal-gui-toolbox/
 │  ├─ detect.py         设备/系统探测 + 命令方言
 │  ├─ session.py        会话抽象（本机 / SSH / Telnet）+ 编码解码 + 提权与 NeedElevation
 │  ├─ telnet_session.py Telnet 协议层（IAC 协商 / 安静判定 / 分页自动翻 / enable）
+│  ├─ serialport.py     COM 串口底层（Windows kernel32 / POSIX termios，零第三方依赖）
+│  ├─ console_session.py COM 会话：串口 + console 登录 + CLIClient（复用分页 / enable）
+│  ├─ devtools.py       adb / hdc 定位（环境变量 / 内置 bin）、server 端口占用与杀进程、设备清单
+│  ├─ debug_session.py  ADB / HDC 会话：`-s <序列号> shell` / `-t <key> shell` + 内层退出码
 │  ├─ metrics.py        CPU / 内存 / 网络 / 时长采样 + 人话格式化
 │  ├─ parsers.py        命令输出 → 结构化行（含 Cisco / H3C 路由表）
 │  ├─ routes.py         路由表读写（ip route / route / netstat -rn / 厂商 CLI）
@@ -580,6 +606,10 @@ terminal-gui-toolbox/
 ├─ _uismoke.py          隧道客户端证书管理界面与档案层（110 项）
 ├─ _selftest.py         PKI：建 CA / 签证书 / CRL / 多平台打包（58 项）
 ├─ _conntest.py         连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（106 项）
+├─ _devtoolstest.py     ADB / HDC 组件定位 / 端口占用 / 设备清单解析（53 项）
+├─ _serialtest.py       COM 串口：参数归一 / 假串口登录 / 分页 / enable（36 项）
+├─ _devsessiontest.py   ADB / HDC 会话：命令拼装 / 内层退出码 / 多设备保护（31 项）
+├─ _newconntest.py      新连接方式：字段显隐 / 校验 / 界面切协议 / 设置页（94 项）
 ├─ _aismoke.py          AI 运维：方案解析 / 自驱循环 / 三档模式 / 技能（59 项）
 ├─ _aiskilltest.py      技能库：8 份内置 / frontmatter / 自动挑选 / 安装 / 注入（54 项）
 ├─ _mdevsmoke.py        多设备标签：加入 / 切换 / 关闭 / 回退（34 项）
@@ -665,6 +695,10 @@ python _vpnsmoke.py   # 隧道客户端证书管理内嵌：五个子页 / 状�
 python _uismoke.py    # 隧道客户端证书管理界面与档案层（103 项）
 python _selftest.py   # 建 CA / 签证书 / CRL / 多平台打包（58 项）
 python _conntest.py   # 连接形态 / 提权三项 / 厂商方言 / Telnet 假设备（106 项）
+python _devtoolstest.py   # ADB / HDC 组件定位 / 端口占用 / 设备清单（53 项）
+python _serialtest.py     # COM 串口：参数 / 假串口登录 / 分页 / enable（36 项）
+python _devsessiontest.py # ADB / HDC 会话：命令拼装 / 内层 rc / 多设备（31 项）
+python _newconntest.py    # 新连接方式：字段显隐 / 校验 / 界面 / 设置页（94 项）
 python _websmoke.py   # Web 服务：探测解析 / 证书报表 / 部署与回滚 / 页面切换（98 项）
 python _aismoke.py    # AI 运维：JSON 解析 / 自驱循环 / 三档模式 / 技能注入（59 项）
 python _aiskilltest.py # 技能库：内置 8 份 / frontmatter 子集 / 自动挑选 / 安装（54 项）

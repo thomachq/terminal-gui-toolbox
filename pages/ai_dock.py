@@ -47,6 +47,9 @@ MODE_OPTS = [
     ("auto", "自动 · 只读与一般改动直接跑，高风险必问"),
     ("confirm", "逐条确认 · 凡有改动都先问"),
     ("readonly", "只读 · 只查不改"),
+    # 完全放行：不弹确认、不因风险等级拦截。只在用户明确切换后生效，
+    # 侧栏与设置页都会常显当前模式，避免「以为还在自动模式」。
+    ("free", "完全放行 · 不问直接执行（含危险动作）"),
 ]
 MODE_LABEL = dict(MODE_OPTS)
 MODE_BY_LABEL = {v: k for k, v in MODE_OPTS}
@@ -1822,6 +1825,16 @@ class AiDockPage:
 
             def pick(_e=None, k=key, t=title):
                 self._ai_close_all_menus()
+                if k == "free" and self.agent_cfg.mode != "free":
+                    # 切到完全放行是「降低保护」，必须让人明确点一次
+                    if not forms.confirm(
+                            self, "切到完全放行？",
+                            "完全放行下，助手执行的任何命令都不再询问，"
+                            "包括删除、重启、清空分区这类危险动作。\n\n"
+                            "动作仍会逐条写进终端与日志，但不会再给你确认的机会。\n"
+                            "请只在明确知道要它做什么时使用。",
+                            danger=True, ok_text="我明白，切过去"):
+                        return
                 self.agent_cfg.data["mode"] = k
                 try:
                     self.agent_cfg.save()
@@ -2468,9 +2481,13 @@ class AiDockPage:
         d = self._effective_device()
         s = self.session
         kind = str(getattr(s, "host_kind", "") or "")
+        # `proto` 只有新会话才有；老会话退到 `kind`（ssh/telnet/local/com/adb/hdc）。
+        # 不这么写的话，ADB / COM 会话会被报成 "local"，模型就会按本机去理解。
+        proto = getattr(s, "proto", "") or getattr(s, "kind", "") or "local"
         return {
             "name": (getattr(s, "name", None) or getattr(s, "host", None) or "本机"),
-            "proto": getattr(s, "proto", "") or "local",
+            "proto": proto,
+            "serial": str(getattr(s, "serial", "") or ""),
             "os": getattr(d, "os_name", "") or "",
             "host_kind": kind or ("windows" if getattr(d, "os_family", "") == "windows"
                                   else "unix"),
@@ -2619,6 +2636,11 @@ class AiDockPage:
             if rec is not None:
                 self._ai_tool_result(rec, bool(p.get("ok")), p.get("text") or "")
                 self._ai_pending = None
+        elif kind == "free":
+            # 完全放行下跑的危险动作：不打断，但必须在会话里留一行，
+            # 免得出事以后没人知道当时是「没问」而不是「问过点了确定」。
+            self._ai_note("⚠ 完全放行未询问：" + _call_title(p.get("call") or {}),
+                          "warn")
         elif kind == "refused":
             self._ai_note("✕ 已拒绝：" + _call_title(p.get("call") or {}), "err")
         elif kind == "skip":
@@ -2687,6 +2709,9 @@ class AiDockPage:
         if tool == "relay":
             return self._ai_relay(args.get("src", ""), args.get("src_path", ""),
                                   args.get("dst", ""), args.get("dst_path", ""))
+        if tool == "devtool":
+            return self._ai_devtool(args.get("bus", ""), args.get("action", ""),
+                                    args.get("target", ""))
         if tool == "open_page":
             return self._ai_ui_call(self._ai_open_page, args.get("page", ""))
         if tool == "page_action":
@@ -2799,6 +2824,49 @@ class AiDockPage:
             self._log_raw("ok" if rc == 0 else "bad",
                           f"[助手] {name} $ {cmd}\n{(body or '')[:4000]}\n")
         return all_ok, "\n\n".join(blocks)
+
+    # -- ADB / HDC 设备
+    def _ai_devtool(self, bus: str, action: str, target: str = ""):
+        """助手里管 adb / hdc 的设备清单（USB 与远程都走这里）。
+
+        只做「看 / 连 / 断」三件事：真正在设备上执行命令仍然走 exec
+        （会话池里已连接的 ADB / HDC 会话直接可用）。
+        """
+        bus = str(bus or "").strip().lower()
+        action = str(action or "list").strip().lower()
+        try:
+            from core import devtools
+        except Exception as e:  # noqa: BLE001
+            return False, f"调试组件模块不可用：{e}"
+        if bus not in devtools.BUS:
+            return False, "bus 只能是 adb 或 hdc"
+        src = "auto"
+        try:
+            src = str(self.settings.data.get("debug_src") or "auto")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if action in ("list", "devices", "ls"):
+                rows = devtools.list_devices(bus, src)
+                if not rows:
+                    return True, f"{bus} 当前没有设备（USB 未授权 / 远程未连接）"
+                return True, "\n".join(
+                    f"{r['serial']}\t{r.get('state', '')}"
+                    f"{(' · ' + r['model']) if r.get('model') else ''}"
+                    for r in rows)
+            if action in ("connect", "tconn"):
+                ok, text = devtools.connect_device(bus, target, src)
+                return ok, text or ("已连接" if ok else "连接失败")
+            if action in ("disconnect", "remove"):
+                ok, text = devtools.disconnect_device(bus, target, src)
+                return ok, text or ("已断开" if ok else "断开失败")
+            return False, "action 只能是 list / connect / disconnect"
+        except devtools.ToolMissing as e:
+            return False, str(e)
+        except devtools.ToolError as e:
+            return False, str(e)
+        except Exception as e:  # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"
 
     # -- 跨机中转
     def _ai_relay(self, src: str, src_path: str, dst: str, dst_path: str):

@@ -131,27 +131,41 @@ def host_fields(rec: dict | None = None, cred_opts=None, proxy_opts=None,
     cred_opts = cred_opts if cred_opts is not None else [("", "不使用凭证（手填口令）")]
     proxy_opts = proxy_opts if proxy_opts is not None else [("", "直连（不走代理）")]
     is_win = sys.platform == "win32" if is_win is None else bool(is_win)
-    remote = ["ssh", "telnet"]
+    # 有网络地址的协议（ADB/HDC 的地址可空＝USB，校验交给 validate）
+    remote = ["ssh", "telnet", "adb", "hdc"]
+    # 需要认证 / 代理的协议（调试桥没有账号密码这一层）
+    netdev = ["ssh", "telnet"]
+    debug = list(H.DEBUG_PROTO)
 
     def when_os(want, extra=()):
         """提权区按「目标系统」显隐 —— 目标系统是自动时按协议猜（见 assume_os）。"""
         wants = (want,) if isinstance(want, str) else tuple(want)
 
         def fn(vals) -> bool:
+            # 调试桥（ADB/HDC）没有 sudo / enable 这回事：设备给的是受限 shell，
+            # 摆一个用不上的密码框只会让人以为「填了就能改系统」。
+            if H.proto_of(vals) in H.DEBUG_PROTO:
+                return False
             if H.assume_os(vals, is_win) not in wants:
                 return False
             return all(bool(vals.get(k)) == bool(v) for k, v in extra)
         return fn
 
     def login_pw(vals) -> bool:
-        """登录密码只在「Telnet」或「SSH + 密码认证」时出现。
+        """登录密码只在「Telnet / COM console」或「SSH + 密码认证」时出现。
 
         SSH 选了私钥就不该再有登录密码 —— 那时候要问的是私钥密码。
+        ADB / HDC 没有登录密码（USB 授权在设备上点）。
         """
         proto = H.proto_of(vals)
-        if proto == "telnet":
+        if proto in ("telnet", "com"):
             return True
         return proto == "ssh" and str(vals.get("auth") or "") == "password"
+
+    from core import serialport as _sp
+    _ports = _sp.list_ports()
+    _port_hint = ("已检测到：" + "、".join(_ports)) if _ports else \
+        "没有检测到串口（设备没插 / 驱动没装也可以手填，例如 COM3）"
 
     saved = bool(rec.get("sudo_password"))
     fields = [
@@ -159,21 +173,63 @@ def host_fields(rec: dict | None = None, cred_opts=None, proxy_opts=None,
          "default": H.display_name(rec) if rec.get("name") else "",
          "hint": "清单里显示的名字，同一名称会覆盖原记录"},
         {"key": "proto", "label": "协议", "kind": "select",
-         "options": [("ssh", "SSH"), ("telnet", "Telnet"), ("local", "本机")],
+         "options": list(H.PROTO_PICK),
          "default": H.proto_of(rec)},
         {"key": "host", "label": "地址", "kind": "text",
          "show_if": {"proto": remote},
          "default": str(rec.get("host") or ""),
-         "hint": "IP 或域名；IPv6 直接写"},
+         "hint": "IP 或域名；IPv6 直接写。ADB / HDC 留空＝USB 直连"},
         {"key": "port", "label": "端口", "kind": "text",
          "show_if": {"proto": remote},
          "default": str(rec.get("port") or "22")},
         {"key": "user", "label": "用户", "kind": "text",
-         "show_if": {"proto": remote},
-         "default": str(rec.get("user") or "")},
+         "show_if": {"proto": ["ssh", "telnet", "com"]},
+         "default": str(rec.get("user") or ""),
+         "hint": "COM 口可留空（设备 console 免登录时不用填）"},
+        # ---- COM（console）：串口名 + 线路参数
+        {"key": "com_port", "label": "串口", "kind": "text",
+         "show_if": {"proto": ["com"]},
+         "default": str(rec.get("com_port") or "COM1"),
+         "hint": _port_hint},
+        {"key": "baud", "label": "波特率", "kind": "select",
+         "show_if": {"proto": ["com"]},
+         "options": [(str(b), str(b)) for b in _sp.BAUDS],
+         "default": str(rec.get("baud") or "115200")},
+        {"key": "databits", "label": "数据位", "kind": "select",
+         "show_if": {"proto": ["com"]},
+         "options": [(str(d), str(d)) for d in _sp.DATABITS],
+         "default": str(rec.get("databits") or "8")},
+        {"key": "parity", "label": "校验", "kind": "select",
+         "show_if": {"proto": ["com"]},
+         "options": [("none", "无 (N)"), ("even", "偶 (E)"), ("odd", "奇 (O)"),
+                     ("mark", "标记 (M)"), ("space", "空格 (S)")],
+         "default": str(rec.get("parity") or "none")},
+        {"key": "stopbits", "label": "停止位", "kind": "select",
+         "show_if": {"proto": ["com"]},
+         "options": [("1", "1"), ("1.5", "1.5"), ("2", "2")],
+         "default": str(rec.get("stopbits") or "1")},
+        {"key": "flow", "label": "流控", "kind": "select",
+         "show_if": {"proto": ["com"]},
+         "options": [("none", "无"), ("rtscts", "硬件 RTS/CTS"),
+                     ("xonxoff", "软件 XON/XOFF")],
+         "default": str(rec.get("flow") or "none"),
+         "hint": "console 线绝大多数是「无」；选错会收不到输出"},
+        # ---- ADB / HDC：组件来源与设备序列号
+        {"key": "tool_src", "label": "组件来源", "kind": "select",
+         "show_if": {"proto": debug},
+         "options": [("auto", "自动（环境变量优先，找不到用内置 bin）"),
+                     ("env", "环境变量（PATH）"),
+                     ("bundled", "内置组件（应用目录 bin）")],
+         "default": str(rec.get("tool_src") or "auto"),
+         "hint": "内置组件放在应用目录的 bin 文件夹里"},
+        {"key": "device_id", "label": "设备序列号", "kind": "text",
+         "show_if": {"proto": debug},
+         "default": str(rec.get("device_id") or ""),
+         "hint": "留空＝自动（只有一台设备时）；多台必须指定"},
         # 目标系统：决定下面提权问的是 sudo 密码、enable 密码，还是根本不用密码
         {"key": "ostype", "label": "目标系统", "kind": "select",
-         "show_if": {"proto": remote},
+         # COM 也可能是 Linux 服务器的串口控制台，所以这一项对它也保留
+         "show_if": {"proto": netdev + ["com"]},
          "options": H.pick_options(),
          "default": H.os_of(rec),
          "hint": "决定提权方式；留「自动」的话连上后按 uname / ver 认出来并记住"},
@@ -248,15 +304,18 @@ def host_fields(rec: dict | None = None, cred_opts=None, proxy_opts=None,
          "default": str(rec.get("tags") or ""),
          "hint": "逗号分隔，例如：web, 生产, 上海"},
         {"key": "cred_id", "label": "凭证", "kind": "select",
-         "show_if": {"proto": remote},
+         "show_if": {"proto": netdev},
          "options": cred_opts,
          "default": str(rec.get("cred_id") or ""),
          "hint": "选了凭证就以凭证为准，上面手填的口令不生效"},
         {"key": "proxy_id", "label": "代理", "kind": "select",
-         "show_if": {"proto": remote},
+         "show_if": {"proto": netdev},
          "options": proxy_opts,
          "default": str(rec.get("proxy_id") or ""),
          "hint": "从「代理池」里挑一条链路进来"},
+        {"key": "dbg_note", "label": "连接方式", "kind": "readonly",
+         "show_if": {"proto": debug},
+         "default": "USB 直连不用填地址；填了地址就走网络调试（ADB connect / HDC tconn）",},
     ]
     # 同名 key 只留第一份 —— 提权那两个勾选框共用一个 `sudo` 字段，
     # 但表单里不能挂两个同 key 的控件（后建的会把先建的 getter 顶掉）。
@@ -342,11 +401,15 @@ def merge_host_form(data: dict, base: dict | None = None,
         merged.get("password") or merged.get("key_passphrase")
         or merged.get("sudo_password"))
     tgt = H.assume_os(merged, is_win)
-    local_win = merged.get("proto") == "local" and tgt == "windows"
+    proto = merged.get("proto")
+    local_win = proto == "local" and tgt == "windows"
+    # 调试桥（ADB/HDC）没有 sudo / enable：设备给的是受限 shell，
+    # 留一个勾会让下次连接去试一条根本不存在的提权路径。
     merged["sudo"] = (bool(merged.get("sudo"))
-                      if (H.is_unix(tgt) or tgt == "network") else False)
+                      if (H.is_unix(tgt) or tgt == "network")
+                      and proto not in H.DEBUG_PROTO else False)
     merged["elevate"] = bool(merged.get("elevate")) if local_win else False
-    if merged.get("proto") != "local":
+    if proto != "local":
         merged["shell"] = ""
     return merged
 

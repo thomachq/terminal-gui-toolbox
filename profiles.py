@@ -72,6 +72,11 @@ PROFILE_FIELDS = (
     # os_name 是连上之后 detect() 探到的具体版本名（Debian 12 / Windows 11），
     # 只用来显示，不含任何凭据。
     "ostype", "os_name",
+    # ---- 新增连接方式（v1.0.33）：
+    #   com  —— 串口名与线路参数（console）
+    #   adb / hdc —— 设备序列号 + 组件来源（auto / env / bundled）
+    "com_port", "baud", "databits", "parity", "stopbits", "flow",
+    "device_id", "tool_src",
     "created", "last_used",
 )
 
