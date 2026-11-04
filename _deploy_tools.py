@@ -28,6 +28,27 @@ def sha(p: Path) -> str:
 print("源 :", SRC)
 print("目标:", DST)
 
+# bin/：ADB / HDC 的内置组件（adb.exe + 三个 dll、hdc.exe + libusb_shared.dll）。
+# portable 包里一直带着它，但本机安装这里以前只换 exe 与说明 —— 结果安装版里
+# 压根没有 bin/，「内置 bin」这条路径等于不存在，只能吃环境变量里那个 adb。
+# 口径与 _pack_release.py 的 KEEP_IGNORED 保持一致：只带程序、dll 与说明。
+bin_src, bin_dst = SRC / "bin", DST / "bin"
+if bin_src.is_dir():
+    bin_dst.mkdir(exist_ok=True)
+    for p in sorted(bin_src.iterdir()):
+        if not p.is_file():
+            continue
+        low = p.name.lower()
+        if not (low.endswith((".exe", ".dll")) or low.startswith("notice-")
+                or low.endswith(".md")):
+            continue
+        d = bin_dst / p.name
+        if d.is_file() and sha(d) == sha(p):
+            print(f"[ok]   bin/{p.name} 已是最新")
+            continue
+        shutil.copy2(p, d)
+        print(f"[ok]   bin/{p.name} 覆盖完成  {d.stat().st_size} 字节")
+
 # 说明文件没人占用，直接覆盖
 for name in ("使用说明.txt",):
     s, d = SRC / name, DST / name
