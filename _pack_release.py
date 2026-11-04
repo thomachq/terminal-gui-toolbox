@@ -327,7 +327,10 @@ def make_github_clone() -> Path | None:
     tmp = HERE / "_release" / "_clone"
     if (tmp / ".git").is_dir():
         try:
-            for cmd in (["fetch", "--prune", "--tags", "origin"],
+            # fetch 必须带 --force：重打过的 tag（v1.0.33 补了两处脚本修复）
+            # 会让 `--tags` 报 `! [rejected] would clobber existing tag`，
+            # 整个复用分支直接放弃、github 包静默不生成。
+            for cmd in (["fetch", "--prune", "--tags", "--force", "origin"],
                         ["checkout", "-B", "main", "origin/main"],
                         ["reset", "--hard", "origin/main"]):
                 subprocess.run(["git", "-C", str(tmp)] + cmd, check=True,
@@ -335,8 +338,13 @@ def make_github_clone() -> Path | None:
         except Exception as e:  # noqa: BLE001
             print(f"[warn] 复用已有克隆失败：{e}")
             return None
-        head = subprocess.run(["git", "-C", str(tmp), "log", "--oneline", "-1"],
-                              capture_output=True, text=True, timeout=60).stdout.strip()
+        # 这里必须显式 encoding="utf-8"：git 输出的提交信息是 UTF-8，用
+        # text=True 走系统代码页（GBK）时，subprocess 的读线程会抛
+        # UnicodeDecodeError 并把 stdout 变成 None —— 于是 head 是空的，
+        # 还会在控制台上打一段和打包无关的 traceback。
+        head = (subprocess.run(["git", "-C", str(tmp), "log", "--oneline", "-1"],
+                               capture_output=True, encoding="utf-8",
+                               errors="replace", timeout=60).stdout or "").strip()
         print(f"[info] 复用已有克隆，已更新到 {head}")
     else:
         try:
