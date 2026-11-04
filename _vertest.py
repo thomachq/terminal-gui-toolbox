@@ -122,21 +122,32 @@ chk(src.count('if "--version" in sys.argv:') == 1,
 
 # ---------------------------------------------------------------- F
 sec("F. --check-tools（v1.0.33：排障时先看它用的是哪一份 adb/hdc）")
+# 子进程写管道时用的是系统代码页（中文 Windows 上是 GBK），不是 UTF-8；
+# 以前按 encoding="utf-8" 解，中文断言（应用目录/内置 bin/端口）全都假 FAIL。
+def _dec(b: bytes) -> str:
+    for enc in ("utf-8", "gbk"):
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return b.decode("utf-8", "replace")
+
+
 r = subprocess.run([sys.executable, str(SRC), "--check-tools"],
-                   capture_output=True, text=True, encoding="utf-8",
-                   errors="replace", cwd=str(HERE), timeout=120)
+                   capture_output=True, cwd=str(HERE), timeout=120)
+_out, _err = _dec(r.stdout), _dec(r.stderr)
 chk(r.returncode == 0, "源码 --check-tools 退出码 0", f"rc={r.returncode}")
 for want in ("应用目录", "内置 bin", "ADB", "HDC", "端口"):
-    chk(want in r.stdout, f"输出里有「{want}」")
-chk("Traceback" not in r.stderr, "stderr 没有异常", r.stderr[:200])
+    chk(want in _out, f"输出里有「{want}」")
+chk("Traceback" not in _err, "stderr 没有异常", _err[:200])
 if EXE.is_file():
     r = subprocess.run([str(EXE), "--check-tools"], capture_output=True,
-                       text=True, encoding="utf-8", errors="replace",
                        cwd=str(HERE), timeout=300)
+    _out = _dec(r.stdout)
     chk(r.returncode == 0, "exe --check-tools 退出码 0", f"rc={r.returncode}")
-    chk("bin" in r.stdout, "exe 能在自己目录下找到 bin")
-    chk(str(HERE) in r.stdout or "TerminalToolbox" in r.stdout,
-        "exe 报的应用目录是它自己的位置", r.stdout[:160])
+    chk("bin" in _out, "exe 能在自己目录下找到 bin")
+    chk(str(HERE) in _out or "TerminalToolbox" in _out,
+        "exe 报的应用目录是它自己的位置", _out[:160])
 
 print(f"\n结果：{_p} 通过 / {_f} 失败")
 if _f:
