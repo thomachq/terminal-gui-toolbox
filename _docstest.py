@@ -54,7 +54,9 @@ def sec(t):
 
 
 TPL_HAND = PK.DOC_TPL / "模板-项目交接说明.md"
-TPL_DEB = PK.DOC_TPL / "模板-deb构建说明.md"
+# v1.0.35 起 deb 说明是**通用版**（docs/deb构建说明.md）：不带版本号、不走
+# 模板渲染，版本号由执行者从 app.py 的 APP_VER 现读。
+DEB = PK.DOC_TPL / "deb构建说明.md"
 VER = PK.VER
 
 # 判「还有没有没替换的占位符」只能按占位符的形状判：文档正文里出现花括号
@@ -63,36 +65,43 @@ PH = re.compile(r"\{\{[A-Za-z_]+\}\}")
 
 
 # ---------------------------------------------------------------- 1
-sec("1. 模板本体")
-for tpl in (TPL_HAND, TPL_DEB):
-    chk(tpl.is_file() and tpl.stat().st_size > 3000,
-        f"模板存在且够长：{tpl.name}",
-        f"{tpl.stat().st_size if tpl.is_file() else '缺失'} bytes")
+sec("1. 文档本体")
+chk(TPL_HAND.is_file() and TPL_HAND.stat().st_size > 3000,
+    f"交接模板存在且够长：{TPL_HAND.name}",
+    f"{TPL_HAND.stat().st_size if TPL_HAND.is_file() else '缺失'} bytes")
+chk(DEB.is_file() and DEB.stat().st_size > 3000,
+    f"通用版 deb 说明存在且够长：{DEB.name}",
+    f"{DEB.stat().st_size if DEB.is_file() else '缺失'} bytes")
 
 h = TPL_HAND.read_text(encoding="utf-8")
 chk("{{VER_V}}" in h, "交接模板用了 {{VER_V}} 占位符")
 chk("{{DATE}}" in h, "交接模板用了 {{DATE}} 占位符")
 chk("{{VER}}" in h, "交接模板用了 {{VER}} 占位符（文件名/命令示例）")
 
-d = TPL_DEB.read_text(encoding="utf-8")
-chk("{{VER}}" in d, "deb 模板用了 {{VER}} 占位符")
-chk("{{VER_V}}" in d, "deb 模板用了 {{VER_V}} 占位符（git checkout 用）")
-chk("{{DATE_RFC2822}}" in d, "deb 模板用了 {{DATE_RFC2822}}（changelog 日期）")
+# 通用版 deb 说明的四条硬约束：不渲染、不写死版本、从源码读、覆盖面够
+d = DEB.read_text(encoding="utf-8")
+chk(PH.search(d) is None, "通用版 deb 说明里没有任何 {{占位符}}（不走渲染）",
+    (PH.search(d).group(0) if PH.search(d) else ""))
+chk("APP_VER" in d, "deb 说明要求从 app.py 的 APP_VER 取版本号")
+chk("$VER" in d, "deb 说明通篇用 $VER 变量，不写死版本号")
+for need in ("debian/control", "debian/rules", "debian/changelog",
+             "TB_DATA_DIR", "dpkg-buildpackage", "dpkg-deb -I"):
+    chk(need in d, f"通用版 deb 说明覆盖到：{need}")
+
 chk("模板" in h.splitlines()[4] or "模板" in h[:600],
     "交接模板首段说明了「改模板别改产物」")
-chk("模板" in d[:900], "deb 模板首段说明了「改模板别改产物」")
 
 
 # ---------------------------------------------------------------- 2
 sec("2. 渲染结果")
 PK.OUT.mkdir(parents=True, exist_ok=True)
 made = PK.render_docs()
-chk(len(made) == 2, "render_docs 产出两份", str(len(made)))
+chk(len(made) == 1, "render_docs 只产出交接说明（deb 说明改通用版）", str(len(made)))
 
 names = [p.name for p in made]
 chk("terminal-gui-toolbox项目交接说明.md" in names, "交接说明文件名固定")
-chk(f"terminal-gui-toolbox-deb构建说明-{VER}.md" in names,
-    "deb 说明文件名带版本号", str(names))
+chk(not any("deb构建说明" in n for n in names),
+    "不再渲染带版本号的 deb 说明", str(names))
 
 for p in made:
     txt = p.read_text(encoding="utf-8")
@@ -104,11 +113,6 @@ hand_txt = (PK.OUT / "terminal-gui-toolbox项目交接说明.md").read_text(enco
 chk(f"版本：**v{VER}**" in hand_txt, "交接说明头部版本行渲染正确")
 from datetime import date as _d  # noqa: E402
 chk(_d.today().isoformat() in hand_txt, "交接说明含今天日期")
-
-deb_txt = (PK.OUT / f"terminal-gui-toolbox-deb构建说明-{VER}.md").read_text(
-    encoding="utf-8")
-chk(f"terminal-gui-toolbox_{VER}_all.deb" in deb_txt, "deb 说明里产物名代入了版本")
-chk(f"terminal-gui-toolbox ({VER}) unstable" in deb_txt, "changelog 版本行代入了版本")
 
 
 # ---------------------------------------------------------------- 3
@@ -159,17 +163,19 @@ with zipfile.ZipFile(PK.OUT / "_addfile_测试.zip", "w") as zf:
 # ---------------------------------------------------------------- 5
 sec("5. 部署清单与预检")
 lst = DP.files("1.0.99")
-chk(len(lst) == 6, "交付清单六项", str(lst))
-chk(any("1.0.99" in n for n in lst), "deb 说明项内联了版本号")
+chk(len(lst) == 5, "交付清单五项（deb 说明转常驻文档）", str(lst))
+chk(any("1.0.99" in n for n in lst), "源码包项内联了版本号")
 chk(any(".zip" in n for n in lst) and sum(".zip" in n for n in lst) == 4,
     "四个 zip 包都在清单里")
+chk(not any("deb构建说明" in n for n in lst),
+    "清单里不再有版本化的 deb 说明", str(lst))
 
 empty = PK.OUT / "_空目录_预检测试"
 empty.mkdir(exist_ok=True)
 miss = DP.missing("1.0.99", empty)
-chk(len(miss) == 6, "空目录预检报全六项", str(len(miss)))
+chk(len(miss) == 5, "空目录预检报全五项", str(len(miss)))
 miss2 = DP.missing("1.0.99", PK.HERE / "docs")   # 有别的文件但没这些包
-chk(len(miss2) == 6, "错目录预检同样报全（不会因为有文件就放行）")
+chk(len(miss2) == 5, "错目录预检同样报全（不会因为有文件就放行）")
 empty.rmdir()
 
 
@@ -180,7 +186,7 @@ with zipfile.ZipFile(kb) as zf:
     nl = zf.namelist()
     base = [n.split("/")[-1] for n in nl]
     chk("terminal-gui-toolbox项目交接说明.md" in nl, "知识库含交接说明成品")
-    chk(f"terminal-gui-toolbox-deb构建说明-{VER}.md" in nl, "知识库含 deb 说明成品")
+    chk("docs/deb构建说明.md" in nl, "知识库含通用版 deb 说明")
     chk(not [n for n in base if n.startswith("模板-")],
         "知识库不含模板本体", str([n for n in base if n.startswith("模板-")][:3]))
     chk(not [n for n in nl if n.endswith("/query") or n == "query"],

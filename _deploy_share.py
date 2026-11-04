@@ -42,8 +42,8 @@ def files(v: str) -> list[str]:
         "terminal-gui-toolbox工具包.zip",
         "terminal-gui-toolbox项目知识库.zip",
         f"terminal-gui-toolbox-{v}(github).zip",
-        f"terminal-gui-toolbox-deb构建说明-{v}.md",
         "terminal-gui-toolbox项目交接说明.md",
+        # deb 构建说明与发布链说明都是通用版（不带版本号），走常驻文档那一段
     ]
 
 
@@ -138,7 +138,7 @@ def main() -> int:
 
     # 常驻文档：不代表具体版本，但每次发版都要给最新的一份。
     # 它们不在 _release/v<ver>/ 里（不随版本变化），所以单独从 docs/ 拷。
-    for doc in ("发布链说明.md",):
+    for doc in ("发布链说明.md", "deb构建说明.md"):
         src = ROOT / "docs" / doc
         if not src.is_file():
             print("  !! 缺常驻文档（跳过）：", doc)
@@ -165,6 +165,13 @@ def main() -> int:
     if legacy.is_file():
         print("  旧命名的源码包，挪进 old/ 归档")
         archive(legacy, legacy.name)
+
+    # deb 说明从 v1.0.35 起改成通用版（deb构建说明.md）。共享盘上同一版本
+    # 那份带版本号的副本已经多余，挪进 old/ —— 两份并存会让读者不知道该信哪份。
+    legacy_deb = DST / f"terminal-gui-toolbox-deb构建说明-{v}.md"
+    if legacy_deb.is_file():
+        print("  旧命名的 deb 说明，挪进 old/ 归档")
+        archive(legacy_deb, legacy_deb.name)
 
     # 复核：逐个比大小，别把「复制了」当成「复制对了」
     bad = [n for n in files(v)

@@ -168,17 +168,20 @@ def render_docs() -> list[Path]:
     `add_file()` 静默 False + 部署脚本静默跳过，整整七个版本没人发现。
     现在模板进仓库（能 diff、能 review），打包时自动代入版本号，渲染完还会
     扫一遍有没有漏替换的 `{{...}}`——有就直接抛错，绝不让半成品流出去。
+
+    **deb 构建说明不再渲染**（2026-11-04 用户要求）：它改成通用版
+    `docs/deb构建说明.md`，文件名不带版本号 —— 版本号从源码的 `APP_VER` 读，
+    一份文档管所有迭代，AI 智能体拿着它对任意版本都能出包。既然不随版本
+    变化，就不该每次发版都复制一份带版本号的副本出去。
     """
     ctx = {
         "VER": VER,
         "VER_V": "v" + VER,
         "DATE": date.today().isoformat(),
-        # debian/changelog 要的格式：Sat, 24 Oct 2026 23:10:00 +0800
         "DATE_RFC2822": formatdate(localtime=True),
     }
     pairs = (
         ("模板-项目交接说明.md", "terminal-gui-toolbox项目交接说明.md"),
-        ("模板-deb构建说明.md", f"terminal-gui-toolbox-deb构建说明-{VER}.md"),
     )
     made: list[Path] = []
     for tpl_name, out_name in pairs:
@@ -205,8 +208,7 @@ def make_kb() -> Path:
          "docs/改造说明-AI运维与宝塔对齐.md", True),
         (OUT / "terminal-gui-toolbox项目交接说明.md",
          "terminal-gui-toolbox项目交接说明.md", True),
-        (OUT / f"terminal-gui-toolbox-deb构建说明-{VER}.md",
-         f"terminal-gui-toolbox-deb构建说明-{VER}.md", True),
+        # deb 构建说明是通用版（不带版本号），由下面的 docs/*.md 通配带进去
     ]
     # docs/ 下的模板不进知识库：知识库要的是渲染好的成品，模板留给工具包
     # （接手的人改的是模板）。否则包里两份「交接说明」并排，看的人会懵。
@@ -245,8 +247,7 @@ def make_kit() -> Path:
         add_tree(zf, HERE, "terminal-gui-toolbox")
         add_file(zf, OUT / "terminal-gui-toolbox项目交接说明.md",
                  "terminal-gui-toolbox/项目交接说明.md", required=True)
-        add_file(zf, OUT / f"terminal-gui-toolbox-deb构建说明-{VER}.md",
-                 f"terminal-gui-toolbox/deb构建说明-{VER}.md", required=True)
+        # deb 构建说明随 add_tree 的 docs/ 一起进包（通用版，不带版本号）
     return out
 
 
