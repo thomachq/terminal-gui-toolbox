@@ -323,7 +323,9 @@ def make_github_clone() -> Path | None:
        （SAFE_DELETE_BULK_CONFIRM_REQUIRED），脚本会半路失败。所以改成复用：
        目录已在就 `fetch` + 硬切到 `origin/main`，不在才 clone。留着下次发版接着用。
     """
-    out = OUT / "terminal-gui-toolbox(github).zip"
+    # 源码包名带版本号（用户 2026-11-04 要求）：以前的
+    # `terminal-gui-toolbox(github).zip` 下了三份之后，谁也说不清哪个是哪一版。
+    out = OUT / f"terminal-gui-toolbox-{VER}(github).zip"
     tmp = HERE / "_release" / "_clone"
     if (tmp / ".git").is_dir():
         try:

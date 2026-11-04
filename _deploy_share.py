@@ -41,7 +41,7 @@ def files(v: str) -> list[str]:
         f"Terminal-GUI-Toolbox-{v}-windows-x64-portable.zip",
         "terminal-gui-toolbox工具包.zip",
         "terminal-gui-toolbox项目知识库.zip",
-        "terminal-gui-toolbox(github).zip",
+        f"terminal-gui-toolbox-{v}(github).zip",
         f"terminal-gui-toolbox-deb构建说明-{v}.md",
         "terminal-gui-toolbox项目交接说明.md",
     ]
@@ -135,6 +135,36 @@ def main() -> int:
             print("  !! 写入被拒（共享盘不允许覆盖已存在文件）：", name)
             continue
         print("  已写 %-52s %7.1f MB" % (name, dst.stat().st_size / 1048576))
+
+    # 常驻文档：不代表具体版本，但每次发版都要给最新的一份。
+    # 它们不在 _release/v<ver>/ 里（不随版本变化），所以单独从 docs/ 拷。
+    for doc in ("发布链说明.md",):
+        src = ROOT / "docs" / doc
+        if not src.is_file():
+            print("  !! 缺常驻文档（跳过）：", doc)
+            continue
+        dst = DST / doc
+        if dst.is_file() and dst.stat().st_size == src.stat().st_size:
+            print("尺寸一致，跳过覆盖", doc)
+            continue
+        if dst.is_file():
+            archive(dst, doc)
+            if dst.is_file():
+                print("  !! 旧文件挪不走，无法写入：", doc)
+                continue
+        try:
+            shutil.copyfile(src, dst)
+            print("  已写 %-52s %7.1f KB" % (doc, dst.stat().st_size / 1024))
+        except PermissionError:
+            print("  !! 写入被拒（共享盘不允许覆盖已存在文件）：", doc)
+
+    # v1.0.35 起源码包名带上版本号；共享盘上那份老的无版本号包已经没用了，
+    # 但和它同一目录并存会让人分不清该下哪个 —— 挪进 old/ 归档（共享盘
+    # 不允许删除，所以只改名，不 unlink）。
+    legacy = DST / "terminal-gui-toolbox(github).zip"
+    if legacy.is_file():
+        print("  旧命名的源码包，挪进 old/ 归档")
+        archive(legacy, legacy.name)
 
     # 复核：逐个比大小，别把「复制了」当成「复制对了」
     bad = [n for n in files(v)
