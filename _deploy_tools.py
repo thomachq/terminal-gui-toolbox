@@ -10,7 +10,10 @@ import shutil
 import time
 from pathlib import Path
 
-SRC = Path(r"N:\AI-workspace\WorkBuddy\Terminal GUI Toolbox")
+# 源目录就用脚本自己所在的位置：项目从 N:\AI-workspace\WorkBuddy 搬到
+# L:\AI-Workspace\terminal-gui-toolbox\gh 那次，写死的旧路径没跟着改，
+# 脚本会去一个不存在的目录取 exe。改成 __file__ 之后，再搬家也不用动这里。
+SRC = Path(__file__).resolve().parent
 DST = Path(r"D:\Tools\Terminal-GUI-Toolbox")
 
 
