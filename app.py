@@ -137,7 +137,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.35"
+APP_VER = "1.0.36"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -3330,8 +3330,14 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
 
         def ok(res):
             s, dev, elev, elev_why = res
-            # 多设备：连上就加一个槽位，顶部标签栏多一个；同一台重连则替换
+            # 多设备：连上就加一个槽位，顶部标签栏多一个；同一台重连则替换。
+            # 重连同一台会换新 sid、close 旧会话 —— 旧 sid 那条终端页签若留着，
+            # 就成了「标题还像连着、会话却是 None」的孤儿页签，点进去没会话可用，
+            # 用户看到的就是「终端再点不开」。这里按 sid 差集把被替换掉的清掉。
+            before = {sl.sid for sl in self.sessions}
             slot = self.sessions.add(s, dev)
+            for gone in before - {sl.sid for sl in self.sessions}:
+                self._term_forget(gone)     # 连同页签/独立窗口一起清，不影响别的设备
             slot.elev = elev
             self._rebuild_devtabs()
             self.btn_connect.set_enabled(True)
