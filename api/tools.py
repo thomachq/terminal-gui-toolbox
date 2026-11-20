@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
+import shlex
+import time
 from pathlib import Path
 
 from core import files as fl
@@ -112,6 +115,37 @@ def _flag(qs: dict, key: str) -> bool:
     return _q(qs, key).strip().lower() in ("1", "true", "yes", "on", "y")
 
 
+def _is_enoent(e: Exception) -> bool:
+    """SFTP 的「路径不存在」判断：文件不存在或父目录不存在都算。
+
+    paramiko 把 SSH_FX_NO_SUCH_FILE 转成 IOError(errno=2)，文案常见
+    `[Errno 2] No such file` / `No such file or directory`。chroot 下请求
+    /tmp、/etc 就走这里，触发命令通道兜底。
+    """
+    if isinstance(e, FileNotFoundError):
+        return True
+    eno = getattr(e, "errno", None)
+    if eno == 2:
+        return True
+    text = f"{e}".lower()
+    return ("no such file" in text) or ("not found" in text)
+
+
+def _fs_error(fs, e: Exception, what: str) -> _Fail:
+    """非 ENOENT 的操作失败 → 带诊断的错误，不再是裸 500。
+
+    sftp 会话用 400（客户端路径问题，附 SFTP 根视图诊断）；本机仍保持
+    历史 500 语义（_tooltest 的契约），不强改。
+    """
+    diag = ""
+    try:
+        diag = fs.diagnose()
+    except Exception:  # noqa: BLE001
+        pass
+    status = 400 if getattr(fs, "kind", "") == "sftp" else 500
+    return _Fail(status, f"文件操作失败（{what}）：{type(e).__name__}: {e}", diag)
+
+
 class ToolKit:
     """一组「智能体可以直接用」的工具端点。"""
 
@@ -181,6 +215,108 @@ class ToolKit:
                 trace(f"sftp {text}", rc, out, err, 0)
             except Exception:  # noqa: BLE001
                 pass
+
+    # ------------------------------------------------------------ SFTP 兜底
+    def _exec_file(self, c, sub: str, path: str, *, data: bytes | None = None,
+                   to: str = "", cap: int | None = None, fs=None) -> dict:
+        """SFTP 不可达时的命令通道兜底（群晖 chroot /tmp、/etc 等）。
+
+        全部经 _Exec → pool.exec，带 [API] 前缀进审计；base64 传内容避免
+        引号/换行/二进制把 shell 命令搞坏。返回体统一带 via=exec-fallback，
+        让调用方（智能体/人）知道这次走的是命令通道而非 SFTP。
+        """
+        ex = _Exec(self.pool, c.id, c)
+        q = shlex.quote(path)
+        diag = ""
+        if fs is not None:
+            try:
+                diag = fs.diagnose()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def fail(cmd, rc, err):
+            hint = diag + f" 兜底命令：{cmd[:120]}"
+            return _Fail(500 if rc < 0 else 400,
+                         f"命令通道文件操作失败（rc={rc}）：{(err or '')[:200]}",
+                         hint)
+
+        if sub == "mkdir":
+            cmd = f"mkdir -p -- {q}"
+            rc, out, err = ex.run(cmd, timeout=30)
+            if rc != 0:
+                raise fail(cmd, rc, err)
+            self._note(c, f"exec-fallback mkdir {path}")
+            return {"session": c.id, "path": path, "ok": True,
+                    "via": "exec-fallback"}
+
+        if sub == "remove":
+            cmd = f"rm -rf -- {q}"
+            rc, out, err = ex.run(cmd, timeout=30)
+            if rc != 0:
+                raise fail(cmd, rc, err)
+            self._note(c, f"exec-fallback remove {path}")
+            return {"session": c.id, "path": path, "removed": True,
+                    "via": "exec-fallback"}
+
+        if sub == "rename":
+            cmd = f"mv -- {q} {shlex.quote(to)}"
+            rc, out, err = ex.run(cmd, timeout=30)
+            if rc != 0:
+                raise fail(cmd, rc, err)
+            self._note(c, f"exec-fallback rename {path} -> {to}")
+            return {"session": c.id, "from": path, "to": to, "ok": True,
+                    "via": "exec-fallback"}
+
+        if sub == "read":
+            cmd = f"base64 < {q}"
+            rc, out, err = ex.run(cmd, timeout=60)
+            if rc != 0:
+                raise fail(cmd, rc, err)
+            joined = "".join((out or "").split())
+            try:
+                raw = base64.b64decode(joined, validate=True)
+            except (binascii.Error, ValueError):
+                raise _Fail(500, "命令通道读回的内容不是合法 base64", diag)
+            over = False
+            if cap and len(raw) > cap:
+                raw, over = raw[:cap], True
+            self._note(c, f"exec-fallback read {path} ({len(raw)}B)",
+                       0, f"{len(raw)} bytes")
+            base = {"session": c.id, "path": path, "bytes": len(raw),
+                    "truncated": over, "via": "exec-fallback"}
+            try:
+                base.update(encoding="utf-8", text=raw.decode("utf-8"))
+            except UnicodeDecodeError:
+                base.update(encoding="base64",
+                            content_b64=base64.b64encode(raw).decode())
+            return base
+
+        if sub == "write":
+            if data is None:
+                raise _Fail(400, "写操作缺内容")
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            b64 = base64.b64encode(data).decode()
+            # 分块写 b64 再统一解码，规避 ARG_MAX；每块 60KB
+            chunks = [b64[i:i + 60000] for i in range(0, len(b64), 60000)] or [""]
+            tmp = f"/tmp/.ttb-w-{os.getpid()}-{int(time.time() * 1000)}"
+            mk = f": > {shlex.quote(tmp)} && " + " && ".join(
+                f"printf '%s' {shlex.quote(ch)} >> {shlex.quote(tmp)}" for ch in chunks)
+            rc, out, err = ex.run(mk, timeout=60)
+            if rc != 0:
+                raise fail(mk, rc, err)
+            dest = shlex.quote(path)
+            cmd = f"mkdir -p -- {shlex.quote(parent)} && " if parent and parent != "/" else ""
+            cmd += f"base64 -d < {shlex.quote(tmp)} > {dest} && rm -f -- {shlex.quote(tmp)}"
+            rc, out, err = ex.run(cmd, timeout=60)
+            if rc != 0:
+                ex.run(f"rm -f -- {shlex.quote(tmp)}", timeout=15)
+                raise fail(cmd, rc, err)
+            self._note(c, f"exec-fallback write {path} ({len(data)}B)",
+                       0, f"{len(data)} bytes")
+            return {"session": c.id, "path": path, "bytes": len(data),
+                    "ok": True, "via": "exec-fallback"}
+
+        raise _Fail(400, f"命令通道不支持这个操作：{sub}")
 
     # ------------------------------------------------------------ 系统
     def sysinfo(self, c) -> dict:
@@ -307,14 +443,34 @@ class ToolKit:
         if sub in ("list", "ls"):
             path = _q(qs, "path") or str(body.get("path") or "")
             real = fs.normalize(path) if path else fs.home()
-            rows = fs.listdir(real)
+            via = ""
+            try:
+                rows = fs.listdir(real)
+            except Exception as e:  # noqa: BLE001
+                if fs.kind != "sftp" or not _is_enoent(e):
+                    raise _fs_error(fs, e, f"列目录 {real}")
+                # SFTP 看不到（群晖 chroot 下的 /tmp 等）→ exec 通道 ls 兜底
+                ex = _Exec(self.pool, c.id, c)
+                cmd = f"ls -1a -- {shlex.quote(path or '.')}"
+                rc, out, err = ex.run(cmd, timeout=30)
+                if rc != 0:
+                    raise _Fail(400, f"命令通道列目录失败（rc={rc}）：{(err or '')[:200]}",
+                                fs.diagnose())
+                names = [ln for ln in (out or "").splitlines()
+                         if ln and ln not in (".", "..")]
+                rows = [fl.Entry(name=n, path=(path.rstrip('/') + '/' + n).lstrip('/')
+                                 or n, is_dir=False) for n in names]
+                via = "exec-fallback"
             self._note(c, f"list {real}")
             cut = rows[:MAX_LIST]
-            return 200, {
+            res = {
                 "session": c.id, "path": real, "parent": fs.parent(real),
                 "count": len(rows), "truncated": len(rows) > len(cut),
                 "entries": [e.row() for e in cut],
             }
+            if via:
+                res["via"] = via
+            return 200, res
 
         if sub == "read":
             path = _q(qs, "path") or str(body.get("path") or "")
@@ -323,21 +479,27 @@ class ToolKit:
             real = fs.normalize(path)
             cap = int(_q(qs, "max") or body.get("max") or MAX_READ)
             cap = max(1, min(cap, MAX_READ))
-            with fs.open_read(real) as f:
-                data = f.read(cap + 1)
-            over = len(data) > cap
-            data = data[:cap]
-            self._note(c, f"read {real} ({len(data)}B)",
-                       0, f"{len(data)} bytes")
             try:
-                text = data.decode("utf-8")
-                return 200, {"session": c.id, "path": real, "bytes": len(data),
-                             "truncated": over, "encoding": "utf-8",
-                             "text": text}
+                with fs.open_read(real) as f:
+                    data = f.read(cap + 1)
+                over = len(data) > cap
+                data = data[:cap]
+                self._note(c, f"read {real} ({len(data)}B)",
+                           0, f"{len(data)} bytes")
+                res = {"session": c.id, "path": real, "bytes": len(data),
+                       "truncated": over}
+            except Exception as e:  # noqa: BLE001
+                if fs.kind != "sftp" or not _is_enoent(e):
+                    raise _fs_error(fs, e, f"读文件 {real}")
+                # 群晖 chroot：/etc/hostname 等 SFTP 不可达 → 命令通道读
+                return 200, self._exec_file(c, "read", path, cap=cap, fs=fs)
+            try:
+                res["encoding"] = "utf-8"
+                res["text"] = data.decode("utf-8")
             except UnicodeDecodeError:
-                return 200, {"session": c.id, "path": real, "bytes": len(data),
-                             "truncated": over, "encoding": "base64",
-                             "content_b64": base64.b64encode(data).decode()}
+                res["encoding"] = "base64"
+                res["content_b64"] = base64.b64encode(data).decode()
+            return 200, res
 
         if method != "POST":
             raise _Fail(405, f"{sub} 要用 POST")
@@ -356,20 +518,30 @@ class ToolKit:
             else:
                 raise _Fail(400, "需要 text 或 content_b64")
             real = fs.normalize(path)
-            with fs.open_write(real) as f:
-                f.write(data)
-            self._note(c, f"write {real} ({len(data)}B)", 0, f"{len(data)} bytes")
-            return 200, {"session": c.id, "path": real, "bytes": len(data),
-                         "ok": True}
+            try:
+                with fs.open_write(real) as f:
+                    f.write(data)
+                self._note(c, f"write {real} ({len(data)}B)", 0, f"{len(data)} bytes")
+                return 200, {"session": c.id, "path": real, "bytes": len(data),
+                             "ok": True}
+            except Exception as e:  # noqa: BLE001
+                if fs.kind != "sftp" or not _is_enoent(e):
+                    raise _fs_error(fs, e, f"写文件 {real}")
+                return 200, self._exec_file(c, "write", path, data=data, fs=fs)
 
         if sub == "mkdir":
             path = str(body.get("path") or "")
             if not path:
                 raise _Fail(400, "需要 path")
             real = fs.normalize(path)
-            fs.mkdir(real)
-            self._note(c, f"mkdir {real}")
-            return 200, {"session": c.id, "path": real, "ok": True}
+            try:
+                fs.mkdir(real)
+                self._note(c, f"mkdir {real}")
+                return 200, {"session": c.id, "path": real, "ok": True}
+            except Exception as e:  # noqa: BLE001
+                if fs.kind != "sftp" or not _is_enoent(e):
+                    raise _fs_error(fs, e, f"建目录 {real}")
+                return 200, self._exec_file(c, "mkdir", path, fs=fs)
 
         if sub == "remove":
             path = str(body.get("path") or "")
@@ -377,10 +549,15 @@ class ToolKit:
                 raise _Fail(400, "需要 path")
             real = fs.normalize(path)
             is_dir = bool(body.get("dir")) or fs.is_dir(real)
-            fs.remove(real, is_dir=is_dir)
-            self._note(c, f"remove {'dir' if is_dir else 'file'} {real}")
-            return 200, {"session": c.id, "path": real, "removed": True,
-                         "dir": is_dir}
+            try:
+                fs.remove(real, is_dir=is_dir)
+                self._note(c, f"remove {'dir' if is_dir else 'file'} {real}")
+                return 200, {"session": c.id, "path": real, "removed": True,
+                             "dir": is_dir}
+            except Exception as e:  # noqa: BLE001
+                if fs.kind != "sftp" or not _is_enoent(e):
+                    raise _fs_error(fs, e, f"删除 {real}")
+                return 200, self._exec_file(c, "remove", path, fs=fs)
 
         if sub == "rename":
             path = str(body.get("path") or "")
@@ -388,9 +565,14 @@ class ToolKit:
             if not path or not to:
                 raise _Fail(400, "需要 path 和 to")
             a, b = fs.normalize(path), fs.normalize(to)
-            fs.rename(a, b)
-            self._note(c, f"rename {a} -> {b}")
-            return 200, {"session": c.id, "from": a, "to": b, "ok": True}
+            try:
+                fs.rename(a, b)
+                self._note(c, f"rename {a} -> {b}")
+                return 200, {"session": c.id, "from": a, "to": b, "ok": True}
+            except Exception as e:  # noqa: BLE001
+                if fs.kind != "sftp" or not _is_enoent(e):
+                    raise _fs_error(fs, e, f"改名 {a}")
+                return 200, self._exec_file(c, "rename", path, to=to, fs=fs)
 
         raise _Fail(404, f"没有这个文件操作：{sub}",
                     "可用：list / read / write / mkdir / remove / rename")

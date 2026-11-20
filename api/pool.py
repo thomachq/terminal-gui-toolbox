@@ -18,6 +18,9 @@
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import shlex
 import threading
 import time
 import traceback
@@ -25,6 +28,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from core.detect import DeviceInfo, detect, dialect_for
+from core.files import SFTPRootMap
 from core.metrics import Sampler
 from core.redact import scrub
 from core.session import (ConnSpec, SessionError, call_tracer,
@@ -97,6 +101,7 @@ class Conn:
     reconnects: int = 0
     last_error: str = ""
     lock: threading.RLock = field(default_factory=threading.RLock)
+    sftp_map: SFTPRootMap | None = None     # SFTP 根映射（惰性探测，重连时清空）
 
     def touch(self) -> None:
         self.last_used = time.time()
@@ -345,22 +350,75 @@ class SessionPool:
         }
 
     # ------------------------------------------------------------ 文件
+    def _sftp_map(self, c: Conn, sftp) -> SFTPRootMap:
+        """惰性探测这台连接的 SFTP 根映射（只探一次，结果挂在 Conn 上）。"""
+        if c.sftp_map is None:
+            runner = None
+            if callable(getattr(c.session, "run", None)):
+                runner = lambda cmd, timeout=8: c.session.run(cmd, timeout=timeout)
+            m = SFTPRootMap(sftp, runner)
+            try:
+                m.probe()
+            except Exception:  # noqa: BLE001
+                pass
+            c.sftp_map = m
+        return c.sftp_map
+
+    @staticmethod
+    def _is_enoent(e: Exception) -> bool:
+        if isinstance(e, FileNotFoundError):
+            return True
+        if getattr(e, "errno", None) == 2:
+            return True
+        t = f"{e}".lower()
+        return "no such file" in t or "not found" in t
+
+    def _exec_run(self, c: Conn, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
+        """在已持 c.lock 的上下文里直接跑命令 + 记审计（不再调 self.exec 避免锁重入）。"""
+        rc, out, err = c.session.run(cmd, timeout=timeout)
+        self._trace(c, cmd, rc, out, err, 0)
+        return rc, out, err
+
     def upload(self, cid: str, path: str, data: bytes) -> dict:
         c = self.get(cid)
         if not path:
             raise PoolError("path 不能为空")
         sess = c.session
         with c.lock:
-            if hasattr(sess, "sftp"):
-                try:
-                    sftp = sess.sftp()
-                    with sftp.file(path, "wb") as f:
-                        f.write(data)
-                    c.touch()
-                    return {"ok": True, "path": path, "bytes": len(data)}
-                except Exception as e:  # noqa: BLE001
-                    raise PoolError(f"SFTP 上传失败：{e}") from e
-        raise PoolError("该协议不支持文件上传")
+            if not hasattr(sess, "sftp"):
+                raise PoolError("该协议不支持文件上传")
+            sftp = sess.sftp()
+            m = self._sftp_map(c, sftp)
+            mapped = m.to_sftp(path)
+            try:
+                with sftp.file(mapped, "wb") as f:
+                    f.write(data)
+                c.touch()
+                return {"ok": True, "path": path, "bytes": len(data),
+                        "sftp_path": mapped if mapped != path else None}
+            except Exception as e:  # noqa: BLE001
+                if not self._is_enoent(e):
+                    raise PoolError(f"SFTP 上传失败：{e}（{m.diag()}）") from e
+                # 群晖 chroot：家目录已在路径映射里覆盖；仍 ENOENT 的（如 /tmp）
+                # 用命令通道 base64 写入，对用户透明。
+                b64 = base64.b64encode(data).decode()
+                chunks = [b64[i:i + 60000] for i in range(0, len(b64), 60000)] or [""]
+                tmp = f"/tmp/.ttb-u-{int(time.time() * 1000)}"
+                setup = f": > {shlex.quote(tmp)} && " + " && ".join(
+                    f"printf '%s' {shlex.quote(ch)} >> {shlex.quote(tmp)}" for ch in chunks)
+                rc, out, err = self._exec_run(c, setup, timeout=60)
+                if rc != 0:
+                    raise PoolError(f"命令通道上传失败（rc={rc}）：{(err or '')[:200]}")
+                parent = path.rsplit("/", 1)[0] if "/" in path else ""
+                cmd = (f"mkdir -p -- {shlex.quote(parent)} && " if parent and parent != "/" else "")
+                cmd += f"base64 -d < {shlex.quote(tmp)} > {shlex.quote(path)} && rm -f -- {shlex.quote(tmp)}"
+                rc, out, err = self._exec_run(c, cmd, timeout=60)
+                if rc != 0:
+                    self._exec_run(c, f"rm -f -- {shlex.quote(tmp)}", timeout=15)
+                    raise PoolError(f"命令通道上传失败（rc={rc}）：{(err or '')[:200]}")
+                c.touch()
+                return {"ok": True, "path": path, "bytes": len(data),
+                        "via": "exec-fallback"}
 
     def download(self, cid: str, path: str, limit: int = 4 * 1024 * 1024) -> dict:
         c = self.get(cid)
@@ -370,19 +428,38 @@ class SessionPool:
         with c.lock:
             if not hasattr(sess, "sftp"):
                 raise PoolError("该协议不支持文件下载")
+            sftp = sess.sftp()
+            m = self._sftp_map(c, sftp)
+            mapped = m.to_sftp(path)
             try:
-                sftp = sess.sftp()
-                st = sftp.stat(path)
+                st = sftp.stat(mapped)
                 if st.st_size and st.st_size > limit:
                     raise PoolError(f"文件太大（{st.st_size} 字节），上限 {limit}")
-                with sftp.file(path, "rb") as f:
+                with sftp.file(mapped, "rb") as f:
                     data = f.read()
                 c.touch()
-                return {"ok": True, "path": path, "bytes": len(data), "data": data}
+                return {"ok": True, "path": path, "bytes": len(data), "data": data,
+                        "sftp_path": mapped if mapped != path else None}
             except PoolError:
                 raise
             except Exception as e:  # noqa: BLE001
-                raise PoolError(f"SFTP 下载失败：{e}") from e
+                if not self._is_enoent(e):
+                    raise PoolError(f"SFTP 下载失败：{e}（{m.diag()}）") from e
+                # /tmp、/etc 等不在 SFTP 根内 → 命令通道读回
+                cmd = f"base64 < {shlex.quote(path)}"
+                rc, out, err = self._exec_run(c, cmd, timeout=60)
+                if rc != 0:
+                    raise PoolError(f"命令通道下载失败（rc={rc}）：{(err or '')[:200]}（{m.diag()}）")
+                joined = "".join((out or "").split())
+                try:
+                    data = base64.b64decode(joined, validate=True)
+                except (binascii.Error, ValueError):
+                    raise PoolError("命令通道读回的内容不是合法 base64")
+                if len(data) > limit:
+                    raise PoolError(f"文件太大（{len(data)} 字节），上限 {limit}")
+                c.touch()
+                return {"ok": True, "path": path, "bytes": len(data), "data": data,
+                        "via": "exec-fallback"}
 
     # ------------------------------------------------------------ 保活
     def _reconnect(self, c: Conn) -> None:
@@ -409,6 +486,7 @@ class SessionPool:
             self._hook(sess, str(spec.get("user") or ""),
                        str(spec.get("host") or ""))
             c.session = sess
+            c.sftp_map = None          # 新会话的 SFTP 根要重新探测
             try:
                 c.sampler = Sampler(sess, c.dialect)
             except Exception:  # noqa: BLE001

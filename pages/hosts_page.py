@@ -695,9 +695,22 @@ class HostsPage:
         if not rec:
             return None
         if col == "act":
-            # #0 树列里并排画了「连接/断开」+「编辑」两个按钮图，按 x 落点
-            # 分发：左半（连接按钮宽内）走连接/断开，右半走编辑。
-            if event.x <= U.px(_CONN_W):
+            # #0 树列里并排画了「连接/断开」+「编辑」两个按钮图。
+            # 关键：树列有个展开三角的缩进（实测 96/150 DPI 下图片从 x≈26
+            # 起画），所以不能用「绝对 x <= 连接按钮宽」分发 —— 那样连接
+            # 按钮右半（26+52 .. 26+78）会被误判成「编辑」，表现为点「断开」
+            # 有时弹出编辑框、有时没反应。先向左扫到本次点击所在图片的左
+            # 边界，再按图内相对坐标分发，缩进/缩放多少都不影响。
+            tree = self.tbl_host.tree
+            img_x0 = event.x
+            try:
+                while img_x0 > 0 and str(
+                        tree.identify_element(img_x0 - 1, event.y)) == "image":
+                    img_x0 -= 1
+            except tk.TclError:
+                img_x0 = 0
+            rel_x = event.x - img_x0
+            if rel_x <= U.px(_CONN_W):
                 self.host_toggle_conn(dict(row))
             else:
                 self.host_edit(dict(rec))

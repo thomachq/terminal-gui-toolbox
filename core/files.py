@@ -249,6 +249,125 @@ class LocalFS(BaseFS):
         return open(p, "wb")
 
 
+# ------------------------------------------------------------------ SFTP 根映射
+class SFTPRootMap:
+    """探测 SFTP 通道的「根」在 shell 视角里到底是哪儿，并做路径映射。
+
+    为什么需要：群晖 DSM 的 internal-sftp 把会话 chroot 到 /volume1 ——
+    `sftp.listdir("/")` 看到的是共享文件夹（homes/backups/docker…），而 shell
+    看到的却是完整文件系统。于是 shell 视角的 /tmp、/etc、
+    /var/services/homes/<user> 在 SFTP 通道里全不存在，文件 API 一律 ENOENT。
+
+    探测靠两件事（都不写远端、不影响对方）：
+      · `sftp.listdir("/")` 的顶层名字 = SFTP 根视图
+      · shell 的 `ls /volume1` 等候选挂载点 = 真实路径候选
+    谁与根视图重合最多，谁就是 SFTP 根对应的 shell 前缀。
+
+    普通 Linux 没有 chroot：根视图含 tmp/etc、shell_root 探测为 "/"，
+    to_sftp() 原样返回 —— 天然不回归（验收标准最后一条）。
+    """
+    CANDIDATES = ("/volume1", "/volume2", "/volume3", "/volumes/CDROM")
+
+    def __init__(self, sftp, runner=None):
+        self.sftp = sftp
+        self.runner = runner            # (cmd, timeout)->(rc,out,err) 或 None
+        self.shell_root = "/"           # SFTP 根对应的 shell 前缀
+        self.top: list[str] = []        # SFTP 根视图顶层名字
+        self.chroot = False
+        self.home_aliases: list[tuple[str, str]] = []   # (shell 前缀, sftp 前缀)
+        self.reason = ""
+        self._done = False
+
+    def _run(self, cmd: str, timeout: int = 8) -> tuple[int, str, str]:
+        if not callable(self.runner):
+            return -1, "", ""
+        try:
+            r = self.runner(cmd, timeout)
+            if isinstance(r, tuple) and len(r) >= 2:
+                return int(r[0]), str(r[1] or ""), str(r[2] or "") if len(r) > 2 else ""
+        except Exception:  # noqa: BLE001
+            pass
+        return -1, "", ""
+
+    def probe(self) -> "SFTPRootMap":
+        if self._done:
+            return self
+        self._done = True
+        try:
+            self.top = [str(x) for x in self.sftp.listdir("/")]
+        except Exception as e:  # noqa: BLE001
+            self.reason = f"读 SFTP 根失败：{type(e).__name__}: {e}"
+            return self
+        top_set = set(self.top)
+        # chroot 的强特征：根视图里没有 Linux 必备的 tmp/etc/usr
+        if {"tmp", "etc", "usr"} & top_set:
+            self.reason = "SFTP 根视图含 /tmp /etc，判断未 chroot"
+            return self
+        # 逐个候选挂载点比对，重合最多者为 shell_root
+        best, best_score = "/", 0
+        for cand in self.CANDIDATES:
+            rc, out, _ = self._run(f"ls -1 {cand} 2>/dev/null", timeout=8)
+            names = {ln.strip() for ln in out.splitlines() if ln.strip()}
+            score = len(names & top_set)
+            if score > best_score:
+                best, best_score = cand, score
+        if best_score >= 2:
+            self.shell_root = best
+            self.chroot = True
+        # 家目录别名：shell 侧 /var/services/homes/<user> ↔ SFTP /homes/<user>
+        # 用 shell 读 passwd 拿真实 home，配合根视图里的 homes 推断。
+        rc, out, _ = self._run("printf %s \"$HOME\"", timeout=8)
+        shell_home = (out or "").strip()
+        user = ""
+        rc2, out2, _ = self._run("id -un", timeout=8)
+        if rc2 == 0 and (out2 or "").strip():
+            user = (out2 or "").strip().splitlines()[-1]
+        if self.chroot and "homes" in top_set and user:
+            # 群晖：shell 家目录是 /var/services/homes/<user>（或符号链接到
+            # /volume1/homes/<user>），SFTP 视角统一是 /homes/<user>。
+            for sh in (f"/var/services/homes/{user}",
+                       f"/volume1/homes/{user}", f"{self.shell_root}/homes/{user}"):
+                self.home_aliases.append((sh, f"/homes/{user}"))
+            if shell_home and shell_home not in {a for a, _ in self.home_aliases}:
+                self.home_aliases.append((shell_home.rstrip("/"), f"/homes/{user}"))
+        self.reason = (
+            f"SFTP 根视图={sorted(top_set)[:8]}… shell 根={self.shell_root} "
+            f"({'chroot' if self.chroot else '无 chroot'})")
+        return self
+
+    def to_sftp(self, path: str) -> str:
+        """shell 视角路径 → SFTP 视角路径。未 chroot 时原样返回。"""
+        p = (path or "").strip().replace("\\", "/")
+        if not p.startswith("/"):
+            p = "/" + p
+        if not self.chroot:
+            return "/" + "/".join(s for s in p.split("/") if s not in ("", "."))
+        # 先替换家目录别名（最长优先，避免 /homes/<user> 被壳前缀吃掉）
+        for sh, sf in sorted(self.home_aliases, key=lambda x: -len(x[0])):
+            if p == sh:
+                return sf
+            if p.startswith(sh + "/"):
+                return sf + p[len(sh):]
+        # 再剥 shell 根前缀
+        root = self.shell_root.rstrip("/")
+        if root and root != "/" and (p == root or p.startswith(root + "/")):
+            rest = p[len(root):]
+            return rest if rest.startswith("/") else ("/" + rest)
+        return "/" + "/".join(s for s in p.split("/") if s not in ("", "."))
+
+    def diag(self) -> str:
+        """给错误响应用的诊断文案。"""
+        if not self._done:
+            self.probe()
+        head = f"SFTP 根视图 {self.top[:8]}（疑似 chroot 于 {self.shell_root}）"
+        if self.home_aliases:
+            ex = self.home_aliases[0][0]
+            head += f"；家目录请用 SFTP 视角如 {self.home_aliases[0][1]}/…（shell 的 {ex}）；"
+        else:
+            head += "；"
+        return head + "/tmp、/etc 不在 SFTP 根内，只能走命令通道；命令执行不受影响"
+
+
 # ------------------------------------------------------------------ SFTP
 class SFTPFS(BaseFS):
     kind = "sftp"
@@ -258,6 +377,7 @@ class SFTPFS(BaseFS):
     def __init__(self, session, start: str | None = None):
         self.session = session
         self._start = start
+        self._rootmap: SFTPRootMap | None = None
 
     # -- 连接
     def _sftp(self):
@@ -267,6 +387,31 @@ class SFTPFS(BaseFS):
         if not callable(fn):
             raise OSError("当前会话不支持 SFTP（Telnet 没有文件传输通道）")
         return fn()
+
+    def _map(self) -> SFTPRootMap:
+        """惰性探测 SFTP 根映射（缓存；探测失败也不能影响正常文件操作）。"""
+        if self._rootmap is None:
+            runner = None
+            if callable(getattr(self.session, "run", None)):
+                runner = lambda cmd, timeout=8: self.session.run(cmd, timeout=timeout)
+            m = SFTPRootMap(self._sftp(), runner)
+            try:
+                m.probe()
+            except Exception:  # noqa: BLE001
+                pass
+            self._rootmap = m
+        return self._rootmap
+
+    def remote(self, path: str) -> str:
+        """normalize + SFTP 根映射：把 shell 视角路径转成 SFTP 视角路径。"""
+        return self._map().to_sftp(self.normalize(path))
+
+    def diagnose(self) -> str:
+        """SFTP 根视图诊断（文件操作失败时给上层拼进错误信息）。"""
+        try:
+            return self._map().diag()
+        except Exception:  # noqa: BLE001
+            return ""
 
     def home(self) -> str:
         if self._start:
@@ -297,7 +442,7 @@ class SFTPFS(BaseFS):
         return "/" + "/".join(parts)
 
     def _attr(self, path: str):
-        return self._sftp().lstat(self.normalize(path))
+        return self._sftp().lstat(self.remote(path))
 
     def is_dir(self, path: str) -> bool:
         try:
@@ -313,7 +458,7 @@ class SFTPFS(BaseFS):
             return False
 
     def listdir(self, path: str) -> list[Entry]:
-        root = self.normalize(path)
+        root = self.remote(path)
         sftp = self._sftp()
         out: list[Entry] = []
         for a in sftp.listdir_attr(root):
@@ -344,10 +489,10 @@ class SFTPFS(BaseFS):
         return sort_entries(out)
 
     def mkdir(self, path: str) -> None:
-        self._sftp().mkdir(self.normalize(path))
+        self._sftp().mkdir(self.remote(path))
 
     def remove(self, path: str, is_dir: bool = False) -> None:
-        p = self.normalize(path)
+        p = self.remote(path)
         sftp = self._sftp()
         if is_dir:
             # 递归删：先清空再删自己
@@ -359,13 +504,13 @@ class SFTPFS(BaseFS):
             sftp.remove(p)
 
     def rename(self, old: str, new: str) -> None:
-        self._sftp().rename(self.normalize(old), self.normalize(new))
+        self._sftp().rename(self.remote(old), self.remote(new))
 
     def open_read(self, path: str):
-        return self._sftp().open(self.normalize(path), "rb")
+        return self._sftp().open(self.remote(path), "rb")
 
     def open_write(self, path: str):
-        return self._sftp().open(self.normalize(path), "wb")
+        return self._sftp().open(self.remote(path), "wb")
 
     def describe(self) -> str:
         s = self.session

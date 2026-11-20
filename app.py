@@ -137,7 +137,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.37"
+APP_VER = "1.0.38"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -2792,8 +2792,12 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self.v_keypw.set(p.get("key_passphrase", "") or "")
         self.v_pw.set(p.get("password", "") or "")
         self.v_sudopw.set(p.get("sudo_password", "") or "")
-        # 本机档案里的两套提权（Linux sudo / Windows UAC）与外壳
-        self.v_elevate.set(bool(p.get("sudo") or p.get("sudo_password")))
+        # 本机档案里的两套提权（Linux sudo / Windows UAC）与外壳。
+        # 自动提权勾只认 `sudo` 这一项：sudo_password 是独立存的口令，
+        # 按需操作（Docker / 防火墙）也要用它，不代表「连上就 sudo -i」。
+        # 以前写成 `sudo or sudo_password`：用户在表单里关掉 sudo 保存后，
+        # 密码还在，再从清单连接时这里又把勾打上，于是「关掉无效」。
+        self.v_elevate.set(bool(p.get("sudo")))
         self.v_admin.set(bool(p.get("elevate")))
         self.v_shell.set(str(p.get("shell") or ""))
         # 新增连接方式（v1.0.33）
@@ -3876,6 +3880,18 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                 self._ws_raise(pane.master)
             except tk.TclError:
                 pass
+            # 终端页签：切回来时必须把焦点交还输入框，否则 ↑ 翻历史 / Tab
+            # 补全的按键落在旧焦点（比如刚才点的页签按钮）上，表现为「上键
+            # 不显示上次命令」。grid() 之后控件才真正映射，聚焦要延后一拍。
+            focus = getattr(pane, "_focus_input", None)
+            if callable(focus):
+                self.after_idle(self._term_refocus, focus)
+
+    def _term_refocus(self, focus) -> None:
+        try:
+            focus()
+        except tk.TclError:
+            pass
 
     def _tab_pane(self, key: str):
         """按页签键找它对应的面板。终端和设置各有一张登记表。"""

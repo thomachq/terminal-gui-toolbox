@@ -34,6 +34,7 @@
 """
 from __future__ import annotations
 
+import os
 import queue
 import time
 import tkinter as tk
@@ -44,6 +45,8 @@ from core.redact import scrub, scrub_cmd
 
 MAX_LINES = 4000          # 超过就从头砍，长跑一晚也不会把内存吃光
 HIST_MAX = 300
+# Tab 补全的内建命令候选（与 _help 里那张表保持一致）。
+BUILTIN_CMDS = ("clear", "cls", "history", "cd", "help", "exit", "quit")
 
 # 记住用户上次选的输入形态（本进程内有效，重开窗口不跳回去）。
 # 默认行内：没有独立输入行，就不会被底部日志面板挤掉（用户 2026-10-25 要求
@@ -221,6 +224,7 @@ class _TermShell:
         self.entry.bind("<Return>", self._submit)
         self.entry.bind("<Up>", self._hist_prev)
         self.entry.bind("<Down>", self._hist_next)
+        self.entry.bind("<Tab>", self._complete)
         self.entry.bind("<Control-l>", lambda e: (self.clear(), "break")[1])
         self.entry.bind("<Control-c>", self._sigint)
 
@@ -306,6 +310,7 @@ class _TermShell:
             "<KP_Enter>": self._submit,
             "<Up>": self._hist_prev,
             "<Down>": self._hist_next,
+            "<Tab>": self._complete,
             "<Control-l>": lambda e: (self.clear(), "break")[1],
             "<Control-c>": self._sigint,
             "<Key>": self._clamp_key,
@@ -598,6 +603,58 @@ class _TermShell:
             self.entry.icursor("end")
         return "break"
 
+    # ------------------------------------------------------------ Tab 补全
+    def _completion_pool(self) -> list[str]:
+        """补全候选：内建命令 + 历史命令（去重、保序）。
+
+        远端文件/目录名要发命令查，补一次敲一回不划算，也不该伪造 —— 这里
+        只补「指令」（命令名）。用户敲过的命令最该回来，所以 `_hist` 也算。
+        """
+        pool: list[str] = []
+        seen: set[str] = set()
+        for c in (*BUILTIN_CMDS, *self._hist):
+            # 历史里存的是整行，取第一个词才是命令名
+            word = str(c or "").strip().split()[0] if str(c or "").strip() else ""
+            if word and word not in seen:
+                seen.add(word)
+                pool.append(word)
+        return pool
+
+    def _complete(self, _e=None):
+        """Tab 补全当前正敲的那个词（行尾 token）。
+
+        · 唯一候选：补全到整个词；
+        · 多个候选：补到公共前缀，并把候选列出来让用户再敲一个字；
+        · 没候选：原样不动（绝不打断输入）。
+        返回 "break" 阻止 Tab 把焦点挪到别的控件上去。
+        """
+        try:
+            line = self._get_input()
+        except tk.TclError:
+            return "break"
+        # 光标前的最后一个词：行尾若有空格，补的是「新词」（空前缀=列出全部）
+        word = line.rsplit(" ", 1)[-1] if line else ""
+        prefix = word.strip()
+        try:
+            pool = self._completion_pool()
+        except tk.TclError:
+            pool = []
+        matches = [c for c in pool if c.startswith(prefix)]
+        matches = list(dict.fromkeys(matches))   # 去重保序
+        if not matches:
+            return "break"
+        if len(matches) == 1:
+            done = matches[0]
+        else:
+            done = os.path.commonprefix(matches)
+            self.write("  ".join(matches) + "\n", "meta")
+        # 把行尾那个词换成补全结果，前面的命令/参数原样保留
+        head = line[: len(line) - len(word)]
+        self._set_input(head + done)
+        if self.mode != "inline":
+            self.entry.icursor("end")
+        return "break"
+
     def _sigint(self, _e=None):
         if self._busy:
             self._cancel = True
@@ -715,7 +772,8 @@ class _TermShell:
             "  clear / cls   清屏        history   历史\n"
             "  cd <目录>     换目录       help      这条\n"
             "  exit / quit   关闭窗口\n"
-            "其它一律原样发到当前会话执行。Ctrl+L 清屏，↑↓ 翻历史，Ctrl+C 放弃等待。\n",
+            "其它一律原样发到当前会话执行。\n"
+            "Ctrl+L 清屏，↑↓ 翻历史，Tab 补全指令（内建 + 历史），Ctrl+C 放弃等待。\n",
             "meta")
 
     # ------------------------------------------------------------ 生命周期
