@@ -265,6 +265,24 @@ chk(keys.index("status") > 1, "状态列排在这两个动作列之后", keys)
 chk("act" in row_of("winsrv"), "行模型里有动作列取值")
 eq(row_of("winsrv").get("act"), "连接", "动作列文字是「连接」")
 
+# ---- 行首「连接」按钮：树的 #0 列放图片（ttk data 列放不了按钮）
+chk(tbl._use_tree_icon, "主机表启用了树列图片")
+eq(tbl._icon_col, "act", "图片列是行首 act 列")
+chk(hasattr(win, "host_toggle_conn"), "有连接/断开切换入口")
+imgs = HP._conn_button_images()
+chk("conn" in imgs and "disc" in imgs, "连接/断开两张按钮图都加载了")
+chk(win._host_button_icon(row_of("winsrv")) is imgs.get("conn"),
+    "未连接那台给蓝色「连接」图")
+applied.clear(); conns.clear()
+tgt_idx = [i for i, r in enumerate(tbl.rows()) if r.get("name") == "winsrv"][0]
+tbl.select_index(tgt_idx)
+pump(win, 0.1)
+win.host_connect_sel()
+pump(win, 0.2)
+chk(bool(applied) and applied[-1].get("name") == "winsrv",
+    "行首按钮连接作用于那一行", [a.get("name") for a in applied])
+eq(len(conns), 1, "点行首按钮真的发起连接")
+
 # ================================================================== 5. 状态列
 sec("5. 状态列")
 
@@ -306,12 +324,31 @@ class _FakeSlot:
     def alive(self):
         return True
 
+    def close(self):
+        pass
 
+
+_FakeSlot.sid = "fakesid1"
 win.sessions._slots.append(_FakeSlot())
 win.host_refresh()
 pump(win, 0.3)
 eq(row_of("winsrv").get("status"), "● 已连接", "有活会话时优先显示「已连接」")
-win.sessions._slots.pop()
+
+# ---- 行首按钮：已连接那台给红色「断开」图，点一下真断开
+sec("5b. 行首按钮随状态切换（连接→断开）")
+chk(win._host_button_icon(row_of("winsrv")) is imgs.get("disc"),
+    "已连接那台给红色「断开」图")
+disconnected = []
+win._term_forget = lambda sid, _d=disconnected: _d.append(sid)
+win.host_toggle_conn(dict(row_of("winsrv")))
+pump(win, 0.2)
+eq(disconnected, ["fakesid1"], "点「断开」清掉那台的终端页签")
+chk(not any(getattr(s, "sid", "") == "fakesid1" for s in win.sessions.slots()),
+    "点「断开」真的把会话从槽位移除")
+chk(win._host_button_icon(row_of("winsrv")) is imgs.get("conn"),
+    "断开后那台的行首图回蓝色「连接」")
+
+win.sessions._slots.pop() if win.sessions.slots() else None
 
 # ================================================================== 6. 端口探测
 sec("6. probe_host 只做一次握手")

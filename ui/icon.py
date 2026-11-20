@@ -22,16 +22,22 @@ def apply_icon(win, ico: str | Path | None) -> bool:
     p = Path(ico)
     if not p.is_file():
         return False
+    # 两个都要设，且**当前窗口优先**：`iconbitmap(default=...)` 只改「新窗口的
+    # 默认图标」，不一定改到已经建好的这个窗口 —— 单用它的后果是标题栏/任务栏
+    # 仍是 Tk 羽毛图标（托盘却是自定义图标，因为托盘走 LoadImageW 独立加载）。
+    # 用户报过这个：任务栏羽毛、托盘和标题栏正常，根因就在这句 return 太早。
+    ok = False
     try:
-        win.iconbitmap(default=str(p))
-        return True
+        win.iconbitmap(str(p))      # 当前窗口（标题栏 + 任务栏缩略图）
+        ok = True
     except Exception:  # noqa: BLE001
         pass
     try:
-        win.iconbitmap(str(p))
-        return True
+        win.iconbitmap(default=str(p))   # 之后新建的 Toplevel 继承
+        ok = True
     except Exception:  # noqa: BLE001
-        return False
+        pass
+    return ok
 
 
 def set_app_id(app_id: str = "TerminalToolbox.App.1") -> None:

@@ -14,6 +14,7 @@ import socket
 import sys
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox
 
 import wbtui as U
@@ -23,12 +24,55 @@ from core import proxies as P
 from ui import forms
 from ui.table import Column, DataTable, Segmented
 
+# 行首「连接 / 断开」按钮小图（由 _mkconnbtn.py 生成，运行时只读 PNG，
+# 不依赖 Pillow）。ttk.Treeview 的 data 列放不了按钮，只有 #0 树列支持
+# image=，所以主机表用 DataTable 的 icon_col 把它们画在行首。
+_ASSETS = Path(__file__).resolve().parent.parent / "assets"
+_BTN_IMG: dict[str, tk.PhotoImage] = {}
+_BTN_BASE_W = 102          # 按钮组图的 96 DPI 基准宽（连接 + 编辑两按钮）
+_CONN_W = 52               # 左半「连接/断开」按钮的基准宽（点击分发用）
+_BTN_SRC_W = 306           # PNG 实际宽度 = 基准 × 3
+
+
+def _scaled_photo(src: tk.PhotoImage, target_w: int) -> tk.PhotoImage:
+    """把 3x 超采样图缩放到目标宽度（= 基准 × 当前 DPI）。
+
+    zoom/subsample 只收整数，用最简分数逼近缩放比，兼顾 100/125/150/200%
+    缩放；先 zoom 再 subsample，保证 3x 源图的清晰度不浪费。
+    """
+    from fractions import Fraction
+    sw = src.width()
+    if target_w <= 0 or sw == target_w:
+        return src
+    ratio = Fraction(target_w, sw).limit_denominator(8)
+    img = src
+    if ratio.numerator > 1:
+        img = img.zoom(ratio.numerator)
+    if ratio.denominator > 1:
+        img = img.subsample(ratio.denominator)
+    return img
+
+
+def _conn_button_images() -> dict[str, tk.PhotoImage]:
+    if not _BTN_IMG:
+        target = U.px(_BTN_BASE_W)
+        for key in ("conn", "disc"):
+            p = _ASSETS / f"btns_{key}.png"
+            if p.is_file():
+                try:
+                    _BTN_IMG[key] = _scaled_photo(
+                        tk.PhotoImage(file=str(p)), target)
+                except tk.TclError:
+                    pass
+    return _BTN_IMG
+
+
 HOST_COLS = [
     # 最左两列是动作列：连接 / 编辑。
     # 表格单元格只能是文字（ttk.Treeview 没法给单个格子塞真按钮），
     # 所以这两列靠 _host_row_click 按列名分发点击 —— 点哪列就是哪个动作。
-    Column("act", "", 54, anchor="center"),
-    Column("edit", "", 34, anchor="center"),
+    Column("act", "", 116, anchor="w"),   # #0 树列：连接/断开 + 编辑两个按钮图（右侧留白，别贴住「未检测」）
+    Column("edit", "", 34, anchor="center"),  # 由图片代理，实际隐藏（保留供逻辑/测试）
     Column("status", "状态", 74),
     Column("name", "名称", 150, stretch=True),
     Column("addr", "地址", 176, mono=True),
@@ -489,7 +533,8 @@ class HostsPage:
             empty_title="还没有主机",
             empty_hint="点左上角「添加主机」建一条，或「导入主机」从 ~/.ssh/config 拉过来。",
             on_activate=self.host_connect_row,
-            on_select=lambda r: None)
+            on_select=lambda r: None,
+            icon_col=["act", "edit"], icon_of=self._host_button_icon)
         self.tbl_host.grid(row=0, column=0, sticky="nsew")
         self.tbl_host.set_menu([
             ("连接", lambda: self.host_connect_row(self._host_pick()), None),
@@ -548,6 +593,91 @@ class HostsPage:
             return
         self.host_edit(rec)
 
+    def _host_live_sid(self, rec: dict) -> str:
+        """这一行档案当前连着的会话 sid；没连返回空串。
+
+        匹配口径和 _host_status 完全一致（host + port），避免「状态列显示已
+        连接、按钮却显示连接」这种自相矛盾。本机不占 slot，返回空串。
+        """
+        if H.proto_of(rec) == "local":
+            return ""
+        host = str(rec.get("host") or "").strip().lower()
+        port = str(rec.get("port") or "").strip()
+        if not host or not hasattr(self, "sessions"):
+            return ""
+        for slot in self.sessions.slots():
+            sess = getattr(slot, "session", None)
+            if sess is None:
+                continue
+            if str(getattr(sess, "host", "") or "").lower() != host:
+                continue
+            if port and str(getattr(sess, "port", "") or "") not in ("", port):
+                continue
+            try:
+                if slot.alive():
+                    return str(getattr(slot, "sid", "") or "")
+            except Exception:  # noqa: BLE001
+                continue
+        return ""
+
+    def _host_is_live(self, rec: dict) -> bool:
+        """这一行档案此刻是否连着（本机按本机会话，其它按会话池 host+port）。"""
+        if H.proto_of(rec) == "local":
+            return self._local_live()
+        return bool(self._host_live_sid(rec))
+
+    def _host_button_icon(self, row: dict):
+        """DataTable 的 icon_of 回调：已连接给「断开」红图，否则「连接」蓝图。"""
+        imgs = _conn_button_images()
+        if not imgs:
+            return None
+        rec = (row or {}).get("_raw") or row or {}
+        return imgs.get("disc" if self._host_is_live(rec) else "conn")
+
+    def host_disconnect_row(self, rec: dict) -> None:
+        """断开这一行档案对应的会话（本机走 _disconnect）。"""
+        keep_name = str(rec.get("name") or "")
+        if H.proto_of(rec) == "local":
+            self._disconnect()
+        else:
+            sid = self._host_live_sid(rec)
+            if sid:
+                self.sessions.close(sid)
+                self._term_forget(sid)
+                self._after_switch()
+        self.toast("已断开连接", "ok")
+        self.host_refresh()
+        # 断开只改连接态、不该让用户丢掉选中行 —— 保留选中，按钮直接变回
+        # 「连接」，再点一次就能重连（用户「直接断开」的诉求要能来回切）。
+        if keep_name:
+            for i, r in enumerate(self.tbl_host.rows()):
+                if str(r.get("name") or "") == keep_name:
+                    self.tbl_host.select_index(i)
+                    break
+
+    def host_toggle_conn(self, row: dict | None = None) -> None:
+        """行首按钮：这一行已连接就断开，否则连接。
+
+        `row` 由表格点击传入；不传则作用于选中行。连接成功后 do_connect 的
+        ok() 会刷新主机页，行首图片随之从蓝「连接」变红「断开」。
+        """
+        rec = ((row or {}).get("_raw") or row or {}) if row else self._host_pick()
+        if not rec:
+            self.toast("先选一行主机（也可以双击主机行连接）", "warn")
+            return
+        if self._host_is_live(rec):
+            self.host_disconnect_row(rec)
+        else:
+            self.host_connect_row(rec)
+
+    def host_connect_sel(self) -> None:
+        """旧入口：始终连接选中行（保留给老脚本/测试）。"""
+        rec = self._host_pick()
+        if not rec:
+            self.toast("先选一行主机，再点「连接」（也可以双击主机行）", "warn")
+            return
+        self.host_connect_row(rec)
+
     def _host_row_click(self, event):
         """点行首的动作列：左起第一列「连接」，第二列「✎」编辑。
 
@@ -565,7 +695,12 @@ class HostsPage:
         if not rec:
             return None
         if col == "act":
-            self.host_connect_row(dict(row))
+            # #0 树列里并排画了「连接/断开」+「编辑」两个按钮图，按 x 落点
+            # 分发：左半（连接按钮宽内）走连接/断开，右半走编辑。
+            if event.x <= U.px(_CONN_W):
+                self.host_toggle_conn(dict(row))
+            else:
+                self.host_edit(dict(rec))
         else:
             self.host_edit(dict(rec))
         return "break"

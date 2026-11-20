@@ -153,9 +153,20 @@ class DataTable(tk.Frame):
                  searchable: bool = True, search_hint: str = "搜索…",
                  empty_title: str = "暂无数据", empty_hint: str = "",
                  on_activate=None, on_select=None, bg_role: str = "card",
-                 row_h: int | None = None):
+                 row_h: int | None = None, icon_col: str | None = None,
+                 icon_of=None):
         super().__init__(master, bg=U.T.card, bd=0)
         self.columns = list(columns)
+        # 可选「图片动作列」：ttk.Treeview 的 data 列只能放文字，只有树列 #0
+        # 支持 image=。主机清单的行首要放真正的按钮小图（连接/断开），就把那一
+        # 列的 key 传进来，并为每行提供 icon_of(row)->PhotoImage。默认 None，
+        # 其它表零影响。分组模式(#0 另有其用)与之互斥，设了分组就忽略这里。
+        # icon_col 可传单个 key 或一组 key：一组时第一个是主列（#0 点击返回它），
+        # 全部都从 displaycolumns 里藏起来 —— 一行图片里画多个按钮时就这么用。
+        self._icon_cols = ([icon_col] if isinstance(icon_col, str)
+                           else list(icon_col or []))
+        self._icon_col = self._icon_cols[0] if self._icon_cols else None
+        self._icon_of = icon_of
         self._rows: list[dict] = []
         self._view: list[dict] = []
         self._sort_key: str | None = None
@@ -225,7 +236,16 @@ class DataTable(tk.Frame):
         self.table_wrap = tk.Frame(self, bg=U.T.card, bd=0)
         self.table_wrap.pack(fill="both", expand=True)
         keys = [c.key for c in self.columns]
-        self.tree = ttk.Treeview(self.table_wrap, columns=keys, show="headings",
+        self._use_tree_icon = bool(self._icon_col and self._icon_col in keys)
+        if self._use_tree_icon:
+            # #0 树列专门放动作按钮图，这些列的文字不再重复显示
+            show = "tree headings"
+            display = [k for k in keys if k not in self._icon_cols]
+        else:
+            show = "headings"
+            display = keys
+        self.tree = ttk.Treeview(self.table_wrap, columns=keys, show=show,
+                                 displaycolumns=display,
                                  height=height, selectmode="browse")
         self._apply_columns()
         self.sb = ttk.Scrollbar(self.table_wrap, orient="vertical",
@@ -292,6 +312,12 @@ class DataTable(tk.Frame):
 
     def _apply_columns(self) -> None:
         """按定义把列建出来。stretch 一律 False —— 拉伸自己算（见 _refit_columns）。"""
+        if self._use_tree_icon:
+            ic = next((c for c in self.columns if c.key == self._icon_col), None)
+            if ic is not None:
+                self.tree.heading("#0", text=ic.title)
+                self.tree.column("#0", width=self._width_of(ic.key),
+                                 minwidth=U.px(44), anchor=ic.anchor, stretch=False)
         for c in self.columns:
             self.tree.heading(c.key, text=c.title,
                               command=lambda k=c.key: self._sort_by(k))
@@ -319,7 +345,7 @@ class DataTable(tk.Frame):
         avail -= U.px(2)
         # 分组模式下最左边那列（#0）是实打实占宽的，不算进来的话
         # 一组模型就会平白多出一条横向滚动条。
-        if self._group_key:
+        if self._group_key or self._use_tree_icon:
             try:
                 avail -= int(self.tree.column("#0", "width")) + U.px(4)
             except tk.TclError:
@@ -591,9 +617,11 @@ class DataTable(tk.Frame):
         except ValueError:
             return ""
         if n == 0:
-            return "#0"
+            # 树列：分组模式是组头；icon 模式是动作按钮列，点击要能触发行动作
+            return self._icon_col if self._use_tree_icon else "#0"
         keys = [c.key for c in self.columns
-                if not self._group_key or c.key != self._group_key]
+                if (not self._group_key or c.key != self._group_key)
+                and not (self._use_tree_icon and c.key in self._icon_cols)]
         return keys[n - 1] if 0 < n <= len(keys) else ""
 
     def row_at(self, y: int) -> dict | None:
@@ -740,7 +768,13 @@ class DataTable(tk.Frame):
             try:
                 # iid 用序号：排序/过滤后仍能反查 _view
                 iid = str(i)
-                self.tree.insert("", "end", iid=iid, values=vals, tags=tuple(tags))
+                kw = {}
+                if self._use_tree_icon and self._icon_of:
+                    img = self._icon_of(row)
+                    if img is not None:
+                        kw["image"] = img
+                self.tree.insert("", "end", iid=iid, values=vals,
+                                 tags=tuple(tags), **kw)
             except tk.TclError:
                 continue
             self._iid_row[iid] = row

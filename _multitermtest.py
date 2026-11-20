@@ -188,6 +188,24 @@ def main() -> int:
     chk(app._term_key(slot2b.sid) in app._term_panes, "新会话开了新页签",
         str(list(app._term_panes)))
 
+    print("\n[H] 连新设备不再掐断旧设备（do_connect 的 work 不再无条件 close）")
+    import inspect
+    src = inspect.getsource(A.ToolboxApp.do_connect)
+    # work() 内部不得再有 `old = self.session; old.close()` —— 那是单设备时代
+    # 「换连接先关旧的」遗留，连第二台时把第一台关掉，是用户报的核心 bug。
+    body = src.split("def work():", 1)[-1].split("def ok(", 1)[0]
+    chk("old.close()" not in body and ".close()" not in body,
+        "do_connect.work() 里没有无条件关闭当前会话",
+        [ln.strip() for ln in body.splitlines() if "close()" in ln])
+    # 行为：当前活动是 A 时再连 B，A 仍活着（会话池 add 不碰别的槽位）
+    sa = FakeSession("10.9.0.1", name="A")
+    sb = FakeSession("10.9.0.2", name="B")
+    sla = app.sessions.add(sa, dev("A"), "A")
+    app.sessions.set_active(sla.sid)
+    app.sessions.add(sb, dev("B"), "B")     # 连第二台，等价于 do_connect 的 ok()
+    chk(sa.alive, "连第二台后第一台还活着（没被掐断）")
+    chk(sb.alive and app.session is sb, "新连的第二台成为当前会话")
+
     print("\n[结果]")
     print(f"  PASS {PASS} / FAIL {FAIL}")
     if FAILED:

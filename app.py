@@ -137,7 +137,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.36"
+APP_VER = "1.0.37"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -3217,12 +3217,11 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
                 return messagebox.showwarning("缺少参数", "请填登录密码", parent=self)
 
         def work():
-            old = self.session
-            if old:
-                try:
-                    old.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            # 多设备并存：不再无条件关闭当前会话。单设备时代「换连接先关旧的」
+            # 会在连第二台时把第一台掐断 —— 槽位还在、会话却死了，设备标签变
+            # 「离线」、终端页签变成打不开的空壳。关闭旧会话的职责现在归两处：
+            # sessions.add() 在重连同一台（key 相同）时替换并 close（core/
+            # sessionmgr.py），以及用户主动断开（_disconnect / _close_device）。
             s = open_session(spec)
             s.tracer = self._trace_cmd
             # 先探测出「对方到底是什么」，再决定提权怎么提：
@@ -4952,6 +4951,12 @@ def main():
         return
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 任务栏图标身份必须**早于第一个 Tk 窗口**设置：AppUserModelID 一旦在窗口
+    # 建好之后才调，explorer 已把这个进程归到 python.exe / 默认组，任务栏就顶着
+    # Tk 羽毛图标 —— 哪怕标题栏、托盘都是对的（用户截图就是这个现象）。
+    # ToolboxApp.__init__ 里那次是兜底（测试脚本直接 new App 不走 main）。
+    set_app_id("TerminalToolbox.App.1")
 
     # 隧道控制台已经内嵌在「隧道服务管理」页里，不再有 --vpncert 子进程形态。
     # 想单独调它可以直接 `python vpncert_gui.py`（它自己能独立跑）。

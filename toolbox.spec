@@ -72,6 +72,9 @@ a = Analysis(
     # 地址库（常用网段/省级/国家）也在这里：~3.8 MB，离线可用，
     # 用户点「更新地址库」时写的是 data/iplib（覆盖内置这份）。
     datas=[('assets/app.ico', 'assets'), ('assets/app.png', 'assets'),
+           # 主机清单行首「连接/断开 + 编辑」按钮图（v1.0.37）：运行时只读，
+           # 本机安装目录没有 assets\，必须靠 _MEIPASS 才能找到，漏了按钮就没了。
+           ('assets/btns_conn.png', 'assets'), ('assets/btns_disc.png', 'assets'),
            ('assets/iplib', 'assets/iplib')],
     hiddenimports=hidden,
     hookspath=[],
