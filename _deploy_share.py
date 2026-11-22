@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """把当前版本的交付物推到医院共享目录。
 
-用法：python _deploy_share.py [1.0.6]
+用法：python _deploy_share.py [1.0.6] [--verify-hash]
 不给版本号就用 _pack_release.py 里的 VER。
+默认「大小相同就跳过」（SMB 读几十 MB 算哈希慢）；`--verify-hash` 改成比
+SHA-256，用来识破「大小相同但内容不同」—— 2026-11-22 真踩过这个坑。
 
 共享盘是 SMB，`os.replace`（MoveFileEx + REPLACE_EXISTING）在这台 NAS 上
 会被拒（WinError 5：拒绝访问），但 `shutil.move` 走 copy+unlink 能成。
@@ -12,6 +14,7 @@
 不能像 v1.0.6 那轮一样 `continue` 掉——那次工具包和知识库的旧文件没挪动，
 结果两个包整轮都没更新（虽然内容是旧的同版本，但逻辑上就是漏了）。
 """
+import hashlib
 import re
 import shutil
 import sys
@@ -20,6 +23,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DST = Path(r"\\192.168.3.12\Public\软件\AI生成的应用\terminal-gui-toolbox")
 OLD = DST / "old"
+
+# 常驻文档（不带版本号、内容随版本演进、同名覆盖）：(仓库内相对路径, 共享目录里的名字)
+# 2026-11-22 起把需求及问题管理三件套也纳入 —— 它们回答「用户要什么 / 做到什么
+# 程度 / 还欠什么」，和交接说明一样是接手的人必读，不能只活在 git 里。
+STAY_DOCS = [
+    ("docs/发布链说明.md", "发布链说明.md"),
+    ("docs/terminal-gui-toolbox-deb构建说明.md", "terminal-gui-toolbox-deb构建说明.md"),
+    ("需求及问题处理清单.md", "需求及问题处理清单.md"),
+    ("任务清单.md", "任务清单.md"),
+    ("未完成待办.md", "未完成待办.md"),
+]
+
+
+def stay_missing() -> list[str]:
+    """常驻文档里仓库侧缺了哪些源文件。
+
+    以前常驻文档缺失只打一行「跳过（本地没有）」，混在几十行输出里没人看见
+    （交接说明与 deb 说明因此在共享盘上卡了七个版本）。现在缺一份就整轮拒绝。
+    """
+    return [name for rel, name in STAY_DOCS if not (ROOT / rel).is_file()]
 
 
 def ver() -> str:
@@ -86,6 +109,46 @@ def archive(p: Path, name: str) -> None:
         print("  留档也失败（不影响交付）:", e)
 
 
+def sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def put(src: Path, name: str, verify: bool = False) -> bool:
+    """把 src 写到共享目录的 name。
+
+    默认按 size 判「同一份就跳过」（SMB 上读几十 MB 的哈希慢，不值得每次付）。
+    `--verify-hash` 时改比 SHA-256 —— 2026-11-22 真踩到：`任务清单.md` 内容改了
+    但字节数恰好相同，默认策略把新文件判成「一样」直接跳过，共享盘上留下旧内容。
+    那条正是交接说明 §7-7 预警过的坑，现在有开关可以显式规避。
+    """
+    dst = DST / name
+    if dst.is_file() and dst.stat().st_size == src.stat().st_size:
+        if not verify:
+            print("尺寸一致，跳过覆盖", name)
+            return True
+        if sha256(dst) == sha256(src):
+            print("哈希一致，跳过覆盖", name)
+            return True
+        print("  尺寸相同但内容不同，强制覆盖", name)
+    if dst.is_file():
+        archive(dst, name)
+        if dst.is_file():
+            # 归档没把它挪走 → 现在写进去一定被拒（共享盘不允许覆盖）
+            print("  !! 旧文件挪不走，无法写入：", name)
+            return False
+    try:
+        shutil.copyfile(src, dst)
+    except PermissionError:
+        print("  !! 写入被拒（共享盘不允许覆盖已存在文件）：", name)
+        return False
+    print("  已写 %-52s %7.1f KB" % (name, dst.stat().st_size / 1024))
+    return True
+
+
 def main() -> int:
     v = ver()
     if not v:
@@ -111,52 +174,32 @@ def main() -> int:
         print("   先跑 python _pack_release.py 补齐，再来分发。")
         return 2
 
-    OLD.mkdir(exist_ok=True)
+    smiss = stay_missing()
+    if smiss:
+        print(f"!! 常驻文档缺 {len(smiss)} 份源文件，拒绝部署：")
+        for m in smiss:
+            print("   -", m)
+        return 2
 
-    print(f"→ {DST}   (v{v})")
+    OLD.mkdir(exist_ok=True)
+    verify = "--verify-hash" in sys.argv
+
+    print(f"→ {DST}   (v{v})" + ("   [--verify-hash]" if verify else ""))
     for name in files(v):
         src = src_dir / name
         if not src.is_file():          # 预检已保证不会走到这
             print("!! 预检漏了，运行时才发现缺文件：", name)
             return 1
-        dst = DST / name
-        if dst.is_file() and dst.stat().st_size == src.stat().st_size:
-            print("尺寸一致，跳过覆盖", name)
-            continue
-        if dst.is_file():
-            archive(dst, name)
-            if dst.is_file():
-                # 归档没把它挪走 → 现在写进去一定被拒（共享盘不允许覆盖）
-                print("  !! 旧文件挪不走，无法写入：", name)
-                continue
-        try:
-            shutil.copyfile(src, dst)
-        except PermissionError:
-            print("  !! 写入被拒（共享盘不允许覆盖已存在文件）：", name)
-            continue
-        print("  已写 %-52s %7.1f MB" % (name, dst.stat().st_size / 1048576))
+        put(src, name, verify)
 
     # 常驻文档：不代表具体版本，但每次发版都要给最新的一份。
-    # 它们不在 _release/v<ver>/ 里（不随版本变化），所以单独从 docs/ 拷。
-    for doc in ("发布链说明.md", "terminal-gui-toolbox-deb构建说明.md"):
-        src = ROOT / "docs" / doc
+    # 它们不在 _release/v<ver>/ 里（不随版本变化），所以单独从仓库拷。
+    for rel, doc in STAY_DOCS:
+        src = ROOT / rel
         if not src.is_file():
-            print("  !! 缺常驻文档（跳过）：", doc)
+            print("  !! 缺常驻文档（预检已保证不会走到这）：", doc)
             continue
-        dst = DST / doc
-        if dst.is_file() and dst.stat().st_size == src.stat().st_size:
-            print("尺寸一致，跳过覆盖", doc)
-            continue
-        if dst.is_file():
-            archive(dst, doc)
-            if dst.is_file():
-                print("  !! 旧文件挪不走，无法写入：", doc)
-                continue
-        try:
-            shutil.copyfile(src, dst)
-            print("  已写 %-52s %7.1f KB" % (doc, dst.stat().st_size / 1024))
-        except PermissionError:
-            print("  !! 写入被拒（共享盘不允许覆盖已存在文件）：", doc)
+        put(src, doc, verify)
 
     # v1.0.35 起源码包名带上版本号；共享盘上那份老的无版本号包已经没用了，
     # 但和它同一目录并存会让人分不清该下哪个 —— 挪进 old/ 归档（共享盘
@@ -187,6 +230,18 @@ def main() -> int:
     if bad:
         print("!! 大小不符（这几个没真正落地）：", bad)
         return 1
+    if verify:
+        # --verify-hash 时连常驻文档一起按 SHA-256 复核：同大小不同内容正是
+        # 默认策略的盲区，既然付了哈希的代价，就别只验一半。
+        hbad = [name for src, name in
+                [(src_dir / n, n) for n in files(v)] +
+                [(ROOT / rel, doc) for rel, doc in STAY_DOCS]
+                if not (DST / name).is_file() or sha256(DST / name) != sha256(src)]
+        if hbad:
+            print("!! 哈希不符（这几个内容不对）：", hbad)
+            return 1
+        print("全部就位（大小 + SHA-256 逐个核对过）")
+        return 0
     print("全部就位（大小逐个核对过）")
     return 0
 

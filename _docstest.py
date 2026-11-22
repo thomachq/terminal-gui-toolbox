@@ -187,6 +187,9 @@ with zipfile.ZipFile(kb) as zf:
     base = [n.split("/")[-1] for n in nl]
     chk("terminal-gui-toolbox项目交接说明.md" in nl, "知识库含交接说明成品")
     chk("docs/terminal-gui-toolbox-deb构建说明.md" in nl, "知识库含通用版 deb 说明")
+    # 2026-11-22 起：需求及问题管理三件套必须进知识库（问责台账 + 批次 + 欠账）
+    for _n in ("需求及问题处理清单.md", "任务清单.md", "未完成待办.md"):
+        chk(_n in nl, f"知识库含 {_n}")
     chk(not [n for n in base if n.startswith("模板-")],
         "知识库不含模板本体", str([n for n in base if n.startswith("模板-")][:3]))
     chk(not [n for n in nl if n.endswith("/query") or n == "query"],
@@ -195,6 +198,56 @@ with zipfile.ZipFile(kb) as zf:
     chk(f"v{VER}" in body.splitlines()[2], "包内交接说明头部版本正确",
         body.splitlines()[2])
     chk(PH.search(body) is None, "包内交接说明无占位符残留")
+
+
+# ---------------------------------------------------------------- 7
+sec("7. 常驻文档（2026-11-22 起五份）")
+chk(len(DP.STAY_DOCS) == 5, "常驻文档五项（发布链 / deb 说明 / 三件套）",
+    str(len(DP.STAY_DOCS)))
+chk(DP.stay_missing() == [], "仓库侧常驻文档源文件齐全", str(DP.stay_missing()))
+_rels = [rel for rel, _ in DP.STAY_DOCS]
+chk(all((PK.HERE / r).is_file() for r in _rels), "STAY_DOCS 里的路径都真实存在",
+    str([r for r in _rels if not (PK.HERE / r).is_file()]))
+
+# 看板不许过期：正文改了没重跑 _issueboard.py，发版闸门会拦
+import subprocess  # noqa: E402
+_rc = subprocess.run([sys.executable, str(PK.HERE / "_issueboard.py"), "--check"],
+                     capture_output=True, text=True,
+                     encoding="utf-8", errors="replace").returncode
+chk(_rc == 0, "需求清单看板未过期（_issueboard.py --check）", f"rc={_rc}")
+
+
+# ---------------------------------------------------------------- 8
+sec("8. put() 的同大小不同内容（R-008 / 交接说明 §7-7）")
+import shutil as _sh  # noqa: E402
+import tempfile as _tf  # noqa: E402
+
+_tmp = Path(_tf.mkdtemp(prefix="_puttest_"))
+_src = _tmp / "a.md"
+_src.write_text("aaa", encoding="utf-8")
+_dp = _tmp / "dp"
+_dp.mkdir()
+_old_dst, _old_old = DP.DST, DP.OLD
+DP.DST, DP.OLD = _dp, _dp / "old"
+DP.OLD.mkdir()
+try:
+    chk(DP.put(_src, "同.md") is True, "首次写入成功")
+    chk(DP.put(_src, "同.md", verify=True) is True
+        and not (DP.OLD / "同.md").exists(), "哈希一致 -> 跳过且不归档")
+
+    _src2 = _tmp / "b.md"
+    _src2.write_text("bbb", encoding="utf-8")      # 同长度、不同内容
+    chk(_src.stat().st_size == _src2.stat().st_size, "构造出「同大小不同内容」")
+    chk(DP.put(_src2, "同.md") is True
+        and (_dp / "同.md").read_text(encoding="utf-8") == "aaa",
+        "默认策略确实会漏（盲区可复现，不是猜的）")
+    chk(DP.put(_src2, "同.md", verify=True) is True
+        and (_dp / "同.md").read_text(encoding="utf-8") == "bbb",
+        "--verify-hash 能识破并覆盖")
+    chk((DP.OLD / "同.md").is_file(), "被替换的旧件进 old/ 归档")
+finally:
+    DP.DST, DP.OLD = _old_dst, _old_old
+    _sh.rmtree(_tmp, ignore_errors=True)
 
 
 print(f"\n{'=' * 52}")
