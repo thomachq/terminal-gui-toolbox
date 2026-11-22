@@ -137,7 +137,7 @@ def _sudo_pw_maybe_wrong(msg: str) -> bool:
     return any(k in t for k in _SUDO_PW_HINTS)
 
 APP_NAME = "Terminal GUI Toolbox"
-APP_VER = "1.0.38"
+APP_VER = "1.0.39"
 APP_SUB = ("多协议终端工具箱 · SSH / Telnet / 本机 · 设备探测 · 安全中心 / 数据库 / "
            "计划任务 / Web 服务 · AI 运维")
 
@@ -283,6 +283,8 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self._win_pref = dict(self._win_state.data)
         self._win_normal: tuple[int, int, int, int] | None = None
         self._apply_win_geometry()
+        # RDP 改分辨率后不会发 <Configure>：记一份屏幕/工作区快照，由定时器比对。
+        self._display_seen = self._display_snapshot()
         self.bind("<Configure>", self._on_win_configure)
 
         # ---- 状态
@@ -418,6 +420,8 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         # 单实例：第二个进程双击时会把我们叫醒（见 core/singleinstance.py）。
         # 轮询而不是等 Win32 消息 —— Tk 不暴露窗口过程，收不到自定义消息。
         self.after(700, self._wake_poll)
+        # 远程桌面改分辨率也不会通知 Tk：每秒比对一次屏幕/工作区（见 _watch_display）。
+        self.after(1000, self._watch_display)
 
     # ============================================================ 骨架
     def _header(self):
@@ -1128,6 +1132,25 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         self._quit_app()
 
     # ============================================================ 窗口几何
+    def _usable_area(self, screen=None) -> tuple[int, int, int, int]:
+        """屏幕尺寸与 SPI 工作区的交集才是真能摆窗口的区域。
+
+        RDP 下实测 `winfo_screen*` 已经是 1707×960，而 `SPI_GETWORKAREA`
+        还报 2560×1368；只看后者会把窗口按旧大屏恢复出来，标题栏和底部全跑到
+        屏幕外。
+        """
+        if screen is None:
+            try:
+                screen = (0, 0, int(self.winfo_screenwidth()),
+                          int(self.winfo_screenheight()))
+            except (tk.TclError, ValueError):
+                screen = (0, 0, 1280, 720)
+        area = winstate.work_area(screen)
+        x0, y0 = max(screen[0], area[0]), max(screen[1], area[1])
+        x1 = min(screen[0] + screen[2], area[0] + area[2])
+        y1 = min(screen[1] + screen[3], area[1] + area[3])
+        return (x0, y0, max(240, x1 - x0), max(160, y1 - y0))
+
     def _apply_win_geometry(self) -> None:
         """开窗尺寸：先按工作区自适应，再套上次退出时的位置/大小/最大化。
 
@@ -1139,7 +1162,7 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             screen = (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
         except tk.TclError:
             screen = (0, 0, 1280, 720)
-        area = winstate.work_area(screen)
+        area = self._usable_area(screen)
         box = winstate.restore_box(
             self._win_state.data, area, float(U.S),
             U.px(1360), U.px(880), U.px(900), U.px(560))
@@ -1181,7 +1204,7 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             screen = (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
         except tk.TclError:
             screen = (0, 0, 1280, 720)
-        ax, ay, aw, ah = winstate.work_area(screen)
+        ax, ay, aw, ah = self._usable_area(screen)
         ox, oy, ow, oh = rect
         dw, dh = max(0, ow - cw), max(0, oh - ch)   # 标题栏 + 边框
         m = winstate.DEFAULT_MARGIN
@@ -1225,6 +1248,116 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             self._win_normal = (self.winfo_x(), self.winfo_y(),
                                 event.width, event.height)
         except tk.TclError:
+            pass
+
+    # -------------------------------------------------- 运行中分辨率变化（RDP）
+    def _display_snapshot(self):
+        """当前屏幕 + 工作区。远程桌面改分辨率时这两个一起变。"""
+        try:
+            screen = (0, 0, int(self.winfo_screenwidth()),
+                      int(self.winfo_screenheight()))
+        except (tk.TclError, ValueError):
+            screen = (0, 0, 1280, 720)
+        return screen, self._usable_area(screen)
+
+    def _watch_display(self) -> None:
+        """Tk 收不到 RDP 的分辨率变更消息，只能轮询比对。
+
+        只在快照真的变了才重排，用户自己拖窗口/拉分隔条不受影响。
+        """
+        try:
+            snap = self._display_snapshot()
+            if not hasattr(self, "_display_seen"):
+                self._display_seen = snap
+            elif snap != self._display_seen:
+                self._display_seen = snap
+                self._on_display_changed(snap[1])
+        except Exception:  # noqa: BLE001  自适应是锦上添花，不能拖垮主循环
+            pass
+        try:
+            self.after(1000, self._watch_display)
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _fit_to_workarea(win, area) -> None:
+        """把顶层窗口的**客户区**夹进当前工作区。
+
+        `winfo_rootx/rooty` 给的已经是客户区的屏幕坐标，直接拿来算，
+        不用像 `_win_fit_sync()` 那样猜标题栏宽度 —— 那是启动时用一次的，
+        这里反复调用猜错了会让窗口每轮漂移几像素。
+        """
+        try:
+            cw, ch = int(win.winfo_width()), int(win.winfo_height())
+            cx, cy = int(win.winfo_rootx()), int(win.winfo_rooty())
+            if cw <= 1 or ch <= 1:
+                return
+        except (tk.TclError, ValueError):
+            return
+        ax, ay, aw, ah = area
+        m = winstate.DEFAULT_MARGIN
+        nw = min(cw, max(240, aw - m * 2))
+        nh = min(ch, max(160, ah - m * 2))
+        nx = min(max(cx, ax + m), ax + max(m, aw - nw - m))
+        ny = min(max(cy, ay + m), ay + max(m, ah - nh - m))
+        if (nw, nh, nx, ny) == (cw, ch, cx, cy):
+            return
+        try:
+            win.geometry(f"{nw}x{nh}+{nx}+{ny}")
+        except tk.TclError:
+            pass
+
+    def _on_display_changed(self, area=None) -> None:
+        """分辨率变化后重新收窗口、收日志、重排页面，终端才不会被挤成 0 高。"""
+        if area is None:
+            area = self._display_snapshot()[1]
+        area = tuple(area)
+        try:
+            self.update_idletasks()
+        except tk.TclError:
+            pass
+        try:
+            if self.state() != "zoomed":
+                # 关键是先降 minsize：启动时按大屏算出的 1725×1080 不降下来，
+                # 后面 geometry() 再怎么塞小也会被 Windows 弹回最小尺寸（实测坑）。
+                aw, ah = area[2], area[3]
+                m = winstate.DEFAULT_MARGIN
+                self.minsize(max(240, min(U.px(1150), aw - m * 2)),
+                             max(160, min(U.px(720), ah - m * 2)))
+                self._fit_to_workarea(self, area)
+        except (tk.TclError, ValueError):
+            pass
+        # 拉出去的终端窗口也按当前工作区夹一遍，别留在旧屏幕外面。
+        for w in list(getattr(self, "_term_wins", {}).values()):
+            self._fit_to_workarea(w, area)
+        # 底部日志面板还是旧高度的话，主区会被压没 —— 终端页签创建出来也看不见。
+        if (getattr(self, "_log_dock_on", False)
+                and getattr(self, "_log_dock_built", False)):
+            top = self._log_dock_top()
+            if top:
+                try:
+                    if int(self.log_dock_host.winfo_height()) > top:
+                        self.log_dock_host.configure(height=top)
+                        self._log_dock_h = top
+                except (tk.TclError, ValueError):
+                    pass
+        # ScrollBox 的内胆高度是 itemconfigure 钉死的，屏幕变矮不会自己重算。
+        try:
+            self.update_idletasks()
+            for host in list(getattr(self, "_page_host", {}).values()):
+                if host.winfo_ismapped():
+                    host._refit()
+            tb = getattr(self, "tabbar", None)
+            if tb is not None:
+                tb._fit()
+            top_widget = getattr(self, "_ws_top", None)
+            if top_widget is not None and top_widget.winfo_exists():
+                self._ws_raise(top_widget)
+        except (tk.TclError, AttributeError):
+            pass
+        try:
+            self.status.set_state("分辨率已变化 · 界面已重新适配", "warn")
+        except (AttributeError, tk.TclError):
             pass
 
     def _win_state_save(self) -> None:
@@ -3539,6 +3672,12 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         sid = self._term_key_sid(key)
         if key in self.tabbar.tabs:      # 页签还在但面板丢了：先清干净再建
             self.tabbar.remove(key)
+        # 分辨率刚变过、或日志面板刚收放完，几何可能还没落实；先刷一次再建，
+        # 否则 holder 拿到 0 高，看起来就是「点了终端没反应」。
+        try:
+            self.update_idletasks()
+        except tk.TclError:
+            pass
         holder = U.wframe(self.workspace, "page")
         holder.grid(row=0, column=0, sticky="nsew")
         pane = TerminalPane(holder, _TermCtl(self, sid))

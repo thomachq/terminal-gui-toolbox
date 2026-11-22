@@ -99,7 +99,9 @@ class ApiPage:
 
         # 连接池
         c2 = U.Card(pg, title="连接池", hint="智能体建的连接会一直留在这里，直到被关掉")
-        c2.grid(row=1, column=0, sticky="ns", pady=(U.px(10), 0))
+        # sticky 必须带上 w/e：只写 "ns" 的话这张卡停在请求宽度、在列里居中，
+        # 看起来就是「连接池比智能体接入窄一截」（用户 2026-11-22 截图）。
+        c2.grid(row=1, column=0, sticky="we", pady=(U.px(10), 0))
         c2.configure(height=U.px(210))
         self.tbl_sess = DataTable(c2.body, SESSION_COLS, height=5, searchable=False,
                                   empty_title="连接池是空的",
