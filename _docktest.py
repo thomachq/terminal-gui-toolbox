@@ -121,9 +121,17 @@ def run():
     win = appmod.ToolboxApp()
     win.geometry("+40+40")   # 不 withdraw：按钮坐标要真实布局后才算得出
     pump(win, 0.6)
-    # 模型管理在 v1.0.9 并进了「设置中心」的页签，不再是顶层页签，
-    # 所以是 15 而不是原来的 16。
-    chk(len(win._pages) == 15, "十五个选项卡", len(win._pages))
+    # 页签数变过三次，别凭记忆改这个数字：
+    #   v1.0.9  模型管理并进「设置中心」，顶层少一个（16→15）；
+    #   之后    运维工具组末尾新增「智能体接入」（key=api），又回到 16。
+    # 所以断言 16，并且逐个比对 key 集合 —— 只比数字的话，将来「删一个加一个」
+    # 照样全绿，那就成了自欺。
+    chk(len(win._pages) == 16, "十六个选项卡", len(win._pages))
+    _want_pages = {"hosts", "proxy", "cred", "script", "tools", "rmt", "sys",
+                   "files", "routes", "sec", "docker", "web", "db", "cron",
+                   "vpn", "api"}
+    chk(set(win._pages) == _want_pages, "页签集合与导航一致",
+        sorted(set(win._pages) ^ _want_pages))
     chk("ai" not in win._pages, "AI 不再是一个选项卡")
     chk(hasattr(win, "btn_ai_dock"), "顶部有助手按钮")
     chk(hasattr(win, "btn_settings"), "顶部有设置按钮")
