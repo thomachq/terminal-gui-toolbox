@@ -250,6 +250,20 @@ finally:
     _sh.rmtree(_tmp, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- 9
+sec("9. 新增自测脚本都在位")
+# 这些脚本是「能力判定 / 视觉通道 / 真机串口」的唯一回归手段，
+# 被误删或改名都不会有人发现 —— 所以让文档闸门盯一眼。
+for _name in ("_capstest.py", "_visiontest.py", "_visiontry.py",
+              "_comrealcheck.py", "_modeltest.py", "_docktest.py"):
+    chk((HERE / _name).is_file(), _name, "仓库根")
+
+chk("core.vision" in (HERE / "toolbox.spec").read_text(encoding="utf-8"),
+    "toolbox.spec 里登记了 core.vision（否则打包后视觉通道会 import 失败）")
+chk("core.modelsync" in (HERE / "toolbox.spec").read_text(encoding="utf-8"),
+    "toolbox.spec 里登记了 core.modelsync")
+
+
 print(f"\n{'=' * 52}")
 print(f"通过 {PASS}，失败 {FAIL}")
 if FAILS:

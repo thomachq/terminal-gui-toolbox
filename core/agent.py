@@ -545,6 +545,10 @@ class Agent:
                         "refused": refused, "skipped": skipped,
                         "injected": injected, "answer": answer}
             self.tokens += int(usage.get("total") or 0)
+            # 引擎发现「回答是空的、预算被思考吃光了」这类情况会带一句 note。
+            # 必须让用户看见，否则他只会觉得模型不回话。
+            if usage.get("note"):
+                emit("note", {"text": str(usage["note"]), "step": step})
             self.last_usage = usage
 
             st = parse_step(text, allowed)

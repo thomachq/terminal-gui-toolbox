@@ -21,6 +21,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -101,6 +102,23 @@ MODALITIES: list[tuple[str, str]] = [("vision", "视觉"), ("audio", "音频")]
 MODALITY_KEYS = tuple(k for k, _ in MODALITIES)
 MODALITY_LABEL = dict(MODALITIES)
 _MODALITY_ALIAS = {"image": "vision", "img": "vision", "文本": "", "text": ""}
+
+#: 视觉探针用的 1×1 纯红 PNG（70 字节）。为什么是红的：问一句「什么颜色」，
+#: 回答里出现「红 / red / ff0000」就等于证明它**真的解码了像素**，而不是
+#: 只回了句客套话。用大图探针会把一次探测的成本抬到 1000 prompt tokens。
+PROBE_IMAGE = ("data:image/png;base64,"
+               "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/Vscv"
+               "DQAAAABJRU5ErkJggg==")
+
+#: 思考模型的最小输出预算。deepseek-flash 默认 high，实测一张截图 614 个输出
+#: token 里 556 是思考，max_tokens=300 时 content 直接是空的（用户看到「AI 不回话」）。
+#: 所以只要开了思考，就把预算抬到这个下限；用户设了更大的值就用用户的。
+THINKING_MIN_BUDGET = 1500
+
+#: 安装目录（与 `_deploy_tools.py` 的 DST 同一个位置）。只给 `open_config()`
+#: 做兜底：源码树里那份 `data/ai.json` 经常是化石（没有 Key、模型名也旧），
+#: 而用户真正在用的是这份。不 import 那个脚本 —— 它一 import 就会开始拷文件。
+INSTALL_DIR = Path(r"D:\Tools\Terminal-GUI-Toolbox")
 
 
 def clean_caps(raw) -> dict:
@@ -467,6 +485,109 @@ class AIConfig:
         else:
             self.data["key_enc"] = plain  # 极少数情况下退化为明文，界面会提示
         self.save()
+
+    # ------------------------------------------------------------ 能力（modalities）
+    # 一条能力结论从哪来，比结论本身更重要：用户勾的、探针验的、端点说的、
+    # 预设猜的，可信度完全不同。以前只看一个复选框，出了问题谁也说不清
+    # 「这个视觉是我勾的还是它自己猜的」。所以结论与来源一起存。
+    def caps_src(self) -> dict:
+        raw = self.data.get("caps_src")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def cap_src(self, kind: str) -> dict:
+        v = self.caps_src().get(str(kind))
+        return dict(v) if isinstance(v, dict) else {}
+
+    def set_cap_src(self, kind: str, value, src: str, note: str = "") -> None:
+        """记一条能力结论。`value=None` 表示这条结论作废（回到「不知道」）。"""
+        store = self.data.get("caps_src")
+        if not isinstance(store, dict):
+            store = {}
+        if value is None:
+            store.pop(str(kind), None)
+        else:
+            store[str(kind)] = {"from": str(src or ""), "value": bool(value),
+                                "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "note": str(note or "")[:200]}
+        self.data["caps_src"] = store
+        # 同步到当前模型档案：切换模型时扁平字段会被覆盖，档案里的不能丢
+        m = self.find_model(self.current_id())
+        if isinstance(m, dict):
+            m["caps_src"] = json.loads(json.dumps(store, ensure_ascii=False))
+        self.save()
+
+    def vision_ok(self) -> bool:
+        """这一轮到底发不发图。
+
+        优先级（设计见《模型能力获取-重新设计》）：
+          ① 用户勾了（`modalities` 里有 vision）           → 发
+          ② 用户显式否定（`caps_src.vision.from == user` 且值 False）→ 不发
+          ③ 自动结论（probe / endpoint / preset）为真      → 发
+          ④ 其余（不知道）                                → 不发
+        「不知道就不发」是刻意的：发了多半 400，用户看到的是莫名其妙的一句
+        报错；界面会提示去点「探测」，2 秒就能把「不知道」变成结论。
+        """
+        if "vision" in clean_modalities(self.data.get("modalities")):
+            return True
+        src = self.cap_src("vision")
+        if src.get("from") == "user" and src.get("value") is False:
+            return False
+        return bool(src.get("value"))
+
+    def probe_vision(self, timeout: int = 60, remember: bool = True) -> tuple[bool, str]:
+        """发一张 1×1 的探针图，验「这个端点到底收不收 image_url」。
+
+        为什么用图而不是只问一句话：要验的正是图片通道，纯文本测试永远绿。
+        为什么 1×1：70 字节，比一张截图便宜三个数量级（实测截图 1001 prompt
+        tokens，探针只有几十）。
+        结论写回 `caps_src`（from=probe），不动用户勾的 `modalities`。
+        """
+        base = str(self.data.get("base") or self.preset()["base"]).rstrip("/")
+        if not base:
+            return False, "还没填 base 地址"
+        if not base.endswith("/v1") and "/v1" not in base:
+            base += "/v1"
+        model = str(self.data.get("model") or self.preset()["model"])
+        key = self.get_key()
+        if self.preset().get("need_key") and not key:
+            return False, "还没填 API Key，探测要发一次真实请求"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "这张图是什么颜色？只回答颜色名。"},
+                {"type": "image_url", "image_url": {"url": PROBE_IMAGE}},
+            ]}],
+            "temperature": 0,
+            "max_tokens": 256,
+            "stream": False,
+        }
+        headers = {"Accept": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        try:
+            data = _post_json(base + "/chat/completions", payload, headers, timeout)
+        except AIError as e:
+            msg = str(e)[:200]
+            if remember:
+                self.set_cap_src("vision", False, "probe", msg)
+            return False, f"探测失败：{msg}"
+        try:
+            text = str(data["choices"][0]["message"]["content"] or "").strip()
+        except (KeyError, IndexError, TypeError):
+            if remember:
+                self.set_cap_src("vision", False, "probe", "返回格式不认识")
+            return False, f"返回格式不认识：{str(data)[:160]}"
+        if not text:
+            if remember:
+                self.set_cap_src("vision", False, "probe", "空回答")
+            return False, ("端点收了请求但回答是空的 —— 多半是思考把预算花光了"
+                           "（把 max_tokens 调大再探测）")
+        color = bool(re.search(r"红|red|ff0000", text, re.I))
+        note = f"回答「{text[:40]}」" + ("（认出是红色，确认真的看到了图）" if color
+                                       else "（回答非空，图片通道可用）")
+        if remember:
+            self.set_cap_src("vision", True, "probe", note)
+        return True, note
 
     def describe(self) -> str:
         p = self.preset()
@@ -1225,17 +1346,24 @@ class OpenAIEngine:
         if self.cfg.preset().get("need_key") and not key:
             raise AIError("还没填 API Key")
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": float(self.cfg.data.get("temperature") or 0.2),
-            "max_tokens": int(self.cfg.data.get("max_tokens") or 1200),
-            "stream": False,
-        }
         # 思考档位。只有模型自己声明了可用档位、且不是"关"才发 ——
         # 给不认识这个字段的网关乱发参数会直接 400。
         # "off" 的语义是「不发」，不是发 "none"（对齐 DSH 的 efforts.off = null）。
         level = self.cfg.thinking()
+        want = int(self.cfg.data.get("max_tokens") or 1200)
+        # 开了思考就得给思考留预算：实测 deepseek-flash 一张截图 614 个输出
+        # token 里 556 是思考，max_tokens=300 时 content 是空的，用户只看到
+        # 「AI 一句话不回」。抬到下限而不是无脑翻倍，避免悄悄涨价。
+        budget = want
+        if level and level != "off" and want < THINKING_MIN_BUDGET:
+            budget = THINKING_MIN_BUDGET
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": float(self.cfg.data.get("temperature") or 0.2),
+            "max_tokens": budget,
+            "stream": False,
+        }
         if level and level != "off":
             payload["reasoning_effort"] = level
         headers = {"Accept": "application/json"}
@@ -1261,10 +1389,23 @@ class OpenAIEngine:
         usage = data.get("usage") or {}
         _trace("resp", {"ok": True, "ms": int((time.time() - t0) * 1000),
                         "code": 200, "tokens": usage, "text": text})
+        # 「空回答」不是没有信息量：finish=length + 思考吃掉全部预算时，必须
+        # 说清是预算问题，否则用户会以为模型坏了、或者自己网络断了。
+        choice = (data.get("choices") or [{}])[0] or {}
+        finish = str(choice.get("finish_reason") or "")
+        reason_tok = int(((usage.get("completion_tokens_details") or {})
+                          .get("reasoning_tokens")) or 0)
+        note = ""
+        if not str(text).strip() and finish == "length":
+            note = (f"模型把输出预算花在思考上了（思考 {reason_tok or '?'} / 输出 "
+                    f"{usage.get('completion_tokens') or '?'} tokens），回答被截成空。"
+                    f"把 max_tokens 调大（这次发的是 {budget}），或把思考档位降下来")
         return text, {"prompt": usage.get("prompt_tokens"),
                       "completion": usage.get("completion_tokens"),
                       "total": usage.get("total_tokens"),
-                      "model": model}
+                      "model": model,
+                      "finish": finish, "reasoning": reason_tok, "note": note,
+                      "budget": budget}
 
 
 # ---------------------------------------------------------------- dsh 运行时
@@ -1382,6 +1523,80 @@ def _flatten(messages: list[dict]) -> str:
             parts.append("【用户】\n" + _plain(m.get("content")))
     parts.append("【提醒】只输出一个 JSON 对象，不要使用任何工具，不要执行命令。")
     return "\n\n".join(parts)
+
+
+def open_config(data_dir=None) -> tuple[AIConfig, dict]:
+    """一站式打开配置：**同时**把密钥目录指对，并回报自检结果。
+
+    为什么需要它：`AIConfig` 按路径读 `ai.json`，可 `crypto_store` 的密钥
+    目录是进程级全局（`set_key_dir`，主程序启动时设）。两者不一致时会出现
+    「配置读到了、Key 解不出来」，而 `get_key()` 只返回空串、不报错 ——
+    2026-11-26 就是靠这条把「部署目录明明有 Key」误判成「项目没配 Key」。
+
+    搜索顺序（给了 `data_dir` 就只用它）：
+      `TTB_DATA` 环境变量 → 可执行文件旁 `data/`（便携包）→ 仓库树 `data/`
+      → 当前目录 `data/`。**第一个 key 能解开的**胜出。
+
+    返回 `(cfg, meta)`；`meta` 里永远有 `data_dir` / `key_ok` / `key_error`，
+    脚本与界面都可以直接把 `key_error` 打给用户看。
+    """
+    cands: list[Path] = []
+    if data_dir:
+        cands.append(Path(data_dir))
+    else:
+        env = os.environ.get("TTB_DATA")
+        if env:
+            cands.append(Path(env))
+        if getattr(sys, "frozen", False):
+            cands.append(Path(sys.executable).resolve().parent / "data")
+        cands.append(Path(__file__).resolve().parent.parent / "data")
+        cands.append(INSTALL_DIR / "data")
+        try:
+            cands.append(Path.cwd() / "data")
+        except OSError:
+            pass
+    order: list[Path] = []
+    seen = set()
+    for d in cands:
+        try:
+            k = str(Path(d).resolve()).lower()
+        except OSError:
+            k = str(d).lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        order.append(Path(d))
+
+    first: tuple[AIConfig, Path, Path] | None = None
+    last_err = ""
+    for d in order:
+        f = d / "ai.json"
+        if not f.is_file():
+            continue
+        if crypto_store is not None:
+            try:
+                crypto_store.set_key_dir(d)
+            except Exception:  # noqa: BLE001  密钥目录坏了不该让整个助手打不开
+                pass
+        try:
+            cfg = AIConfig(f)
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+        if first is None:
+            first = (cfg, d, f)
+        if cfg.get_key():
+            return cfg, {"data_dir": str(d), "ai_json": str(f),
+                         "key_ok": True, "key_error": ""}
+        if not last_err:
+            last_err = "key 解不开（八成是另一份 data 目录加密的，或 .vpncert-key 丢了）"
+    if first is not None:
+        return first[0], {"data_dir": str(first[1]), "ai_json": str(first[2]),
+                          "key_ok": False, "key_error": last_err}
+    d = order[0] if order else Path("data")
+    return AIConfig(d / "ai.json"), {
+        "data_dir": str(d), "ai_json": str(d / "ai.json"), "key_ok": False,
+        "key_error": last_err or "一个 ai.json 都没找到"}
 
 
 def make_engine(cfg: AIConfig):

@@ -43,6 +43,7 @@ from core import creds as creds_core
 from core import devtools
 from core import elev
 from core import hosts as hosts_core
+from core import modelsync
 from core import proxies as proxies_core
 from core import serialport as serial_core
 from core import scripts as scripts_core
@@ -351,6 +352,9 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
         # 免得各页自己拼 APP_DIR 拼错。
         self.data_dir = DATA_DIR
         crypto_store.set_key_dir(DATA_DIR)
+        # 模型能力的用户覆盖表（vision/audio）：允许用户给自己网关里的模型名补一条，
+        # 不用等我们更新预设表。文件不存在就是没有覆盖，不报错。
+        modelsync.set_caps_file(DATA_DIR / "model_caps.json")
         self.settings = lockmgr.Settings(DATA_DIR / "settings.json")
         self.lock = lockmgr.LockManager(self.settings)
         self.profiles = ProfileStore(DATA_DIR / "profiles.dat")

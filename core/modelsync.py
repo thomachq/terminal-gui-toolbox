@@ -53,6 +53,62 @@ _VISION = re.compile(
 )
 _AUDIO_IN = re.compile(r"audio|speech-in|omni", re.I)
 
+# --------------------------------------------------------------------- 能力预设
+# 名字正则猜不准的那些，靠这张表钉死。**只放高置信项**：写错一条的代价是
+# 用户以为能看图、结果收到 400 或一句空回答，比"未知"更糟。
+# 顺序无关，精确匹配（整名相等，不区分大小写）。
+#
+# 为什么要这张表：`deepseek-flash` 名字里既没有 vl 也没有 vision，
+# 正则一定漏；而它确实能看图（2026-11-26 用真实截图实测过，见需求清单 R-014）。
+EXACT_MODALITIES: dict[str, list[str]] = {
+    "deepseek-flash": ["vision"],
+    "deepseek-chat": [],            # 官方纯文本，显式写出来免得被别的规则误判
+    "deepseek-reasoner": [],
+}
+
+#: 用户自定义覆盖（`data/model_caps.json`）：{"模型名或正则": ["vision"]}
+#: 主程序启动时用 `set_caps_file()` 指过来；不设就等于没有。
+_caps_path = None
+_user_caps: dict[str, list[str]] | None = None
+
+
+def set_caps_file(path) -> None:
+    """指定用户能力覆盖文件（通常是 `data/model_caps.json`）。"""
+    global _caps_path, _user_caps
+    _caps_path = path
+    _user_caps = None            # 让下次读取重新加载
+
+
+def load_user_caps() -> dict[str, list[str]]:
+    """读用户覆盖表。格式宽松：值可以是 `["vision"]`，也可以是 `{"vision": true}`。"""
+    global _user_caps
+    if _user_caps is not None:
+        return _user_caps
+    out: dict[str, list[str]] = {}
+    if _caps_path is None:
+        _user_caps = out
+        return out
+    try:
+        from pathlib import Path as _P
+        p = _P(_caps_path)
+        if p.is_file():
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    mods: list[str] = []
+                    if isinstance(v, list):
+                        mods = [str(x).strip().lower() for x in v if str(x).strip()]
+                    elif isinstance(v, dict):
+                        # {"vision": true, "audio": false}
+                        mods = [str(k2).strip().lower() for k2, v2 in v.items()
+                                if v2 is True or str(v2).lower() in ("true", "yes", "1")]
+                    if mods:
+                        out[str(k).strip()] = [m for m in mods if m in ("vision", "audio")]
+    except (OSError, ValueError):
+        out = {}
+    _user_caps = out
+    return out
+
 
 def is_text_model(model_id: str) -> bool:
     """这个名字的模型能不能拿来跑一轮对话。"""
@@ -66,18 +122,84 @@ def is_text_model(model_id: str) -> bool:
     return True
 
 
-def modality_guess(model_id: str) -> list[str]:
-    """从名字猜输入模态。只在同步时用来预勾选，用户随时能改。
+def guess_with_src(model_id: str) -> tuple[list[str], str]:
+    """从名字定模态，并说明这个结论**从哪来**：`user` / `preset` / `""`（不知道）。
 
-    猜错了代价很小（两个复选框），猜对了省一次点击。
+    优先级：用户覆盖表 → 精确表 → 名字正则。前两者命中就是「确定」，
+    正则命中算 `preset`（按惯例推断，仍可能错）。
     """
-    mid = str(model_id or "")
+    mid = str(model_id or "").strip()
+    if not mid:
+        return [], ""
+    low = mid.lower()
+    user = load_user_caps()
+    if low in user:
+        return list(user[low]), "user"
+    if low in EXACT_MODALITIES:
+        return list(EXACT_MODALITIES[low]), "preset"
     out = []
     if _VISION.search(mid):
         out.append("vision")
     if _AUDIO_IN.search(mid) and not _NON_CHAT.search(mid):
         out.append("audio")
-    return out
+    return out, ("preset" if out else "")
+
+
+def modality_guess(model_id: str) -> list[str]:
+    """从名字猜输入模态。只在同步时用来预勾选，用户随时能改。
+
+    猜错了代价很小（两个复选框），猜对了省一次点击。
+    """
+    return guess_with_src(model_id)[0]
+
+
+def modalities_from_entry(entry) -> list[str] | None:
+    """从 `/models` 的一个条目里读「端点自己说的」输入模态。
+
+    返回非空列表 = 端点明确声明了视觉/音频；返回 None = 端点没说（≠ 没有）。
+
+    **只做正向确认，绝不用它来否定**：很多兼容网关的 `capabilities` 只写
+    `["completion"]`，并不代表模型不能看图 —— 拿它当"没有视觉"会把
+    `deepseek-flash` 这种能看图的模型错误降级。宁可退回名字猜。
+    """
+    if not isinstance(entry, dict):
+        return None
+    raw: list[str] = []
+    claimed = False
+
+    def take(v):
+        nonlocal claimed
+        if isinstance(v, str):
+            raw.append(v)
+            claimed = True
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                take(x)
+        elif isinstance(v, dict):
+            for k, val in v.items():
+                if val is True or str(val).lower() in ("true", "yes", "1", "supported"):
+                    raw.append(k)
+            if v:
+                claimed = True
+
+    for key in ("modalities", "input_modalities", "capabilities", "capability",
+                "input", "types"):
+        if key in entry:
+            take(entry[key])
+    arch = entry.get("architecture")
+    if isinstance(arch, dict) and "input_modalities" in arch:
+        take(arch["input_modalities"])
+    if not claimed:
+        return None
+    alias = {"image": "vision", "images": "vision", "img": "vision", "vision": "vision",
+             "audio": "audio", "speech": "audio", "text": "", "completion": "",
+             "chat": "", "tools": "", "function_calling": ""}
+    out: list[str] = []
+    for s in raw:
+        k = alias.get(str(s).strip().lower(), str(s).strip().lower())
+        if k in ("vision", "audio") and k not in out:
+            out.append(k)
+    return out or None
 
 
 def filter_text_models(ids) -> list[str]:
@@ -286,6 +408,11 @@ def sync_text_models(base: str, key: str = "", timeout: int = 20) -> list[dict]:
             continue
         lim = parse_limits(e)
         lim["id"] = mid
-        lim["modalities"] = modality_guess(mid)
+        # 端点说的优先（它最权威），端点没说再按名字/预设表猜。
+        said = modalities_from_entry(e)
+        if said:
+            lim["modalities"], lim["modalities_src"] = said, "endpoint"
+        else:
+            lim["modalities"], lim["modalities_src"] = guess_with_src(mid)
         out[mid] = lim
     return [out[k] for k in sorted(out)]

@@ -2455,17 +2455,16 @@ class AiDockPage:
         return "\n".join(lines)
 
     def _ai_vision_on(self) -> bool:
-        """当前模型有没有勾「视觉」。
+        """当前模型这一轮发不发图。
 
-        勾了才把图发出去：没勾还发，网关多半回 400，用户只会看到一句
-        莫名其妙的报错。这个判断读的是当前模型那条档案（扁平镜像），
-        和设置页里那个「视觉」勾选框是同一个字段。
+        判断交给 `AIConfig.vision_ok()`：用户勾选 > 用户显式否定 > 探针/端点/
+        预设的自动结论 > 不知道（不发）。以前这里只看「勾没勾」，于是预设表
+        与探针的结论白算 —— 用户不手勾永远发不了图。
         """
         try:
-            mods = aiops.clean_modalities(self.ai_cfg.data.get("modalities"))
+            return bool(self.ai_cfg.vision_ok())
         except Exception:  # noqa: BLE001  配置坏了不该让发送流程炸
-            mods = []
-        return "vision" in mods
+            return False
 
     def _ai_attach_text(self) -> str:
         """把本轮附件拼进上下文。
@@ -2657,6 +2656,12 @@ class AiDockPage:
                 self._ai_reply(text, p.get("step"))
             if p.get("note"):
                 self._ai_note("· " + p["note"], "mute")
+        elif kind == "note":
+            # 引擎自己发现的问题（例如「预算被思考吃光、回答被截成空」）。
+            # 不当成错误，也不进 transcript —— 它解释的是「为什么这次回答很怪」。
+            text = str(p.get("text") or "").strip()
+            if text:
+                self._ai_note("· " + text, "warn")
         elif kind == "need_confirm":
             self._ai_note("· 这一步要改动，等你确认…", "warn")
         elif kind == "call":

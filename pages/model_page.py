@@ -27,6 +27,7 @@ token 限制 / 能力 / Key / 状态），行上直接「设为当前」「试�
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -1371,17 +1372,80 @@ class _ModelForm(tk.Toplevel):
         return r + 1
 
     def _row_modalities(self, body, r: int) -> int:
+        """输入模态：勾选框 + 来源小字 + 探测按钮。
+
+        勾选框表达的是**有效值**（勾=这一轮会发图），旁边小字说明这个结论
+        是谁下的：手动 / 探测 / 端点 / 预设 / 未声明。只给一个勾选框时，
+        用户永远分不清「这是我自己勾的」还是「程序猜的」，出了问题也无从复查。
+        """
         self._label(body, "输入模态", r)
         cell = self._cell(body, r)
-        have = self.rec.get("modalities") or []
+        have = aiops.clean_modalities(self.rec.get("modalities"))
         self.var_mods: dict[str, tk.BooleanVar] = {}
+        self.lbl_mod_src: dict[str, tk.Label] = {}
         for key, label in aiops.MODALITIES:
             var = tk.BooleanVar(value=(key in have))
             U.Check(cell, label, var, font=U.FONT_S).pack(side="left",
-                                                          padx=(0, U.px(14)))
+                                                          padx=(0, U.px(8)))
             self.var_mods[key] = var
-        self._hint(cell, "只有这两项；视频/文件不做", 220)
+            lb = U.wlabel(cell, self._mod_src_text(key), "pagemute", U.FONT_XS)
+            lb.pack(side="left", padx=(0, U.px(12)))
+            self.lbl_mod_src[key] = lb
+        U.RoundButton(cell, "探测视觉", self._probe_vision, variant="ghost",
+                      height=26, padx=10).pack(side="left", padx=(0, U.px(8)))
+        self._hint(cell, "探测会发一张 1×1 的图（几十 token）；勾选框=这一轮发不发", 260)
         return r + 1
+
+    def _mod_src_text(self, key: str) -> str:
+        """这一条能力结论的来源，一句话说清。"""
+        have = key in aiops.clean_modalities(self.rec.get("modalities"))
+        w = (self.rec.get("caps_src") or {}).get(key) or {}
+        frm = str(w.get("from") or "")
+        if frm == "user":
+            return "（手动·是）" if have else "（手动·否）"
+        tag = {"probe": "探测", "endpoint": "端点", "preset": "预设"}.get(frm, "")
+        if tag:
+            return f"（自动·{tag}·{'是' if w.get('value') else '否'}）"
+        # 老数据没有 caps_src：勾了就是当年手勾的，没勾就是没声明
+        return "（手动·是）" if have else "（未声明）"
+
+    def _probe_vision(self) -> None:
+        """发探针验一次视觉。不写盘 —— 结论跟着「保存」一起进档案。"""
+        rec = dict(self.rec)
+        if not str(rec.get("model") or "").strip():
+            self._fail("先填模型名再探测")
+            return
+        tmp = aiops.AIConfig(self.cfg.path)
+        for k in ("base", "model", "key_enc", "caps", "provider",
+                  "max_tokens", "timeout", "thinking"):
+            if rec.get(k):
+                tmp.data[k] = rec[k]
+        self._fail("探测中：发一张 1×1 的探针图…")
+
+        def work():
+            try:
+                ok, why = tmp.probe_vision(remember=False)
+            except Exception as e:  # noqa: BLE001  探测失败不该炸掉表单
+                ok, why = False, f"{type(e).__name__}: {e}"
+            self.after(0, lambda: self._probe_done(ok, why))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _probe_done(self, ok: bool, why: str) -> None:
+        src = dict(self.rec.get("caps_src") or {})
+        src["vision"] = {"from": "probe", "value": bool(ok),
+                         "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                         "note": str(why)[:200]}
+        self.rec["caps_src"] = src
+        if "vision" in self.var_mods:
+            self.var_mods["vision"].set(bool(ok))
+        lb = self.lbl_mod_src.get("vision")
+        if lb is not None:
+            try:
+                lb.configure(text=self._mod_src_text("vision"))
+            except tk.TclError:
+                pass
+        self._fail(("探测通过：" if ok else "探测失败：") + why)
 
     def _row_tokens(self, body, r: int, key: str, label: str, hint: str,
                     presets: list[int]) -> int:
@@ -1561,6 +1625,22 @@ class _ModelForm(tk.Toplevel):
         except (TypeError, ValueError):
             return self._fail("温度要填数字（0–2）")
 
+        mods = [k for k, v in self.var_mods.items() if v.get()]
+        # 用户动过勾选，这条结论从此算「手动」；原来的探测说明留在 note 里，
+        # 免得覆盖掉「上次探测说了什么」这条唯一的失败线索。
+        old_mods = aiops.clean_modalities(self.rec.get("modalities"))
+        src = dict(self.rec.get("caps_src") or {})
+        for mkey in aiops.MODALITY_KEYS:
+            had, has = mkey in old_mods, mkey in mods
+            if had == has:
+                continue
+            prev = src.get(mkey) or {}
+            keep = str(prev.get("note") or "")
+            src[mkey] = {"from": "user", "value": has,
+                         "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                         "note": (("探测：" + keep) if prev.get("from") == "probe"
+                                  else "在模型表单里手动改的")[:200]}
+
         out = dict(self.rec)
         out.update({
             "name": name or (preset["label"] + " · " + (model or "未命名")),
@@ -1569,7 +1649,8 @@ class _ModelForm(tk.Toplevel):
             "model": model,
             "kind": "text",
             "caps": {"thinking": thinking, "tools": bool(self.var_tools.get())},
-            "modalities": [k for k, v in self.var_mods.items() if v.get()],
+            "modalities": mods,
+            "caps_src": src,
             "context": toks["context"],
             "max_input": toks["max_input"],
             "max_output": toks["max_output"],
