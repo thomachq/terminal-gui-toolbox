@@ -713,7 +713,7 @@ class _SettingsShell:
                 from pages.model_page import ModelPanel
                 return ModelPanel(app, host)
             if key == "skill":
-                from pages.ai_page import SkillPanel
+                from ui.skillwidgets import SkillPanel
                 return SkillPanel(host, app)
             if key == "mcp":
                 from pages.mcp_panel import MCPPanel

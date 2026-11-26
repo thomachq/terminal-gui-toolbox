@@ -1,3 +1,4 @@
+# RUNALL: manual  —— 需要真设备/真 Key，由人手动跑（_runall.py 会跳过）
 # -*- coding: utf-8 -*-
 """真机串口（COM console）验证 —— 接上设备后跑这一条就够。
 

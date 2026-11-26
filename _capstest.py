@@ -229,7 +229,29 @@ try:
 finally:
     aiops._post_json = _real_post
 
-sec("8. open_config：配置与密钥目录绑在一起，解不开要说话")
+sec("8. 并发写：能力结论与界面保存互不吃掉（R-016）")
+p_race = tmp / "race.json"
+p_race.write_text(json.dumps({
+    "provider": "deepseek", "base": "https://example.com/v1",
+    "model": "plain-model-x", "key_enc": "", "temperature": 0.2,
+    "models": [{"id": "r1", "provider": "deepseek", "model": "plain-model-x",
+                "modalities": [], "caps": {}}], "active": "r1"},
+    ensure_ascii=False), encoding="utf-8")
+a_worker = aiops.AIConfig(p_race)     # 假装是工作线程（懒探测）
+b_ui = aiops.AIConfig(p_race)         # 假装是界面（旧快照）
+a_worker.set_cap_src("vision", True, "probe", "探针通过")
+b_ui.data["temperature"] = 0.9        # 界面改的是另一个字段
+b_ui.save()
+disk = json.loads(p_race.read_text(encoding="utf-8"))
+chk((disk.get("caps_src") or {}).get("vision", {}).get("value") is True,
+    "界面整份保存后，工作线程的能力结论还在",
+    (disk.get("caps_src") or {}).get("vision"))
+chk(disk.get("temperature") == 0.9, "界面的改动也落地了", disk.get("temperature"))
+arch = (disk.get("models") or [{}])[0]
+chk((arch.get("caps_src") or {}).get("vision", {}).get("value") is True,
+    "档案里的那份也合并上了（切模型不丢）")
+
+sec("9. open_config：配置与密钥目录绑在一起，解不开要说话")
 cfg2, meta = aiops.open_config(tmp)          # 临时目录里没有 ai.json
 chk(meta["key_ok"] is False and "ai.json" in meta["key_error"],
     "找不到 ai.json 时 key_error 说得明白", meta["key_error"][:50])

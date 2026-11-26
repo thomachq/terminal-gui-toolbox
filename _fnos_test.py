@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# RUNALL: manual  —— 要在飞牛 OS 上以 root 跑（改 /usr/trim 下的证书配置），本机跑必失败
 """飞牛 fnOS：验证「只入库、不绑定」是否被接受（C 档）
 只改 network_cert_all.conf 加一条 used=false，不碰 used=true 的条目，不 reload nginx。
 """

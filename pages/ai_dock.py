@@ -2040,7 +2040,7 @@ class AiDockPage:
 
         def add_local(_e=None):
             self._ai_close_menu()
-            from pages.ai_page import SkillDialog
+            from ui.skillwidgets import SkillDialog
             dlg = SkillDialog(self, self)
             try:
                 dlg.after(150, dlg._import)     # 直接弹导入，少点一次
@@ -2301,7 +2301,7 @@ class AiDockPage:
         self._ai_refresh_scope_btn()
 
     def _ai_open_skill_lib(self) -> None:
-        from pages.ai_page import SkillDialog
+        from ui.skillwidgets import SkillDialog
         SkillDialog(self, self)
 
     def _ai_skills(self) -> list:

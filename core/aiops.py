@@ -22,6 +22,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -114,6 +115,10 @@ PROBE_IMAGE = ("data:image/png;base64,"
 #: token 里 556 是思考，max_tokens=300 时 content 直接是空的（用户看到「AI 不回话」）。
 #: 所以只要开了思考，就把预算抬到这个下限；用户设了更大的值就用用户的。
 THINKING_MIN_BUDGET = 1500
+
+#: 配置文件的进程内写锁。懒探测跑在工作线程、界面保存跑在主线程，
+#: 两笔写必须串行（`atomicio` 只保证单次替换原子，不管谁先谁后）。
+_IO_LOCK = threading.RLock()
 
 #: 安装目录（与 `_deploy_tools.py` 的 DST 同一个位置）。只给 `open_config()`
 #: 做兜底：源码树里那份 `data/ai.json` 经常是化石（没有 Key、模型名也旧），
@@ -446,9 +451,77 @@ class AIConfig:
             pass
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        atomicio.save_text(self.path,
-                           json.dumps(self.data, ensure_ascii=False, indent=2))
+        """整份落盘。**加锁**：界面在主线程写、懒探测在工作线程写，同进程内串行。
+
+        进程之间不做互斥 —— 单实例锁已经在更外层挡着了。锁只能防「两次写交织
+        把文件写坏」，防不了「谁后写谁赢把对方字段冲掉」，后者交给
+        `_merge_write()`（先读磁盘、只改自己那一块）。
+        """
+        with _IO_LOCK:
+            disk = self._read_disk() or {}
+            merged = dict(disk)
+            merged.update(self.data)
+            # caps_src 单独按条目合并：界面整份保存时，内存里可能还是「没探过」
+            # 的旧快照，直接覆盖会把工作线程刚探出来的结论冲掉。
+            merged["caps_src"] = self._merge_caps(self.data.get("caps_src"),
+                                                  disk.get("caps_src"))
+            self._sync_archive_caps(merged)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            atomicio.save_text(self.path,
+                               json.dumps(merged, ensure_ascii=False, indent=2))
+            self.data = merged
+
+    @staticmethod
+    def _merge_caps(mine, disk) -> dict:
+        """两份 caps_src 按条目合并，`at` 更新的赢（时间戳是唯一可靠的先后）。"""
+        out = dict(mine) if isinstance(mine, dict) else {}
+        for k, v in (disk or {}).items() if isinstance(disk, dict) else []:
+            if not isinstance(v, dict):
+                continue
+            cur = out.get(k)
+            if not isinstance(cur, dict) or str(v.get("at") or "") > str(
+                    cur.get("at") or ""):
+                out[k] = dict(v)
+        return out
+
+    def _sync_archive_caps(self, d: dict) -> None:
+        """把合并后的 caps_src 写进当前模型档案（切模型时扁平字段会被覆盖）。"""
+        store = d.get("caps_src")
+        if not isinstance(store, dict):
+            return
+        mid = str(d.get("active") or "")
+        for m in (d.get("models") or []):
+            if isinstance(m, dict) and str(m.get("id")) == mid:
+                m["caps_src"] = self._merge_caps(m.get("caps_src"), store)
+                break
+
+    def _read_disk(self) -> dict | None:
+        """把磁盘上的当前内容读回来（不合并进 self.data）。"""
+        try:
+            if self.path.is_file():
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                return raw if isinstance(raw, dict) else None
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _merge_write(self, mutator) -> None:
+        """锁内「读磁盘 → 只改自己那一块 → 写回」，并把结果同步回 `self.data`。
+
+        为什么不能直接 save：懒探测跑在工作线程，界面同时可能整份保存模型设置。
+        谁后写谁赢会把对方的字段冲掉（`atomicio` 只保证文件不坏，不保证内容不丢）。
+        这里以磁盘为底，让 mutator 只动它该动的那一项。
+        """
+        with _IO_LOCK:
+            base = self._read_disk()
+            if not isinstance(base, dict) or not base:
+                base = json.loads(json.dumps(self.data, ensure_ascii=False))
+            mutator(base)
+            base.setdefault("provider", self.provider)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            atomicio.save_text(self.path,
+                               json.dumps(base, ensure_ascii=False, indent=2))
+            self.data = base
 
     # -- 便捷
     @property
@@ -505,22 +578,33 @@ class AIConfig:
         return dict(v) if isinstance(v, dict) else {}
 
     def set_cap_src(self, kind: str, value, src: str, note: str = "") -> None:
-        """记一条能力结论。`value=None` 表示这条结论作废（回到「不知道」）。"""
-        store = self.data.get("caps_src")
-        if not isinstance(store, dict):
-            store = {}
-        if value is None:
-            store.pop(str(kind), None)
-        else:
-            store[str(kind)] = {"from": str(src or ""), "value": bool(value),
-                                "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                                "note": str(note or "")[:200]}
-        self.data["caps_src"] = store
-        # 同步到当前模型档案：切换模型时扁平字段会被覆盖，档案里的不能丢
-        m = self.find_model(self.current_id())
-        if isinstance(m, dict):
-            m["caps_src"] = json.loads(json.dumps(store, ensure_ascii=False))
-        self.save()
+        """记一条能力结论。`value=None` 表示这条结论作废（回到「不知道」）。
+
+        走 `_merge_write()`：只动 `caps_src`（和当前模型档案里那份副本），
+        界面上同时进行的任何改动都不会被这一笔冲掉。
+        """
+        kind = str(kind)
+        entry = None if value is None else {
+            "from": str(src or ""), "value": bool(value),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "note": str(note or "")[:200]}
+
+        def mut(d: dict) -> None:
+            store = d.get("caps_src")
+            store = dict(store) if isinstance(store, dict) else {}
+            if entry is None:
+                store.pop(kind, None)
+            else:
+                store[kind] = dict(entry)
+            d["caps_src"] = store
+            # 同步到当前模型档案：切模型时扁平字段会被覆盖，档案里的不能丢
+            mid = str(d.get("active") or self.current_id())
+            for m in (d.get("models") or []):
+                if isinstance(m, dict) and str(m.get("id")) == mid:
+                    m["caps_src"] = json.loads(json.dumps(store, ensure_ascii=False))
+                    break
+
+        self._merge_write(mut)
 
     def vision_ok(self) -> bool:
         """这一轮到底发不发图。

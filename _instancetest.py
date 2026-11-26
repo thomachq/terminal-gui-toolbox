@@ -113,7 +113,9 @@ names = re.findall(r'"([^"]+)"', m.group(1)) if m else []
 # 2026-10-25 用户反馈「任务栏都是终端工具箱的托盘」：根因就是原来把
 # --page / --no-probe / --dark 一起放进放行名单，于是测试实例能和用户那个
 # 并存，托盘里堆出好几个图标。现在只有「根本不出窗口」的参数才放行。
-chk(names == ["--smoke", "--version", "--elev-serve"],
+# `--check-tools` 是后来加的只读参数（打印 ADB/HDC 解析结果，不建 Tk），
+# 它也不该抢单实例锁 —— 但加的时候忘了同步这张期望表，于是基线一直红。
+chk(names == ["--smoke", "--version", "--check-tools", "--elev-serve"],
     f"只放行不出窗口的参数（实际 {names}）", str(names))
 for a in ("--page", "--no-probe", "--dark"):
     chk(a not in names, f"{a} 不再绕过单实例检查")

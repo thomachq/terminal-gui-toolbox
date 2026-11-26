@@ -262,6 +262,12 @@ chk("core.vision" in (HERE / "toolbox.spec").read_text(encoding="utf-8"),
     "toolbox.spec 里登记了 core.vision（否则打包后视觉通道会 import 失败）")
 chk("core.modelsync" in (HERE / "toolbox.spec").read_text(encoding="utf-8"),
     "toolbox.spec 里登记了 core.modelsync")
+# R-006：死代码删掉了，活着的控件搬到了 ui/，spec 里不能还引用已删模块
+_spec = (HERE / "toolbox.spec").read_text(encoding="utf-8")
+chk(not (HERE / "pages" / "ai_page.py").exists(), "pages/ai_page.py 已删（AiPage 死代码）")
+chk((HERE / "ui" / "skillwidgets.py").is_file(), "ui/skillwidgets.py 在位（SkillPanel/SkillDialog）")
+chk("pages.ai_page" not in _spec, "toolbox.spec 不再引用已删模块")
+chk("ui.skillwidgets" in _spec, "toolbox.spec 登记了 ui.skillwidgets")
 
 
 print(f"\n{'=' * 52}")
