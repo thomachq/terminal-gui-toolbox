@@ -522,17 +522,67 @@ class AIConfig:
         优先级（设计见《模型能力获取-重新设计》）：
           ① 用户勾了（`modalities` 里有 vision）           → 发
           ② 用户显式否定（`caps_src.vision.from == user` 且值 False）→ 不发
-          ③ 自动结论（probe / endpoint / preset）为真      → 发
-          ④ 其余（不知道）                                → 不发
+          ③ 探针 / 端点结论（`caps_src`）为真              → 发
+          ④ 预设表（含用户覆盖表）判定为能看图             → 发
+          ⑤ 其余（不知道）                                → 不发，交给 `ensure_vision()` 去探
         「不知道就不发」是刻意的：发了多半 400，用户看到的是莫名其妙的一句
-        报错；界面会提示去点「探测」，2 秒就能把「不知道」变成结论。
+        报错；`ensure_vision()` 会在真要发图时自动探一次把「不知道」变成结论。
         """
         if "vision" in clean_modalities(self.data.get("modalities")):
             return True
         src = self.cap_src("vision")
         if src.get("from") == "user" and src.get("value") is False:
             return False
-        return bool(src.get("value"))
+        if src:
+            return bool(src.get("value"))
+        # 预设表这一层：同步时会把结论写进 modalities，但手填的模型名、
+        # 老数据都不会走同步，所以这里再兜一次。
+        try:
+            from core import modelsync as _ms
+            mods, from_ = _ms.guess_with_src(str(self.data.get("model") or ""))
+            if "vision" in mods:
+                return True
+            if from_ in ("preset", "user") and _ms.known_by_table(
+                    str(self.data.get("model") or "")):
+                return False          # 表里明确写了「纯文本」
+        except Exception:  # noqa: BLE001  能力表坏了不该让发送流程炸
+            pass
+        return False
+
+    def ensure_vision(self, timeout: int = 60,
+                      allow_probe: bool = True) -> tuple[bool, str]:
+        """这一轮发不发图；「不知道」时**自动探一次**并记住。
+
+        为什么要有懒探测：预设表必然过期（新模型、自建网关名对不上），把
+        「能不能看图」的正确性押在表上是押不住的。让系统在第一次真要发图时
+        自己问一次，表就退化成「省一次探针」的优化 —— 过期只是多花几十 token，
+        而不是让用户去手点按钮或手写 json。
+
+        探针结论写进 `caps_src`（from=probe），所以**失败也只探一次**；
+        用户换模型/改 Key 后换的是另一条档案，各自记各自的。
+        """
+        if self.vision_ok():
+            return True, ""
+        src = self.cap_src("vision")
+        if src:
+            if src.get("from") == "user":
+                return False, "你手动关掉了视觉（在「设置 → 模型」里可以再打开）"
+            if src.get("from") == "probe":
+                return False, f"上次探测没通过：{src.get('note') or '无说明'}"
+            return False, f"已有结论（{src.get('from')}）判定不支持看图"
+        try:
+            from core import modelsync as _ms
+            model = str(self.data.get("model") or "")
+            if _ms.known_by_table(model):
+                mods, _from = _ms.guess_with_src(model)
+                if "vision" not in mods:
+                    return False, f"预设表里 {model} 是纯文本模型"
+        except Exception:  # noqa: BLE001
+            pass
+        if not allow_probe:
+            return False, "能力还没确认，且这一轮不允许探测"
+        ok, why = self.probe_vision(timeout=timeout)
+        return ok, why
 
     def probe_vision(self, timeout: int = 60, remember: bool = True) -> tuple[bool, str]:
         """发一张 1×1 的探针图，验「这个端点到底收不收 image_url」。

@@ -36,7 +36,8 @@ from tkinter import filedialog, ttk
 
 import wbtui as U
 from core import agent as A
-from core import ai_skills, aiops, aisession, aitrace, clipfile, vision as V
+from core import ai_skills, aiops, aisession, aitrace, clipfile, modelsync
+from core import vision as V
 from pages.model_page import ModelDialog
 from ui import forms
 from ui.md import MdView
@@ -2416,20 +2417,14 @@ class AiDockPage:
             f"任务：{goal}" + (f"（技能 {skill.name}）" if skill is not None else ""),
             tone="ok"), ensure=True)
         ctx = self._ai_context_text()
-        # 图片走真正的视觉通道：转成 data URL 随「任务」那条一起发。
-        # 必须在 `_ai_attach_clear()` 之前收集 —— 清完就只剩空列表了。
-        images: list[str] = []
+        # 图片路径先抄下来（`_ai_attach_clear()` 之后列表就空了）。
+        # 转 data URL 与前期的能力探测放到工作线程里做：探测可能要 2 秒网络，
+        # 在 UI 线程做等于把窗口冻住。
         img_paths = [a["path"] for a in self._ai_attach if a.get("image")]
-        if img_paths:
-            images, notes = V.collect(img_paths, allow=self._ai_vision_on())
-            for n in notes:
-                self._ai_note(n, "dim")
-            if images:
-                self._ai_note(f"本轮随消息附图 {len(images)} 张（视觉通道）", "ok")
         # 上下文已经拼进 ctx，输入框上的附件可以撤了；_ai_files_seen 留着，
         # 下次还能从「引用对话中的文件」里把它拿回来。
         self._ai_attach_clear()
-        threading.Thread(target=self._ai_worker, args=(goal, ctx, skill_text, images),
+        threading.Thread(target=self._ai_worker, args=(goal, ctx, skill_text, img_paths),
                          daemon=True).start()
 
     def _ai_context_text(self) -> str:
@@ -2454,17 +2449,30 @@ class AiDockPage:
             lines.append(block)
         return "\n".join(lines)
 
-    def _ai_vision_on(self) -> bool:
-        """当前模型这一轮发不发图。
+    def _ai_vision_state(self) -> str:
+        """这条模型看图的能力：`yes` / `no` / `unknown`。
 
-        判断交给 `AIConfig.vision_ok()`：用户勾选 > 用户显式否定 > 探针/端点/
-        预设的自动结论 > 不知道（不发）。以前这里只看「勾没勾」，于是预设表
-        与探针的结论白算 —— 用户不手勾永远发不了图。
+        三态而不是布尔：`unknown` 要么去探（工作线程里做），要么老实说
+        「还没确认」；把它当 `no` 会让用户以为模型不支持，当 `yes` 又会
+        白挨一次 400。预设表只负责把一部分模型直接归到 yes/no，剩下的靠探。
         """
         try:
-            return bool(self.ai_cfg.vision_ok())
+            if self.ai_cfg.vision_ok():
+                return "yes"
+            if self.ai_cfg.cap_src("vision"):
+                return "no"
+            model = str(self.ai_cfg.data.get("model") or "")
+            mods = aiops.clean_modalities(self.ai_cfg.data.get("modalities"))
+            # 预设表里显式写了「纯文本」的（deepseek-chat 之类）：不探也知道是 no
+            if modelsync.known_by_table(model) and "vision" not in mods:
+                return "no"
+            return "unknown"
         except Exception:  # noqa: BLE001  配置坏了不该让发送流程炸
-            return False
+            return "unknown"
+
+    def _ai_vision_on(self) -> bool:
+        """这一轮确定会发图吗（`unknown` 不算 —— 它会先探一次再定）。"""
+        return self._ai_vision_state() == "yes"
 
     def _ai_attach_text(self) -> str:
         """把本轮附件拼进上下文。
@@ -2483,10 +2491,16 @@ class AiDockPage:
             if a.get("image"):
                 wh = _png_size(p)
                 dim = f"，{wh[0]}×{wh[1]}" if wh else ""
-                if self._ai_vision_on():
+                st = self._ai_vision_state()
+                if st == "yes":
                     out.append(head + dim + "，图片，**已随消息附上**）")
                     out.append("  这张图你直接就能看见。描述必须基于图里的实际"
                                "内容；看不清就说看不清，不要按文件名猜。")
+                elif st == "unknown":
+                    out.append(head + dim + "，图片）")
+                    out.append("  这条模型能不能看图还没确认 —— 附图的请求里会顺带"
+                               "探一次（几十 token），通过了你就能直接看到图。"
+                               "在那之前不要假装看过图里的内容。")
                 else:
                     out.append(head + dim + "，图片）")
                     out.append("  需要看图就调用工具处理这条路径；"
@@ -2578,7 +2592,27 @@ class AiDockPage:
 
     # ================================================================ 工作线程
     def _ai_worker(self, goal: str, context: str, skill_text: str,
-                   images: list[str] | None = None) -> None:
+                   img_paths: list[str] | None = None) -> None:
+        # 图片：能力不知道就**自动探一次**（1×1 图，几十 token），再决定发不发。
+        # 这是「预设表会过期」的兜底 —— 正确性不再押在表上，表只负责省一次探针。
+        images: list[str] = []
+        if img_paths:
+            try:
+                ok, why = self.ai_cfg.ensure_vision()
+            except Exception as e:  # noqa: BLE001  探测失败不该毁掉这一轮
+                ok, why = False, f"{type(e).__name__}: {e}"
+            if ok:
+                images, notes = V.collect(img_paths, allow=True)
+                for n in notes:
+                    self.post(self._ai_note, n, "dim")
+                if images:
+                    self.post(self._ai_note,
+                              f"本轮随消息附图 {len(images)} 张（视觉通道）", "ok")
+            else:
+                self.post(self._ai_note,
+                          f"这批图没发出去：{why or '模型不支持看图'}。"
+                          "（可以在「设置 → 模型」里点「探测视觉」复查）", "warn")
+
         # MCP 工具是动态的：每轮开始前刷新一次，别让模型拿着上一轮的清单乱调。
         # 这里在工作线程里跑（会起子进程），失败不影响这一轮的任务。
         try:

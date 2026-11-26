@@ -87,9 +87,9 @@ def make_cfg(name: str = "c.json") -> aiops.AIConfig:
     p = tmp / name
     p.write_text(json.dumps({
         "provider": "deepseek", "base": "https://example.com/v1",
-        "model": "deepseek-flash", "key_enc": "", "max_tokens": 1200,
+        "model": "plain-model-x", "key_enc": "", "max_tokens": 1200,
         "models": [{"id": "m1", "provider": "deepseek", "base": "https://example.com/v1",
-                    "model": "deepseek-flash", "modalities": [],
+                    "model": "plain-model-x", "modalities": [],
                     "caps": {"thinking": {"levels": ["off", "low", "high", "max"],
                                           "default": "high"}, "tools": False}}],
         "active": "m1"}, ensure_ascii=False), encoding="utf-8")
@@ -108,6 +108,18 @@ chk(cfg.vision_ok() is True, "自动结论为真 → 也发（这就是这次补
 cfg.set_cap_src("vision", None, "user")
 chk(cfg.cap_src("vision") == {}, "value=None → 结论作废")
 chk(cfg.vision_ok() is False, "作废后回到「不知道」→ 不发")
+
+# 预设表这一层：deepseek-flash 不用手勾也能发（D1「自动发图」的意图）
+cfg_p = make_cfg("preset.json")
+cfg_p.data["model"] = "deepseek-flash"
+cfg_p.data["modalities"] = []
+cfg_p.data["caps_src"] = {}
+chk(cfg_p.vision_ok() is True, "预设表命中 deepseek-flash → 不勾也发")
+cfg_t = make_cfg("textmodel.json")
+cfg_t.data["model"] = "deepseek-chat"
+cfg_t.data["modalities"] = []
+cfg_t.data["caps_src"] = {}
+chk(cfg_t.vision_ok() is False, "预设表写明纯文本 → 不发（也不浪费探针）")
 
 sec("5. caps_src 要跟着模型档案走")
 cfg = make_cfg()
@@ -170,7 +182,54 @@ try:
 finally:
     aiops._post_json = _real_post
 
-sec("7. open_config：配置与密钥目录绑在一起，解不开要说话")
+sec("7. 懒探测：表过期也不用人管（ensure_vision）")
+calls = {"n": 0}
+
+
+def fake_probe(url, payload, headers, timeout):
+    calls["n"] += 1
+    # 回「红色」——等于承认解码了 1×1 的红图（能过「真的看到像素」这条标准）
+    return {"choices": [{"message": {"content": "红色"}, "finish_reason": "stop"}],
+            "usage": {}}
+
+
+cfg_u = make_cfg("unknown.json")
+cfg_u.set_key("sk-capstest-fake")
+cfg_u.data["model"] = "某网关自建模型-xx"          # 表里没有
+cfg_u.data["modalities"] = []
+cfg_u.data["caps_src"] = {}
+cfg_u.save()
+aiops._post_json = fake_probe
+try:
+    ok1, why1 = cfg_u.ensure_vision()
+    chk(ok1 and calls["n"] == 1, "未知模型 → 自动探一次就通过",
+        f"{str(why1)[:32]} / 请求 {calls['n']} 次")
+    chk(cfg_u.cap_src("vision").get("from") == "probe", "结论记成 probe（写盘，下次不用再探）")
+    ok2, _w = cfg_u.ensure_vision()
+    chk(ok2 and calls["n"] == 1, "第二次直接用结论，不再发请求", f"请求 {calls['n']} 次")
+
+    cfg_x = make_cfg("textonly.json")
+    cfg_x.set_key("sk-capstest-fake")
+    cfg_x.data["model"] = "deepseek-chat"
+    cfg_x.data["modalities"] = []
+    cfg_x.data["caps_src"] = {}
+    cfg_x.save()
+    before = calls["n"]
+    ok3, why3 = cfg_x.ensure_vision()
+    chk(ok3 is False and calls["n"] == before,
+        "预设表白纸黑字「纯文本」→ 不浪费探针，直接不发", str(why3)[:32])
+
+    cfg_y = make_cfg("useroff.json")
+    cfg_y.set_key("sk-capstest-fake")
+    cfg_y.data["model"] = "另一个未知模型"
+    cfg_y.set_cap_src("vision", False, "user", "我关掉的")
+    before = calls["n"]
+    ok4, why4 = cfg_y.ensure_vision()
+    chk(ok4 is False and calls["n"] == before, "用户手动关掉 → 尊重，不探", str(why4)[:32])
+finally:
+    aiops._post_json = _real_post
+
+sec("8. open_config：配置与密钥目录绑在一起，解不开要说话")
 cfg2, meta = aiops.open_config(tmp)          # 临时目录里没有 ai.json
 chk(meta["key_ok"] is False and "ai.json" in meta["key_error"],
     "找不到 ai.json 时 key_error 说得明白", meta["key_error"][:50])

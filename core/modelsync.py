@@ -145,6 +145,18 @@ def guess_with_src(model_id: str) -> tuple[list[str], str]:
     return out, ("preset" if out else "")
 
 
+def known_by_table(model_id: str) -> bool:
+    """这个名字在预设表 / 用户覆盖表里有没有**明确条目**。
+
+    有 = 不用探也知道（`deepseek-chat` 这种写了空列表的算「明确没有视觉」）；
+    没有 = 表过期了或者这是个自建名字，只能靠探针。
+    """
+    low = str(model_id or "").strip().lower()
+    if not low:
+        return False
+    return low in load_user_caps() or low in EXACT_MODALITIES
+
+
 def modality_guess(model_id: str) -> list[str]:
     """从名字猜输入模态。只在同步时用来预勾选，用户随时能改。
 

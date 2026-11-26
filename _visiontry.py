@@ -93,8 +93,11 @@ def main() -> int:
     model = str(cfg.data.get("model") or "")
     src = cfg.cap_src("vision")
     origin = src.get("from") or ("user" if "vision" in (cfg.data.get("modalities") or []) else "未知")
-    print(f"模型：{model} | 视觉判定：{'会发图' if cfg.vision_ok() else '不发图'}"
-          f" | 来源：{origin}")
+    # 和产品保持同一条路径：未知就自动探一次（这里不额外花钱，探针几十 token）
+    can, why_can = cfg.ensure_vision()
+    print(f"模型：{model} | 视觉判定：{'可用' if can else '不可用'}"
+          f" | 来源：{cfg.cap_src('vision').get('from') or origin}"
+          + (f" | {why_can}" if (why_can and not can) else ""))
 
     if a.probe:
         print("\n== 探针（1×1 红图，几十 token）")
