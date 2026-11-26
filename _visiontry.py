@@ -87,7 +87,8 @@ def main() -> int:
         if v:
             cfg.data[k] = v
     if a.key:
-        cfg.set_key(a.key) if hasattr(cfg, "set_key") else None
+        # 只放内存（save=False）：用户说「临时给一把」，就不该在他的配置里留副本
+        cfg.set_key(a.key, save=False)
 
     base = str(cfg.data.get("base") or "").rstrip("/")
     model = str(cfg.data.get("model") or "")

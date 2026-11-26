@@ -2498,8 +2498,8 @@ class AiDockPage:
                                "内容；看不清就说看不清，不要按文件名猜。")
                 elif st == "unknown":
                     out.append(head + dim + "，图片）")
-                    out.append("  这条模型能不能看图还没确认 —— 附图的请求里会顺带"
-                               "探一次（几十 token），通过了你就能直接看到图。"
+                    out.append("  这条模型能不能看图还没确认 —— 发图前会先单独探一次"
+                               "（1×1 的图，几十 token），通过了你就能直接看到图。"
                                "在那之前不要假装看过图里的内容。")
                 else:
                     out.append(head + dim + "，图片）")

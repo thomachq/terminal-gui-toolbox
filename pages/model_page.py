@@ -1384,7 +1384,10 @@ class _ModelForm(tk.Toplevel):
         self.var_mods: dict[str, tk.BooleanVar] = {}
         self.lbl_mod_src: dict[str, tk.Label] = {}
         for key, label in aiops.MODALITIES:
-            var = tk.BooleanVar(value=(key in have))
+            # 显示「有效值」而不是 modalities 的字面值：预设表判定有视觉的模型，
+            # 字面值是空的 → 会显示成没勾，用户看到「（自动·预设·是）」配一个
+            # 空勾选框，只会以为程序坏了。
+            var = tk.BooleanVar(value=self._mod_effective(key))
             U.Check(cell, label, var, font=U.FONT_S).pack(side="left",
                                                           padx=(0, U.px(8)))
             self.var_mods[key] = var
@@ -1396,6 +1399,30 @@ class _ModelForm(tk.Toplevel):
         self._hint(cell, "探测会发一张 1×1 的图（几十 token）；勾选框=这一轮发不发", 260)
         return r + 1
 
+    def _auto_mod(self, key: str) -> bool:
+        """不含用户声明的「自动结论」：探针 / 端点 / 预设表。
+
+        单独抽出来是因为两处都要它：勾选框显示有效值、保存时判断「用户是不是
+        动了这一项」。混进用户声明的话，就没法区分「用户改回自动值」与
+        「用户明确要这个值」。
+        """
+        w = (self.rec.get("caps_src") or {}).get(key) or {}
+        if w.get("from") in ("probe", "endpoint", "preset"):
+            return bool(w.get("value"))
+        if key == "vision":
+            mods, _frm = modelsync.guess_with_src(str(self.rec.get("model") or ""))
+            return "vision" in mods
+        return False
+
+    def _mod_effective(self, key: str) -> bool:
+        """勾选框该显示什么：用户声明 > 自动结论。"""
+        if key in aiops.clean_modalities(self.rec.get("modalities")):
+            return True
+        w = (self.rec.get("caps_src") or {}).get(key) or {}
+        if w.get("from") == "user" and w.get("value") is False:
+            return False
+        return self._auto_mod(key)
+
     def _mod_src_text(self, key: str) -> str:
         """这一条能力结论的来源，一句话说清。"""
         have = key in aiops.clean_modalities(self.rec.get("modalities"))
@@ -1406,8 +1433,13 @@ class _ModelForm(tk.Toplevel):
         tag = {"probe": "探测", "endpoint": "端点", "preset": "预设"}.get(frm, "")
         if tag:
             return f"（自动·{tag}·{'是' if w.get('value') else '否'}）"
-        # 老数据没有 caps_src：勾了就是当年手勾的，没勾就是没声明
-        return "（手动·是）" if have else "（未声明）"
+        if have:
+            return "（手动·是）"          # 老数据：勾了就是当年手勾的
+        if self._auto_mod(key):
+            # 没有 caps_src 记录、但预设表/名字正则判成有 —— 这是最常见的一种，
+            # 不写出来的话界面会显示「未声明」配一个勾上的框，自相矛盾
+            return "（自动·预设·是）"
+        return "（未声明）"
 
     def _probe_vision(self) -> None:
         """发探针验一次视觉。不写盘 —— 结论跟着「保存」一起进档案。"""
@@ -1626,20 +1658,27 @@ class _ModelForm(tk.Toplevel):
             return self._fail("温度要填数字（0–2）")
 
         mods = [k for k, v in self.var_mods.items() if v.get()]
-        # 用户动过勾选，这条结论从此算「手动」；原来的探测说明留在 note 里，
-        # 免得覆盖掉「上次探测说了什么」这条唯一的失败线索。
-        old_mods = aiops.clean_modalities(self.rec.get("modalities"))
+        # 与「自动结论」比，不一样才算用户手动定的：
+        #   · 自动说「是」而用户取消勾选 → 记 from=user/value=False，
+        #     这才压得住预设表与探针结论（只比 modalities 字面值做不到：
+        #     自动为真时字面值本来就是空，「用户取消」与「从来没勾」长得一样）
+        #   · 用户改回与自动一致 → 撤掉手动声明，回到自动
+        # 原来的探测说明留在 note 里，那是唯一的失败线索，别覆盖掉。
         src = dict(self.rec.get("caps_src") or {})
         for mkey in aiops.MODALITY_KEYS:
-            had, has = mkey in old_mods, mkey in mods
-            if had == has:
-                continue
+            want = mkey in mods
+            auto = self._auto_mod(mkey)
             prev = src.get(mkey) or {}
-            keep = str(prev.get("note") or "")
-            src[mkey] = {"from": "user", "value": has,
-                         "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                         "note": (("探测：" + keep) if prev.get("from") == "probe"
-                                  else "在模型表单里手动改的")[:200]}
+            if want != auto:
+                if prev.get("from") == "user" and prev.get("value") == want:
+                    continue                     # 已经是这个意思，别动时间戳
+                keep = str(prev.get("note") or "")
+                src[mkey] = {"from": "user", "value": want,
+                             "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                             "note": (("探测：" + keep) if prev.get("from") == "probe"
+                                      else "在模型表单里手动改的")[:200]}
+            elif prev.get("from") == "user":
+                src.pop(mkey, None)              # 改回自动 → 撤掉手动声明
 
         out = dict(self.rec)
         out.update({

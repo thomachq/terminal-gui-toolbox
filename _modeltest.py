@@ -209,6 +209,26 @@ chk(not hasattr(f, "ent_key"),
 chk(not hasattr(f, "ent_base"),
     "表单里没有接口地址输入框：地址也属于服务商，不在每条模型上重复")
 
+# 能力三态：勾选框显示「有效值」，取消勾选要能压过自动结论
+f_cap = _ModelForm(win, {"id": "cap1", "provider": "deepseek", "name": "能力测试",
+                         "base": "https://api.deepseek.com/v1",
+                         "model": "deepseek-flash", "modalities": [],
+                         "caps_src": {}}, win.ai_cfg)
+pump(win, 0.3)
+chk(f_cap.var_mods["vision"].get() is True,
+    "预设表判定有视觉 → 勾选框显示「是」（显示有效值，不是字面值）")
+chk("预设" in f_cap._mod_src_text("vision"), "来源小字写明是预设表判的",
+    f_cap._mod_src_text("vision"))
+f_cap.var_mods["vision"].set(False)
+f_cap._ok()
+pump(win, 0.2)
+_res = f_cap.result or {}
+chk("vision" not in (_res.get("modalities") or []),
+    "取消勾选后 modalities 里没有 vision", _res.get("modalities"))
+_cs = (_res.get("caps_src") or {}).get("vision") or {}
+chk(_cs.get("from") == "user" and _cs.get("value") is False,
+    "取消勾选记成「手动否」——这是唯一能压过预设表/探针的表达", _cs)
+
 # 新模型的归属就是「从哪家点进来的那一家」
 fp = _ModelForm(win, None, win.ai_cfg, default_provider="ollama")
 pump(win, 0.3)

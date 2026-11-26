@@ -477,14 +477,20 @@ class AIConfig:
         except Exception:  # noqa: BLE001
             return ""
 
-    def set_key(self, plain: str) -> None:
+    def set_key(self, plain: str, save: bool = True) -> None:
+        """写 Key。`save=False` 只用这一次（离线脚本的 `--key`），不落盘。
+
+        为什么要有这个开关：脚本里「临时给一把 Key」如果照常 save，会在用户的
+        `data/ai.json` 里留一份副本 —— 用户以为只是这一次，实际上写进去了。
+        """
         if not plain:
             self.data["key_enc"] = ""
         elif crypto_store is not None:
             self.data["key_enc"] = crypto_store.protect(plain) or ""
         else:
             self.data["key_enc"] = plain  # 极少数情况下退化为明文，界面会提示
-        self.save()
+        if save:
+            self.save()
 
     # ------------------------------------------------------------ 能力（modalities）
     # 一条能力结论从哪来，比结论本身更重要：用户勾的、探针验的、端点说的、
