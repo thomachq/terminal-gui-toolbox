@@ -105,18 +105,54 @@ def _tokens_total(tokens) -> int:
         return 0
 
 
+def _content_brief(content) -> tuple[str, int]:
+    """把一条消息的 content 变成「能看的摘要」，顺便报它占多少字符。
+
+    content 现在有两种形态：纯字符串，以及带图时的 OpenAI 多模态数组
+    （`[{"type":"text"...}, {"type":"image_url"...}]`）。后者**绝不能**直接
+    str() 上去 —— 一张 2 MB 的图 base64 有 2.7 MB 字符，AI 活动流会瞬间刷屏，
+    而且每轮都要为「算长度」遍历几 MB 字符串。图片只报张数与体积。
+    返回 (摘要, 字符数)；字符数用于头部那个「输入多大」的估算。
+    """
+    if not isinstance(content, list):
+        s = str(content or "")
+        return s, len(s)
+    texts: list[str] = []
+    img_bytes: list[int] = []
+    chars = 0
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "text":
+            t = str(part.get("text") or "")
+            texts.append(t)
+            chars += len(t)
+        elif kind == "image_url":
+            url = str((part.get("image_url") or {}).get("url") or "")
+            # base64 膨胀约 4/3，反推原图大小给用户看
+            img_bytes.append(max(0, len(url) * 3 // 4))
+            chars += len(url)
+    body = " ".join(x for x in texts if x)
+    if img_bytes:
+        body += ("  [图片 %d 张：%s]" % (len(img_bytes),
+                                        "、".join(human_size(b) for b in img_bytes)))
+    return body, chars
+
+
 def api_request(*, base: str = "", model: str = "", messages=None,
                 provider: str = "", t: float | None = None) -> list[tuple[str, str]]:
     """一次模型调用的「输入」。messages 是 OpenAI 格式的 list[dict]。"""
     msgs = list(messages or [])
-    chars = sum(len(str(m.get("content") or "")) for m in msgs)
+    briefs = [_content_brief(m.get("content")) for m in msgs]
+    chars = sum(n for _s, n in briefs)
     head = (f"[{ts(t)}] AI ⇢ POST {short_host(base)}/chat/completions"
             f"  ·  {model or '(无模型名)'}"
             f"  ·  {len(msgs)} 条消息 {human_size(chars * 2)}")
     lines = [(head, TAG_HEAD)]
-    for m in msgs:
+    for m, (body, _n) in zip(msgs, briefs):
         role = str(m.get("role") or "?")
-        body = clip(m.get("content") or "", HEAD_MAX)
+        body = clip(body, HEAD_MAX)
         if body:
             lines.append((f"        {role:<9} {body}", TAG_BODY))
     if provider:

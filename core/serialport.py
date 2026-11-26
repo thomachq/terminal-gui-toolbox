@@ -244,7 +244,8 @@ if WIN:  # pragma: no cover - 平台分支，逻辑靠假链路测
             5: "串口被别的程序占用（先关掉串口助手、SecureCRT 之类）",
             31: "这台设备不支持该串口参数",
             1167: "设备没有响应（线没接好或设备没上电）",
-            121: "串口读超时（设备一直没回数据）",
+            121: "端口超时：设备一直没响应（线没接好、没上电，"
+                 "或者这是个没有对端的虚拟串口）",
         }.get(int(code or 0), f"系统错误 {code}")
 
 
@@ -367,7 +368,16 @@ class SerialLink:
             buf = ctypes.create_string_buffer(data, len(data))
             if not _k32.WriteFile(self._h, buf, len(data), ctypes.byref(n), None):
                 raise SerialError(f"写串口失败（{_why(ctypes.get_last_error())}）")
-            return int(n.value)
+            wrote = int(n.value)
+            if wrote <= 0:
+                # WriteFile 报成功但一个字节都没写下去 —— 蓝牙 / 虚拟串口在对端
+                # 不存在时就是这样（2026-11-26 在本机 COM5 上实测到）。
+                # 这里必须报错：静默返回 0 会让上层以为命令发出去了，然后一直等到
+                # 读超时，最后报「设备没响应」，把真实原因（根本没写出去）埋掉。
+                raise SerialError(
+                    f"写串口失败：{self.port} 一个字节都没写下去"
+                    "（虚拟/蓝牙串口没有对端，或设备没上电、流控没协商好）")
+            return wrote
         try:
             return os.write(self._fd, data)
         except OSError as e:

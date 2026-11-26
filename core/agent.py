@@ -442,14 +442,28 @@ class Agent:
         return text
 
     def build_messages(self, goal: str, context: str, transcript: list[str],
-                       skill_text: str = "") -> list[dict]:
+                       skill_text: str = "",
+                       images: list[str] | None = None) -> list[dict]:
+        """拼这一轮发给模型的消息。
+
+        `images` 是 data URL 列表（见 `core/vision.py`）。只有在模型声明了视觉
+        能力时界面才会传；非空时「任务」那条改用 content 数组 —— 这是
+        OpenAI 兼容协议里带图的唯一写法。**不能**把 base64 塞进文本：
+        模型会把 base64 当正文读，既浪费 token 又答非所问。
+        """
         msgs = [{"role": "system",
                  "content": self.system_prompt(context, skill_text)}]
         for h in self.history[-8:]:
             role = h.get("role")
             if role in ("user", "assistant") and h.get("content"):
                 msgs.append({"role": role, "content": str(h["content"])[:4000]})
-        msgs.append({"role": "user", "content": f"任务：{goal}"})
+        if images:
+            parts: list[dict] = [{"type": "text", "text": f"任务：{goal}"}]
+            for url in images:
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+            msgs.append({"role": "user", "content": parts})
+        else:
+            msgs.append({"role": "user", "content": f"任务：{goal}"})
         if transcript:
             msgs.append({"role": "user",
                          "content": "你已经执行过的动作与真实结果：\n"
@@ -467,12 +481,14 @@ class Agent:
 
     # -- 主循环
     def run(self, goal: str, execute, *, context: str = "", skill_text: str = "",
+            images: list[str] | None = None,
             confirm=None, on_event=None, should_stop=None,
             risk_of=None, out_limit: int = 2400,
             poll_inject=None) -> dict:
         """跑一轮任务。
 
         execute(tool_id, args) -> (ok: bool, text: str)   由界面层提供，负责真正落地
+        images: list[str]                                 data URL，随「任务」那条一起发
         confirm(calls: list[dict]) -> bool                 需要人点头时调用
         on_event(kind, payload)                            见下方 emit
         risk_of(call) -> str                              页面动作的真实风险由界面给
@@ -520,7 +536,8 @@ class Agent:
             steps = step
             try:
                 text, usage = aiops.make_engine(self.llm).chat(
-                    self.build_messages(goal, context, transcript, skill_text))
+                    self.build_messages(goal, context, transcript, skill_text,
+                                        images))
             except Exception as e:  # noqa: BLE001  网络/配置错都收在这里
                 msg = str(e) if isinstance(e, aiops.AIError) else f"{type(e).__name__}: {e}"
                 emit("error", {"step": step, "msg": msg})

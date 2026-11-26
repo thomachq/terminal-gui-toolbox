@@ -1346,16 +1346,40 @@ class DshEngine:
                       "elapsed": round(time.time() - t0, 1)}
 
 
+def _plain(content) -> str:
+    """多模态 content → 纯文本（图片只留一句占位）。
+
+    Harness 命令行通道只能收文本。把 base64 原样拼进命令行会直接撞
+    Windows 32K 命令行上限（一张 2 MB 图 = 2.7 MB 字符串），所以图片
+    在这里必须降级成「附了 N 张图」——**宁可丢图也不能让整轮发不出去**。
+    """
+    if not isinstance(content, list):
+        return str(content or "")
+    texts: list[str] = []
+    imgs = 0
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            texts.append(str(part.get("text") or ""))
+        elif part.get("type") == "image_url":
+            imgs += 1
+    out = " ".join(x for x in texts if x)
+    if imgs:
+        out += f"（附了 {imgs} 张图片，命令行通道看不了图）"
+    return out
+
+
 def _flatten(messages: list[dict]) -> str:
     parts = []
     for m in messages:
         role = m.get("role")
         if role == "system":
-            parts.append("【规则】\n" + str(m.get("content")))
+            parts.append("【规则】\n" + _plain(m.get("content")))
         elif role == "assistant":
-            parts.append("【你上次的回答】\n" + str(m.get("content"))[:2000])
+            parts.append("【你上次的回答】\n" + _plain(m.get("content"))[:2000])
         else:
-            parts.append("【用户】\n" + str(m.get("content")))
+            parts.append("【用户】\n" + _plain(m.get("content")))
     parts.append("【提醒】只输出一个 JSON 对象，不要使用任何工具，不要执行命令。")
     return "\n\n".join(parts)
 

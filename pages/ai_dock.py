@@ -36,7 +36,7 @@ from tkinter import filedialog, ttk
 
 import wbtui as U
 from core import agent as A
-from core import ai_skills, aiops, aisession, aitrace, clipfile
+from core import ai_skills, aiops, aisession, aitrace, clipfile, vision as V
 from pages.model_page import ModelDialog
 from ui import forms
 from ui.md import MdView
@@ -2416,10 +2416,20 @@ class AiDockPage:
             f"任务：{goal}" + (f"（技能 {skill.name}）" if skill is not None else ""),
             tone="ok"), ensure=True)
         ctx = self._ai_context_text()
+        # 图片走真正的视觉通道：转成 data URL 随「任务」那条一起发。
+        # 必须在 `_ai_attach_clear()` 之前收集 —— 清完就只剩空列表了。
+        images: list[str] = []
+        img_paths = [a["path"] for a in self._ai_attach if a.get("image")]
+        if img_paths:
+            images, notes = V.collect(img_paths, allow=self._ai_vision_on())
+            for n in notes:
+                self._ai_note(n, "dim")
+            if images:
+                self._ai_note(f"本轮随消息附图 {len(images)} 张（视觉通道）", "ok")
         # 上下文已经拼进 ctx，输入框上的附件可以撤了；_ai_files_seen 留着，
         # 下次还能从「引用对话中的文件」里把它拿回来。
         self._ai_attach_clear()
-        threading.Thread(target=self._ai_worker, args=(goal, ctx, skill_text),
+        threading.Thread(target=self._ai_worker, args=(goal, ctx, skill_text, images),
                          daemon=True).start()
 
     def _ai_context_text(self) -> str:
@@ -2444,12 +2454,25 @@ class AiDockPage:
             lines.append(block)
         return "\n".join(lines)
 
+    def _ai_vision_on(self) -> bool:
+        """当前模型有没有勾「视觉」。
+
+        勾了才把图发出去：没勾还发，网关多半回 400，用户只会看到一句
+        莫名其妙的报错。这个判断读的是当前模型那条档案（扁平镜像），
+        和设置页里那个「视觉」勾选框是同一个字段。
+        """
+        try:
+            mods = aiops.clean_modalities(self.ai_cfg.data.get("modalities"))
+        except Exception:  # noqa: BLE001  配置坏了不该让发送流程炸
+            mods = []
+        return "vision" in mods
+
     def _ai_attach_text(self) -> str:
         """把本轮附件拼进上下文。
 
         文本类直接内联内容 —— 模型不用再花一步去「读文件」，问一句答一句更快。
-        图片只报路径和尺寸：这一版没接视觉通道，把 PNG 塞进提示词纯属浪费；
-        但它可以用 exec 去处理（比如识别不了也能 tell 用户图在哪）。
+        图片分两种说法：模型勾了视觉 → 告诉它「图已随消息附上，直接看」；
+        没勾 → 只报路径和尺寸，并明确禁止它假装看过（老文案，保留）。
         二进制与超限文件只报存在，让模型自己决定要不要读。
         """
         if not self._ai_attach:
@@ -2461,9 +2484,14 @@ class AiDockPage:
             if a.get("image"):
                 wh = _png_size(p)
                 dim = f"，{wh[0]}×{wh[1]}" if wh else ""
-                out.append(head + dim + "，图片）")
-                out.append("  需要看图就调用工具处理这条路径；"
-                           "不要假装看过图里的内容。")
+                if self._ai_vision_on():
+                    out.append(head + dim + "，图片，**已随消息附上**）")
+                    out.append("  这张图你直接就能看见。描述必须基于图里的实际"
+                               "内容；看不清就说看不清，不要按文件名猜。")
+                else:
+                    out.append(head + dim + "，图片）")
+                    out.append("  需要看图就调用工具处理这条路径；"
+                               "不要假装看过图里的内容。")
                 continue
             out.append(head + "）")
             body = _read_small_text(p, ATTACH_INLINE_LIMIT)
@@ -2550,7 +2578,8 @@ class AiDockPage:
         self.toast("会话已清空", "ok")
 
     # ================================================================ 工作线程
-    def _ai_worker(self, goal: str, context: str, skill_text: str) -> None:
+    def _ai_worker(self, goal: str, context: str, skill_text: str,
+                   images: list[str] | None = None) -> None:
         # MCP 工具是动态的：每轮开始前刷新一次，别让模型拿着上一轮的清单乱调。
         # 这里在工作线程里跑（会起子进程），失败不影响这一轮的任务。
         try:
@@ -2561,6 +2590,7 @@ class AiDockPage:
         try:
             res = self.agent.run(
                 goal, self._ai_tool_exec, context=context, skill_text=skill_text,
+                images=images,
                 confirm=self._ai_confirm_call,
                 on_event=lambda k, p: self.post(self._ai_dock_event, k, p),
                 should_stop=lambda: self._ai_stop.is_set(),
