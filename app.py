@@ -264,6 +264,14 @@ class _TermCtl:
     def term_run(self, cmd: str, done) -> None:
         self.app.term_run(cmd, done, self.sid)
 
+    def term_capture(self, cmd: str, timeout: int = 8) -> tuple[int, str, str]:
+        """同步跑一条命令（Tab 补全问目录用）。"""
+        return self.app.term_capture(cmd, self.sid, timeout)
+
+    def term_host_kind(self) -> str:
+        """`network` / `unix` / `windows`……补全要靠它决定能不能发 `ls`。"""
+        return self.app.term_host_kind(self.sid)
+
     def term_embed(self, w=None) -> None:
         self.app.term_embed(w)
 
@@ -4236,6 +4244,34 @@ class ToolboxApp(RoutesPage, RemotePage, SecurityPage, DbPage, CronPage,
             done(rc, out, err, int((time.time() - t0) * 1000))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def term_host_kind(self, sid: str = "") -> str:
+        s = self._sid_session(sid)
+        return str(getattr(s, "host_kind", "") or "") if s is not None else ""
+
+    def term_capture(self, cmd: str, sid: str = "",
+                     timeout: int = 8) -> tuple[int, str, str]:
+        """同步执行一条命令，给「问一句就回」的场景用（Tab 补全查目录）。
+
+        与 `term_run` 的差别只有同步：补全要在工作线程里拿到结果之后
+        再去对齐用户当前输入，异步回调会把这段逻辑拆成三段互相传状态。
+        """
+        s = self._sid_session(sid)
+        if s is None:
+            return 1, "", "未连接"
+        cwd = self.term_cwd(sid)
+        if (getattr(s, "host_kind", "") == "network"
+                or str(getattr(s, "kind", "")) in ("com", "adb", "hdc")):
+            full = cmd
+        elif self._sid_family(sid) == "windows":
+            full = (f"Set-Location -LiteralPath '{cwd}' "
+                    f"-ErrorAction SilentlyContinue; {cmd}")
+        else:
+            full = f"cd -- {shlex.quote(cwd)} 2>/dev/null; {cmd}"
+        try:
+            return term_exec(s, full, timeout=timeout)
+        except Exception as e:  # noqa: BLE001  补全失败只需「查不到」
+            return 1, "", str(e)
 
     def _render_device(self, dev: DeviceInfo, s):
         for w in self.kv_holder.winfo_children():

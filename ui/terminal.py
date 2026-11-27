@@ -37,6 +37,9 @@ from __future__ import annotations
 import os
 import queue
 import time
+import shlex
+import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -47,6 +50,102 @@ MAX_LINES = 4000          # 超过就从头砍，长跑一晚也不会把内存�
 HIST_MAX = 300
 # Tab 补全的内建命令候选（与 _help 里那张表保持一致）。
 BUILTIN_CMDS = ("clear", "cls", "history", "cd", "help", "exit", "quit")
+
+#: 这些命令后面跟的是路径，Tab 才值得去问设备要目录清单。
+#: 不在这里的命令（如 `systemctl`、`docker`）参数千奇百怪，发 `ls` 只会白跑一趟。
+PATH_CMDS = frozenset((
+    "cd", "ls", "ll", "la", "cat", "less", "more", "head", "tail", "vi", "vim",
+    "nano", "emacs", "cp", "mv", "rm", "mkdir", "rmdir", "touch", "chmod",
+    "chown", "chgrp", "ln", "stat", "file", "find", "du", "df", "tar", "unzip",
+    "zip", "gzip", "gunzip", "scp", "rsync", "md5sum", "sha256sum", "diff",
+    "source", "sh", "bash", "python3", "python", "nohup",
+))
+#: 列目录一次要发一条命令，短时间内重复按 Tab 不该重复发。
+PATH_CACHE_TTL = 4.0
+PATH_CACHE_MAX = 24
+
+
+def completion_kind(line: str) -> tuple[str, str, str]:
+    """这一次 Tab 该补什么：`(kind, 命令, 行尾词)`，kind ∈ `cmd` / `path` / `none`。
+
+    抽成纯函数是因为 Tab 的绑定必须 `return "break"`，没有窗口就测不了；
+    但「这次该问远端要目录、还是补命令名」这条判断完全可以脱离 UI 测。
+    """
+    word = line.rsplit(" ", 1)[-1] if line else ""
+    prefix = word.strip()
+    head = line[: len(line) - len(word)].strip()
+    cmd = head.split()[0] if head else ""
+    if not cmd:
+        return "cmd", "", word             # 行首：补命令名
+    if prefix.startswith("-"):
+        return "none", cmd, word           # `ls -l` 这种开关，不猜
+    if cmd in PATH_CMDS or "/" in prefix:
+        return "path", cmd, word
+    return "cmd", cmd, word
+
+
+def split_dir_prefix(token: str) -> tuple[str, str]:
+    """把行尾词切成「目录前缀 + 名字前缀」。
+
+    `/` 和 `\\` 都得认：本机 Windows 的终端里用户敲的是 `C:\\Us`，
+    只认 `/` 的话会把整串当成名字前缀，补出来的候选不带盘符 —— 一补就丢路径。
+    """
+    token = str(token or "")
+    cut = max(token.rfind("/"), token.rfind("\\"))
+    if cut < 0:
+        return "", token
+    return token[: cut + 1], token[cut + 1:]
+
+
+def _ps_quote(s: str) -> str:
+    """PowerShell 单引号字符串（内部单引号翻倍）。"""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def path_list_cmd(kind: str, dir_spec: str) -> str:
+    """问设备要目录清单的命令。
+
+    两种外壳不能混用：Windows 本机（PowerShell）没有 `ls -1p`，`ls` 只是
+    `Get-ChildItem` 的别名，参数一给就报错 —— 于是「本机终端里 Tab 补不了路径」
+    而 Linux 上好好的。这里按 `host_kind` 分开生成，两边输出格式统一成
+    「一 行 一 个名字，目录带 `/` 后缀」。
+    """
+    if str(kind or "").lower() == "windows":
+        d = dir_spec or "."
+        return ("Get-ChildItem -LiteralPath " + _ps_quote(d) + " -Force "
+                "-ErrorAction SilentlyContinue | ForEach-Object { "
+                "$_.Name + $(if ($_.PSIsContainer) { '/' } else { '' }) }")
+    return f"ls -1p -- {shlex.quote(dir_spec or './')} 2>/dev/null"
+
+
+def parse_ls_listing(token: str, text: str) -> list[str]:
+    """把 `ls -1p -- <dir>` 的输出变成「整词候选」。
+
+    抽成纯函数是为了能测：这段逻辑里有三个容易写错的地方 ——
+      ① `.` 开头的隐藏文件必须保留（`lstrip("./")` 会把 `.bashrc` 削成 `bashrc`）；
+      ② 目录带 `/` 后缀（`-p` 给的），补上之后用户能直接接着 Tab 下一层；
+      ③ token 已经带了目录前缀（`cd /var/lo`）时，候选也要带同样的前缀，
+         否则补进去的是裸文件名，替换掉整个 token 之后路径就丢了。
+    """
+    token = str(token or "")
+    dir_part, name_part = split_dir_prefix(token)
+    out: list[str] = []
+    for line in str(text or "").splitlines():
+        s = line.strip()
+        if not s or s.endswith(":"):        # `ls` 多目录时打的 "xxx:" 头
+            continue
+        if dir_part:
+            if not s.startswith(dir_part):
+                continue
+            s = s[len(dir_part):]
+        elif s.startswith("./"):
+            s = s[2:]                       # 只剥一次，不动 `.bashrc`
+        if not s.startswith(name_part):
+            continue
+        word = dir_part + s
+        if word not in out:
+            out.append(word)
+    return out
 
 # 记住用户上次选的输入形态（本进程内有效，重开窗口不跳回去）。
 # 默认行内：没有独立输入行，就不会被底部日志面板挤掉（用户 2026-10-25 要求
@@ -89,6 +188,8 @@ class _TermShell:
         # 旁路送来同一条命令时按文本比对吞掉，跟执行顺序无关。
         self._own_cmd = ""
         self._own_ts = 0.0
+        #: 远端目录清单缓存：(目录, 机器) → (时间, 候选)。按 Tab 连按不会连发 ls。
+        self._path_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
         self._sync = tk.BooleanVar(value=True)
         self._prompt_str = ""      # 行内模式写在正文里的提示符
         # 命令在后台线程跑，结果不能直接调 after —— 跨线程注册回调会在
@@ -623,6 +724,12 @@ class _TermShell:
     def _complete(self, _e=None):
         """Tab 补全当前正敲的那个词（行尾 token）。
 
+        三条路，按顺序判：
+          ① 第一个词 = 命令名 → 内建命令 + 历史（本地就有，立即出）；
+          ② 命令是文件类命令（cd/ls/cat…）或这个词已经带 `/` → **远端路径**，
+             发一条 `ls` 去问（异步，回来再填，查不到不伪造）；
+          ③ 其它 → 还是本地命令池，不猜。
+
         · 唯一候选：补全到整个词；
         · 多个候选：补到公共前缀，并把候选列出来让用户再敲一个字；
         · 没候选：原样不动（绝不打断输入）。
@@ -635,6 +742,16 @@ class _TermShell:
         # 光标前的最后一个词：行尾若有空格，补的是「新词」（空前缀=列出全部）
         word = line.rsplit(" ", 1)[-1] if line else ""
         prefix = word.strip()
+
+        # ② 路径补全：命令吃路径，或这个词本身就是路径
+        kind, _cmd, _w = completion_kind(line)
+        if kind == "path":
+            self._complete_path(line, word)
+            return "break"
+        if kind == "none":
+            return "break"
+
+        # ① ③ 命令名补全（原来那套）
         try:
             pool = self._completion_pool()
         except tk.TclError:
@@ -654,6 +771,71 @@ class _TermShell:
         if self.mode != "inline":
             self.entry.icursor("end")
         return "break"
+
+    # ------------------------------------------------------------ 远端路径补全
+    def _complete_path(self, line: str, word: str) -> None:
+        """问设备要目录清单，回来只替换行尾那个词。
+
+        三条规矩（原 `_TODO_20261121.md` 就写死了，别改）：
+          · **发命令查**，不猜（本地没有远端目录的任何信息）；
+          · **异步回填**，绝不阻塞输入；
+          · **查不到就不动** —— 不伪造候选、不清空用户打的字、不弹窗。
+        网络设备（交换机）没有 `ls`，直接不补，免得往 console 上扔垃圾命令。
+        """
+        try:
+            ready = bool(self.ctrl.term_ready())
+            kind = str(self.ctrl.term_host_kind() or "")
+        except Exception:  # noqa: BLE001  套接字断了就当没连
+            return
+        if not ready or self._busy or kind == "network":
+            return
+        token = word
+        dir_part, _name = split_dir_prefix(token)
+        ls_dir = dir_part or "./"
+        snapshot = line
+        cache_key = (ls_dir, kind)
+        hit = self._path_cache.get(cache_key)
+        if hit and (time.monotonic() - hit[0]) < PATH_CACHE_TTL:
+            self._apply_path(snapshot, token, hit[1])
+            return
+
+        def work():
+            text = ""
+            try:
+                rc, out, _err = self.ctrl.term_capture(
+                    path_list_cmd(kind, ls_dir), 8)
+                if rc == 0:
+                    text = out or ""
+            except Exception:  # noqa: BLE001
+                text = ""
+            items = parse_ls_listing(token, text)
+            if len(self._path_cache) > PATH_CACHE_MAX:
+                self._path_cache.clear()
+            self._path_cache[cache_key] = (time.monotonic(), items)
+            self.post(lambda: self._apply_path(snapshot, token, items))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_path(self, snapshot: str, token: str, items: list[str]) -> None:
+        """把候选填进输入框 —— 前提是用户没在这期间接着敲别的。"""
+        if not items:
+            return
+        try:
+            if self._get_input() != snapshot:
+                return          # 用户已经改了，这次结果过期，丢掉（不抢输入）
+        except tk.TclError:
+            return
+        head = snapshot[: len(snapshot) - len(token)]
+        if len(items) == 1:
+            done = items[0]
+        else:
+            done = os.path.commonprefix(items)
+            if done == token:                   # 前缀没推进，别装作补全了
+                self.write("  ".join(items) + "\n", "meta")
+                return
+        self._set_input(head + done)
+        if self.mode != "inline":
+            self.entry.icursor("end")
 
     def _sigint(self, _e=None):
         if self._busy:
@@ -773,7 +955,10 @@ class _TermShell:
             "  cd <目录>     换目录       help      这条\n"
             "  exit / quit   关闭窗口\n"
             "其它一律原样发到当前会话执行。\n"
-            "Ctrl+L 清屏，↑↓ 翻历史，Tab 补全指令（内建 + 历史），Ctrl+C 放弃等待。\n",
+            "Ctrl+L 清屏，↑↓ 翻历史，Ctrl+C 放弃等待。\n"
+            "Tab 补全：行首补命令（内建 + 历史）；cd/ls/cat 这类命令后面补"
+            "**远端路径**\n"
+            "（会发一条 ls 去问设备，查不到就不补，不会瞎猜）。\n",
             "meta")
 
     # ------------------------------------------------------------ 生命周期

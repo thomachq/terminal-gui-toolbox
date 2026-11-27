@@ -247,7 +247,13 @@ def main() -> int:
     app.v_proto.set("local")
     app._proto_changed()
     app.do_connect()
-    pump(app, 3.2)
+    # 等「连上」而不是等固定 3.2 秒：本机连接要起 PowerShell 拿 hostname/OS/CPU，
+    # 冷启动被 Defender 扫一遍就可能超过 3 秒，于是 5 项断言连锁失败 ——
+    # 那是测试等太短，不是连接坏了（判据仍然是「连上且 kind=local」）。
+    _deadline = time.time() + 20
+    while time.time() < _deadline and app.session is None:
+        pump(app, 0.3)
+    pump(app, 1.2)
     s = app.session
     chk(s is not None and s.kind == "local", "本机连接建立")
     d = app.device
