@@ -268,6 +268,10 @@ chk(not (HERE / "pages" / "ai_page.py").exists(), "pages/ai_page.py 已删（AiP
 chk((HERE / "ui" / "skillwidgets.py").is_file(), "ui/skillwidgets.py 在位（SkillPanel/SkillDialog）")
 chk("pages.ai_page" not in _spec, "toolbox.spec 不再引用已删模块")
 chk("ui.skillwidgets" in _spec, "toolbox.spec 登记了 ui.skillwidgets")
+chk("core.proxycheck" in _spec, "toolbox.spec 登记了 core.proxycheck（运行时 import）")
+chk((HERE / "_runall.py").is_file(), "_runall.py 在（统一自测运行器）")
+chk((HERE / "_proxychaintest.py").is_file(), "_proxychaintest.py 在（代理链验证）")
+chk((HERE / "_vcomtest.py").is_file(), "_vcomtest.py 在（虚拟 console 设备）")
 
 
 print(f"\n{'=' * 52}")

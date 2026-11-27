@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from tkinter import messagebox
 
@@ -39,6 +40,9 @@ class ProxyPage:
         U.RoundButton(bar, "刷新", self.proxy_refresh, variant="ghost",
                       font=U.FONT_S, height=30, padx=10).pack(side="left",
                                                               padx=(U.px(6), 0))
+        U.RoundButton(bar, "测试链路", lambda: self.proxy_test(None),
+                      variant="ghost", font=U.FONT_S, height=30,
+                      padx=10).pack(side="left", padx=(U.px(6), 0))
 
         self.v_proxy_kind = tk.StringVar(value="全部类型")
         self.cb_proxy_kind = tk.OptionMenu(bar, self.v_proxy_kind, "全部类型",
@@ -57,6 +61,7 @@ class ProxyPage:
         self.tbl_proxy.grid(row=1, column=0, sticky="nsew")
         self.tbl_proxy.set_menu([
             ("编辑", lambda: self.proxy_edit(self._proxy_pick()), None),
+            ("测试链路", lambda: self.proxy_test(self._proxy_pick()), None),
             ("复制地址", lambda: self._proxy_copy_addr(), None),
             (None, None, None),
             ("删除", lambda: self.proxy_del(self._proxy_pick()), None),
@@ -110,6 +115,39 @@ class ProxyPage:
         p = self._proxy_pick()
         if p:
             self.copy_text(P.addr_of(p), "代理地址")
+
+    # ================================================================ 连通性
+    def proxy_test(self, rec: dict | None = None) -> None:
+        """验证整条链能不能真的把连接送出去（R-004）。
+
+        为什么放工作线程：一次验证要逐跳握手，最坏会等好几个超时叠加，
+        在 UI 线程做就是「点一下卡二十秒」。
+        """
+        rec = rec if rec is not None else self._proxy_pick()
+        pid = str((rec or {}).get("id") or "")
+        if not pid:
+            self.toast("先在表里选一条代理再测试", "warn")
+            return
+        name = str((rec or {}).get("name") or pid)
+        self.toast(f"正在验证「{name}」的链路…", "ok")
+
+        def work():
+            from core import proxycheck as PC
+            try:
+                res = PC.check_chain(self.proxies.proxies, pid)
+            except Exception as e:  # noqa: BLE001  验证失败不该把界面带崩
+                res = {"ok": False, "chain": name, "hops": [], "e2e": {},
+                       "error": f"{type(e).__name__}: {e}", "ms": 0,
+                       "target": "—"}
+            self.post(self._proxy_test_done, res)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _proxy_test_done(self, res: dict) -> None:
+        from core import proxycheck as PC      # 排版在核心里，界面只是个壳
+        forms.InfoDialog.show(self, "代理链测试",
+                              "\n".join(PC.format_report(res)),
+                              width=780, height=380)
 
     # ================================================================ 增删改
     def proxy_add(self) -> None:

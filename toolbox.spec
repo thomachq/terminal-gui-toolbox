@@ -49,6 +49,7 @@ hidden = [
     'core.clipfile',
     'core.vision',          # 视觉通道（v1.0.40）：图片 → data URL，也是运行时 import
     'core.modelsync',       # 模型能力/限制同步（v1.0.40）：预设表 + 端点模态解析
+    'core.proxycheck',      # 代理链连通性验证（v1.0.40）：运行时 import
     'core.aisession',
     'core.ai_skills', 'core.ai_skills_builtin', 'core.agent',
     'ui.statusbar', 'ui.logpanel', 'ui.table', 'ui.forms',
