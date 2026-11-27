@@ -281,7 +281,7 @@ PORTABLE_README = """Terminal GUI Toolbox v{ver} · Windows x64 便携版
   默认「自动」＝先找系统 PATH，找不到才用 bin\\；也可以在设置中心改成只用内置。
   COM 口（console）不需要任何外部程序。
 
-版本：v{ver}    (2026-10-23)
+版本：v{ver}    ({date})
 仓库：https://github.com/thomachq/terminal-gui-toolbox
 """
 
@@ -304,7 +304,7 @@ def make_portable() -> Path:
                     add_file(zf, p, f"Terminal-GUI-Toolbox-{VER}-windows-x64/bin/{p.name}")
         # 使用说明单独写一份给最终用户看的（不含构建内容）
         tmp = OUT / f"_portable_README_{VER}.txt"
-        tmp.write_text(PORTABLE_README.format(ver=VER), encoding="utf-8")
+        tmp.write_text(PORTABLE_README.format(ver=VER, date=date.today().isoformat()), encoding="utf-8")
         add_file(zf, tmp, f"Terminal-GUI-Toolbox-{VER}-windows-x64/使用说明.txt")
         tmp.unlink(missing_ok=True)
         # 空的 data 目录占位，用户一眼知道数据在哪儿

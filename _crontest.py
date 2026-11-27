@@ -163,6 +163,36 @@ def test_rewrite() -> None:
     chk(sysj.strip() == "5 2 * * * root /root.sh", "系统级追加带用户", sysj.strip())
 
 
+def test_edit() -> None:
+    print("== 8. 编辑与备份（R-003） ==")
+    raw = "0 3 * * * /usr/local/bin/backup.sh --full"
+    new = C.build_job_line("30 4 * * *", "/usr/local/bin/backup.sh --incr")
+    edited = C.replace_raw(TAB, raw, new)
+    chk(new in edited and raw not in edited, "只换目标行")
+    chk("*/5 * * * *" in edited, "相邻行没被误改")
+    chk(C.replace_raw(TAB, "不存在的一行", new) == TAB, "找不到就原样返回")
+    off = C.toggle_raw(TAB, raw)
+    ed2 = C.replace_raw(off, "# " + raw, new)
+    chk("# " + new in ed2, "停用行编辑后仍停用（不偷偷启用）")
+    ind = "    " + raw + "\n"
+    chk(C.replace_raw(ind, raw, new).startswith("    " + new), "缩进保留")
+    chk(C.build_job_line("5 2 * * *", "/x", user="root") == "5 2 * * * root /x",
+        "系统级插用户列")
+    chk(C.build_job_line("@daily", "/x", user="root") == "@daily /x",
+        "时间宏不插用户列")
+    bc = C.backup_cmd("crontab", "20261128-010203")
+    chk("crontab -l" in bc and ".tb-backup.20261128-010203" in bc,
+        "crontab 备份命令带时间戳")
+    bf = C.backup_cmd("/etc/cron.d/foo", "20261128-010203")
+    chk(bf.startswith("cp -p") and "/etc/cron.d/foo.tb-backup." in bf,
+        "系统级文件备份命令")
+    chk("crontab " in C.rollback_hint("crontab", "/home/u/.crontab.tb-backup.x"),
+        "回滚提示是人话命令")
+    chk("cp -p" in C.rollback_hint("/etc/cron.d/foo", "/etc/cron.d/foo.tb-backup.x"),
+        "文件回滚提示")
+    chk("没有备份" in C.rollback_hint("crontab", ""), "没备份时明说")
+
+
 def test_bundle() -> None:
     print("== 6. 一次读全 ==")
     text = ("@@crontab\n0 2 * * * /bin/true\n"
@@ -220,6 +250,7 @@ def main() -> int:
     test_rewrite()
     test_bundle()
     test_write()
+    test_edit()
     npass = sum(1 for ok, _, _ in RESULTS if ok)
     print(f"\n合计 {len(RESULTS)} 项：通过 {npass}，失败 {len(RESULTS) - npass}")
     for ok, name, detail in RESULTS:

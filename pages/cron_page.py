@@ -12,6 +12,7 @@ cron 的格式太容易被一行 sed 改坏，而整份写回至少能保证改�
 """
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -85,6 +86,9 @@ class CronPage:
         self.btn_cron_add = U.RoundButton(row, "新增任务", self.cron_add,
                                           variant="primary", height=32, padx=16)
         self.btn_cron_add.pack(side="right", padx=(0, U.px(6)))
+        self.btn_cron_edit = U.RoundButton(row, "编辑", self.cron_edit,
+                                           variant="secondary", height=32, padx=14)
+        self.btn_cron_edit.pack(side="right", padx=(0, U.px(6)))
 
         c2 = U.Card(pg, title="任务列表", hint="双击看原文 · 右键更多")
         c2.grid(row=1, column=0, sticky="nsew", pady=(U.px(10), 0))
@@ -99,6 +103,7 @@ class CronPage:
             ("复制命令", lambda r: self.copy_text(r.get("command", ""), "命令"),
              lambda r: bool(r)),
             (None, None, None),
+            ("编辑调度 / 命令", self.cron_edit, lambda r: bool(r)),
             ("启用 / 停用", self.cron_toggle, lambda r: bool(r)),
             ("立即执行一次", self.cron_run_now, lambda r: bool(r)),
             ("删除这条", self.cron_del, lambda r: bool(r)),
@@ -117,8 +122,8 @@ class CronPage:
 
     # ------------------------------------------------------------ 状态
     def _cron_set_enabled(self, on: bool):
-        for btn in (self.btn_cron_add, self.btn_cron_del, self.btn_cron_toggle,
-                    self.btn_cron_run):
+        for btn in (self.btn_cron_add, self.btn_cron_edit, self.btn_cron_del,
+                    self.btn_cron_toggle, self.btn_cron_run):
             btn.set_enabled(on)
 
     def _cron_log(self, text: str) -> None:
@@ -249,6 +254,12 @@ class CronPage:
         return key, (self.cron_bundle.get("files") or {}).get(key, "")
 
     def _cron_write(self, key: str, text: str, label: str):
+        """整份写回，但**先备份**（R-003 三条规矩）：
+
+        ① 不备份就不写 —— 备份失败直接中止，原文一个字不动；
+        ② 只改目标行 —— 调用方给来的 text 已是「原文上改一行」的结果；
+        ③ 每步进日志 —— 备份路径、写入结果、回滚命令都留在操作记录里。
+        """
         s = self._active_session()
         if s is None:
             self.toast("没有连接的设备", "err")
@@ -258,25 +269,111 @@ class CronPage:
         self.status.set_state(f"写入 {label}…")
 
         def work():
-            return s.run_admin(cmd, timeout=45) if needs_admin else s.run(cmd, timeout=45)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            bcmd = C.backup_cmd(key, stamp)
+            brc, bout, berr = (s.run_admin(bcmd, timeout=30) if needs_admin
+                               else s.run(bcmd, timeout=30))
+            lines = [ln for ln in (bout or "").splitlines() if ln.strip()]
+            backup_path = lines[-1].strip() if lines else ""
+            if key != "crontab" and (brc != 0 or not backup_path):
+                # 系统级文件备不了（多半是权限）→ 不写，原文不动
+                return ("BACKUP_FAIL", (berr or bout or f"rc={brc}").strip(), "")
+            rc, out, err = (s.run_admin(cmd, timeout=45) if needs_admin
+                            else s.run(cmd, timeout=45))
+            return (rc, out, err, backup_path)
 
         def done(res):
-            rc, out, err = res
+            if res[0] == "BACKUP_FAIL":
+                msg = str(res[1])[:400]
+                self._cron_log(f"[备份] {label} · 失败：{msg}（已中止，未写入）")
+                self._log_raw("bad", f"[计划任务] 备份 {label} 失败，未写入：{msg}\n")
+                self.status.set_state("备份失败，未写入", "err")
+                forms.confirm(self, "备份失败，没有写入",
+                              f"{label}\n\n{msg}\n\n"
+                              "备份不成功就不动原文 —— 多半是权限不够，"
+                              "用管理员会话再试。")
+                return
+            rc, out, err, backup_path = res
+            if backup_path:
+                self._cron_log(f"[备份] {backup_path}")
+            else:
+                self._cron_log("[备份] 原本没有这份 crontab（首次写入），无旧文可备")
             if rc == 0:
                 self._cron_log(f"[写入] {label} · 成功")
-                self._log_raw("ok", f"[计划任务] 写入 {label}\n")
+                self._log_raw("ok", f"[计划任务] 写入 {label}（备份 {backup_path or '无'}）\n")
                 self.status.set_state(f"{label} 已更新", "ok")
                 self.toast(f"{label} 已更新", "ok")
                 self.after(300, self.cron_load)
             else:
                 msg = (err or out or f"rc={rc}").strip()[:400]
+                hint = C.rollback_hint(key, backup_path)
                 self._cron_log(f"[写入] {label} · 失败：{msg}")
+                self._cron_log(f"[回滚] {hint}")
                 self._log_raw("bad", f"[计划任务] 写入 {label} 失败：{msg}\n")
                 self.status.set_state("写入失败", "err")
-                forms.confirm(self, "写入失败", f"{label}\n\n{msg}")
+                forms.confirm(self, "写入失败",
+                              f"{label}\n\n{msg}\n\n要回到写之前的样子：\n{hint}")
 
         self.bg(work, ok=done, err=lambda m: (
             self._cron_log(f"[写入] {m}"), self.status.set_state(m, "err")))
+
+    def cron_edit(self, row=None):
+        """改一条已有任务的调度 / 命令（R-003）。
+
+        只支持 cron 系（用户 crontab / /etc/crontab / cron.d）：
+        timer 归 systemd，schtasks 的 /change 参数是另一套，不在这里硬套。
+        """
+        job = self._cron_pick(row)
+        if job is None:
+            return
+        if job.source == "timer":
+            return self._timer_hint(job)
+        if job.source == "schtasks":
+            return forms.confirm(
+                self, "Windows 计划任务不在这里改",
+                "schtasks 的修改参数与 cron 不是一套。\n\n"
+                f"命令行：schtasks /change /tn \"{job.unit or job.schedule}\" ...\n"
+                "或打开「任务计划程序」图形界面改。")
+        key, text = self._cron_text_of(job)
+        if not key:
+            self.toast("这条任务不在可改的位置", "warn")
+            return
+        is_sys = key != "crontab"
+        fields = [
+            {"key": "schedule", "label": "调度", "default": job.schedule,
+             "required": True, "width": 24,
+             "hint": "分 时 日 月 周，如 0 3 * * * / */10 * * * * / @daily"},
+            {"key": "command", "label": "命令", "default": job.command,
+             "required": True, "width": 46, "hint": "写绝对路径"},
+        ]
+        if is_sys:
+            fields.append({"key": "user", "label": "运行用户",
+                           "default": job.user or "root",
+                           "hint": "系统级任务才有这一列"})
+        data = forms.FormDialog.open(
+            self, "编辑计划任务", fields,
+            subtitle="只改这一行；写前自动备份，停用状态保持不变")
+        if not data:
+            return
+        spec = str(data.get("schedule") or "").strip()
+        err = C.validate_schedule(spec)
+        if err:
+            return forms.confirm(self, "调度表达式不合法", err)
+        command = str(data.get("command") or "").strip()
+        user = str(data.get("user") or "").strip() if is_sys else ""
+        new_line = C.build_job_line(spec, command, user)
+        new_text = C.replace_raw(text, job.raw, new_line)
+        if new_text == text:
+            self.toast("没找到这一行，可能刚被别处改过；先刷新", "warn")
+            return
+        state_note = "" if job.enabled else "\n（这条目前是停用的，改完仍保持停用）"
+        if not forms.confirm(
+                self, "确认修改",
+                f"位置：{key}\n\n旧：{job.raw}\n新：{new_line}{state_note}\n\n"
+                "写之前会先备份原文。继续？",
+                ok_text="备份并写入"):
+            return
+        self._cron_write(key, new_text, key)
 
     def cron_toggle(self, row=None):
         job = self._cron_pick(row)
@@ -354,7 +451,7 @@ class CronPage:
             key = "crontab"
             text = self.cron_bundle.get("crontab", "")
             new_text = C.append_job(text, spec, command,
-                                    comment="Terminal Toolbox 新增")
+                                    comment="tb: Terminal Toolbox 新增")
             label = "用户 crontab"
         else:
             name = str(data.get("name") or "").strip() or "toolbox-task"
@@ -365,7 +462,7 @@ class CronPage:
             text = (self.cron_bundle.get("files") or {}).get(key, "")
             new_text = C.append_job(text, spec, command,
                                     user=str(data.get("user") or "root").strip(),
-                                    comment="Terminal Toolbox 新增")
+                                    comment="tb: Terminal Toolbox 新增")
             label = key
         if not forms.confirm(
                 self, "确认新增",

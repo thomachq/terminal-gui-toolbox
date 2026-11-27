@@ -330,6 +330,54 @@ def remove_raw(text: str, raw: str) -> str:
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
+def replace_raw(text: str, raw: str, new_line: str) -> str:
+    """把目标行换成新行（整行精确匹配），找不到就原样返回（R-003 编辑）。
+
+    保留两样东西：原行的缩进、原行的注释状态 —— 编辑一条**已停用**的任务
+    不该把它偷偷启用；停用/启用是「启用 / 停用」按钮的事，两件事分开。
+    """
+    hit = _find_raw_line(text, raw)
+    if hit is None:
+        return text
+    idx, line = hit
+    lines = (text or "").splitlines()
+    indent = line[:len(line) - len(line.lstrip())]
+    was_comment = line.strip().startswith("#")
+    body = str(new_line or "").strip()
+    lines[idx] = indent + ("# " + body if was_comment else body)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def build_job_line(schedule: str, command: str, user: str = "") -> str:
+    """拼一条 cron 行。系统级（/etc/crontab、cron.d）才插用户列。"""
+    sp = str(schedule or "").split()
+    if user and len(sp) == 5:
+        return " ".join(sp[:5]) + f" {user} {command}"
+    return f"{schedule} {command}"
+
+
+def backup_cmd(key: str, stamp: str) -> str:
+    """写前备份命令（R-003 规矩一：**不备份就不写**）。
+
+    成功时最后一行 echo 出备份文件路径（界面拿它写日志、给回滚命令）；
+    用户 crontab 原本不存在时输出空 —— 那是「没东西可备」，不是失败。
+    """
+    if key == "crontab":
+        return (f'f="$HOME/.crontab.tb-backup.{stamp}"; '
+                f'if crontab -l > "$f" 2>/dev/null; then echo "$f"; fi')
+    q = shlex.quote(key)
+    return f"cp -p {q} {q}.tb-backup.{stamp} && echo {q}.tb-backup.{stamp}"
+
+
+def rollback_hint(key: str, backup_path: str) -> str:
+    """写坏之后怎么回去 —— 给人话，不给「请自行恢复」。"""
+    if not backup_path:
+        return "（这次没有备份文件：写前原本就没有这份 crontab）"
+    if key == "crontab":
+        return f"crontab {shlex.quote(backup_path)}"
+    return f"cp -p {shlex.quote(backup_path)} {shlex.quote(key)}"
+
+
 def append_job(text: str, schedule: str, command: str,
                user: str = "", comment: str = "") -> str:
     base = (text or "").rstrip("\n")

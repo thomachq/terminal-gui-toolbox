@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 import wbtui as U
+from core import batchrun as B
 from core import scripts as S
 from ui import forms
 from ui.table import Column, DataTable
@@ -36,6 +37,9 @@ class ScriptPage:
         U.RoundButton(bar, "＋ 新建脚本", self.script_add, variant="primary",
                       font=U.FONT_S, height=30, padx=13).pack(side="left")
         U.RoundButton(bar, "运行", self.script_run_pick, variant="secondary",
+                      font=U.FONT_S, height=30, padx=12).pack(side="left",
+                                                               padx=(U.px(6), 0))
+        U.RoundButton(bar, "批量执行", self.script_batch_pick, variant="secondary",
                       font=U.FONT_S, height=30, padx=12).pack(side="left",
                                                                padx=(U.px(6), 0))
         U.RoundButton(bar, "刷新", self.script_refresh, variant="ghost",
@@ -66,6 +70,7 @@ class ScriptPage:
         self.tbl_script.grid(row=1, column=0, sticky="nsew")
         self.tbl_script.set_menu([
             ("运行", lambda: self.script_run(self._script_pick()), None),
+            ("批量执行（多台对比）", lambda: self.script_batch(self._script_pick()), None),
             ("查看内容", lambda: self.script_view(self._script_pick()), None),
             (None, None, None),
             ("编辑", lambda: self.script_edit(self._script_pick()), None),
@@ -190,6 +195,166 @@ class ScriptPage:
             self, f"脚本输出 · {name}",
             body, subtitle=f"退出码 {rc}" + (f" · {dev}" if dev else ""),
             width=900, height=560)
+
+    # ================================================================ 批量执行
+    def script_batch_pick(self) -> None:
+        self.script_batch(self._script_pick())
+
+    def script_batch(self, rec: dict) -> None:
+        """选脚本 + 多台已连接主机 → 并发跑 → 汇总对比（R-005）。
+
+        目标只取**已连接**的设备：新建连接要凭据、可能弹 UAC，不能藏在
+        「批量运行」里偷偷发生。要加主机，先去主机页连上。
+        """
+        if not rec:
+            self.toast("先选一个脚本", "warn")
+            return
+        if self._script_busy:
+            self.toast("上一个脚本还在跑", "warn")
+            return
+        slots = [sl for sl in self.sessions.slots() if sl.alive()]
+        if len(slots) < 2:
+            self.toast("批量执行至少要连上两台主机（先去主机页连接）", "warn")
+            return
+        picked = self._batch_pick_hosts(slots)
+        if not picked:
+            return
+        name = str(rec.get("name") or "脚本")
+        cmd = S.shell_cmd(dict(rec))
+        labels = "、".join(sl.label for sl in picked)
+        if not forms.confirm(
+                self, "批量执行",
+                f"在 {len(picked)} 台主机上运行「{name}」：\n\n{labels}\n\n"
+                f"{S.preview(rec.get('body'), 80)}\n\n"
+                "这会真的在每台机器上跑一遍，可能产生副作用。继续？",
+                danger=True, ok_text="执行"):
+            return
+        self._script_busy = True
+        self.toast(f"正在 {len(picked)} 台主机上运行：{name}…", "info")
+        self._audit("script.batch", "info",
+                    f"批量运行「{name}」× {len(picked)} 台", labels)
+        targets = [(sl.label, sl.sid, sl.session) for sl in picked]
+
+        def work():
+            results = B.run_batch(targets, cmd, timeout=180)
+            self.after(0, lambda: self._batch_done(name, results))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _batch_pick_hosts(self, slots: list) -> list:
+        """勾选要跑的主机（默认全选）。返回选中的 slot 列表。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("选择主机")
+        dlg.configure(bg=U.T.page)
+        dlg.transient(self)
+        dlg.grab_set()
+        wrap = U.wframe(dlg, "page")
+        wrap.pack(fill="both", expand=True, padx=U.px(18), pady=U.px(16))
+        U.wlabel(wrap, "在哪几台上跑？（只列已连接的设备）", "page",
+                 U.FONT_B).pack(anchor="w")
+        box = U.wframe(wrap, "page")
+        box.pack(fill="both", expand=True, pady=(U.px(10), 0))
+        vars_: list[tuple[tk.BooleanVar, object]] = []
+        for sl in slots:
+            v = tk.BooleanVar(value=True)
+            host = getattr(sl.device, "host", "") or ""
+            text = sl.label + (f"（{host}）" if host and host not in sl.label else "")
+            tk.Checkbutton(box, text=text, variable=v, bg=U.T.page,
+                           fg=U.T.text, activebackground=U.T.page,
+                           selectcolor=U.T.card, font=U.FONT_S,
+                           anchor="w").pack(fill="x", pady=U.px(2))
+            vars_.append((v, sl))
+        out: list = []
+
+        def ok():
+            out.extend(sl for v, sl in vars_ if v.get())
+            dlg.destroy()
+
+        btns = U.wframe(wrap, "page")
+        btns.pack(fill="x", pady=(U.px(14), 0))
+        U.RoundButton(btns, "取消", dlg.destroy, variant="ghost",
+                      font=U.FONT_S, height=30, padx=12).pack(side="right")
+        U.RoundButton(btns, "下一步", ok, variant="primary",
+                      font=U.FONT_S, height=30, padx=14).pack(
+                          side="right", padx=(0, U.px(6)))
+        dlg.geometry(f"+{self.winfo_rootx() + 120}+{self.winfo_rooty() + 120}")
+        dlg.wait_window()
+        return out
+
+    def _batch_done(self, name: str, results: list) -> None:
+        self._script_busy = False
+        cmp_ = B.compare(results)
+        n_fail = sum(1 for r in results if not r.ok)
+        self._audit("script.batch", "ok" if not n_fail else "fail",
+                    f"批量「{name}」：{cmp_['summary']}",
+                    "、".join(r.label for r in results))
+        for r in results:
+            try:
+                self._log_raw("out" if r.ok else "bad",
+                              f"[批量] {name} @ {r.label} → rc={r.rc}\n{r.body}\n")
+            except (AttributeError, tk.TclError):
+                pass
+        self.toast(f"批量执行结束：{cmp_['summary']}",
+                   "ok" if not n_fail else "err")
+        self._batch_result_dialog(name, results, cmp_)
+
+    def _batch_result_dialog(self, name: str, results: list, cmp_: dict) -> None:
+        """结果矩阵：一台一行，相同绿 / 不同黄 / 失败红；双击看全文。"""
+        dlg = tk.Toplevel(self)
+        dlg.title(f"批量结果 · {name}")
+        dlg.configure(bg=U.T.page)
+        dlg.transient(self)
+        wrap = U.wframe(dlg, "page")
+        wrap.pack(fill="both", expand=True, padx=U.px(18), pady=U.px(16))
+        U.wlabel(wrap, cmp_["summary"], "page", U.FONT_B).pack(anchor="w")
+        U.wlabel(wrap, "绿＝与他机一致 · 黄＝输出不同 · 红＝失败 · 双击看完整输出",
+                 "dim", U.FONT_XS).pack(anchor="w", pady=(U.px(2), U.px(8)))
+        cols = ("host", "rc", "ms", "state", "preview")
+        tree = ttk.Treeview(wrap, columns=cols, show="headings", height=10)
+        for cid, text, w, anchor in (
+                ("host", "主机", 180, "w"), ("rc", "退出码", 70, "center"),
+                ("ms", "耗时", 80, "e"), ("state", "对比", 90, "center"),
+                ("preview", "输出预览", 420, "w")):
+            tree.heading(cid, text=text)
+            tree.column(cid, width=w, anchor=anchor,
+                        stretch=(cid == "preview"))
+        state_cn = {"same": "一致", "diff": "不同", "fail": "失败"}
+        for r in results:
+            st = cmp_["status"].get(r.sid or r.label, "fail")
+            prev = (r.out or r.err or r.error or "").strip().splitlines()
+            tree.insert("", "end", iid=r.sid or r.label,
+                        values=(r.label, r.rc, f"{r.ms} ms", state_cn[st],
+                                prev[0][:120] if prev else "(没有输出)"),
+                        tags=(st,))
+        tree.tag_configure("same", foreground="#2e7d32")
+        tree.tag_configure("diff", foreground="#b26a00")
+        tree.tag_configure("fail", foreground="#c62828")
+        tree.pack(fill="both", expand=True)
+
+        def show_full(_e=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            r = next((x for x in results if (x.sid or x.label) == sel[0]), None)
+            if r is not None:
+                forms.InfoDialog(dlg, f"输出 · {r.label}", r.body,
+                                 subtitle=f"退出码 {r.rc} · {r.ms} ms",
+                                 width=860, height=520)
+
+        tree.bind("<Double-1>", show_full)
+        btns = U.wframe(wrap, "page")
+        btns.pack(fill="x", pady=(U.px(12), 0))
+        U.RoundButton(btns, "关闭", dlg.destroy, variant="ghost",
+                      font=U.FONT_S, height=30, padx=12).pack(side="right")
+        U.RoundButton(btns, "逐行对比", lambda: forms.InfoDialog.show(
+            dlg, "逐行对比", B.diff_report(results), width=900, height=520),
+            variant="secondary", font=U.FONT_S, height=30, padx=12).pack(
+                side="right", padx=(0, U.px(6)))
+        U.RoundButton(btns, "看选中主机全文", show_full, variant="secondary",
+                      font=U.FONT_S, height=30, padx=12).pack(
+                          side="right", padx=(0, U.px(6)))
+        dlg.geometry(f"{U.px(900)}x{U.px(520)}"
+                     f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
 
     # ================================================================ 增删改
     def script_add(self) -> None:
