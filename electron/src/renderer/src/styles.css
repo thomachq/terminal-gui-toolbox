@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #0b0f19;
+  color: #e5e7eb;
+  overflow: hidden;
+}
+
+.xterm { height: 100%; padding: 12px 14px; }
+.xterm .xterm-viewport { background: transparent !important; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }

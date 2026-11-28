@@ -57,3 +57,8 @@ _shots/
 /bin/*.exe
 /bin/*.dll
 /bin/NOTICE-*.txt
+
+# ── Electron 外壳：仓库只放源码，依赖与构建产物不提交 ──
+electron/node_modules/
+electron/out/
+electron/package-lock.json

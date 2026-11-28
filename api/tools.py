@@ -99,6 +99,10 @@ TOOLS = [
      "desc": "删文件/目录 {path, dir?}"},
     {"m": "POST", "path": "/v1/tools/files/rename",
      "desc": "改名/移动 {path, to}"},
+    {"m": "GET", "path": "/v1/tools/core/catalog",
+     "desc": "core 函数白名单清单（Electron 全功能迁移适配层）"},
+    {"m": "POST", "path": "/v1/tools/core",
+     "desc": "调白名单 core 函数 {name, args, session?}"},
     {"m": "GET", "path": "/v1/hosts",
      "desc": "本机档案里的设备清单（不含口令），便于按名字连接"},
 ]
@@ -180,6 +184,24 @@ class ToolKit:
 
         if name == "files":
             return self._files(method, parts[1:], qs, body)
+
+        # core 函数白名单桥（Electron 全功能迁移用；core 一行不重写）
+        if name == "core":
+            from api import corebridge as CB
+            if method == "GET" and parts[1:2] == ["catalog"]:
+                return 200, CB.catalog()
+            if method == "POST" and len(parts) == 1:
+                try:
+                    res = CB.call(str(body.get("name") or ""),
+                                  body.get("args") or {},
+                                  self._conn(qs, body) if _q(qs, "session")
+                                  or body.get("session") else None)
+                except KeyError as e:
+                    raise _Fail(404, str(e))
+                except (TypeError, ValueError) as e:
+                    raise _Fail(400, str(e))
+                return 200, {"ok": True, "result": res}
+            raise _Fail(405, "core 桥只支持 GET catalog / POST")
 
         raise _Fail(404, f"没有这个工具：{name or '(空)'}",
                     "GET /v1/tools 看完整能力清单")
