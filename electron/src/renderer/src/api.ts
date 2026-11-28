@@ -58,6 +58,16 @@ export const api = {
     call<{ ok: boolean; result: T }>('POST', '/v1/tools/core',
       session ? { name, args, session } : { name, args }),
 
+  // 通用实体 CRUD（档案/凭证/脚本/代理/审计）
+  storeList: <T = Record<string, unknown>>(entity: string) =>
+    call<Record<string, T[] | number>>('GET', `/v1/tools/store/${entity}`),
+  storeGet: <T = Record<string, unknown>>(entity: string, key: string) =>
+    call<{ record: T }>('GET', `/v1/tools/store/${entity}/get?key=${encodeURIComponent(key)}`),
+  storeUpsert: (entity: string, rec: Record<string, unknown>) =>
+    call<{ ok: boolean; key: string }>('POST', `/v1/tools/store/${entity}`, rec),
+  storeRemove: (entity: string, key: string) =>
+    call<{ ok: boolean }>('DELETE', `/v1/tools/store/${entity}?key=${encodeURIComponent(key)}`),
+
   // 常用 tools 端点
   sysinfo: (session?: string) =>
     call<Record<string, unknown>>('GET', `/v1/tools/sysinfo${session ? `?session=${session}` : ''}`),

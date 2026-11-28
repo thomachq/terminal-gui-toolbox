@@ -5,6 +5,10 @@ import { Sidebar, type Page } from './components/Sidebar'
 import { ConnectionsPage } from './pages/ConnectionsPage'
 import { TerminalPage } from './pages/TerminalPage'
 import { FeaturePage } from './pages/FeaturePage'
+import { HostsPage } from './pages/HostsPage'
+import { ScriptsPage } from './pages/ScriptsPage'
+import { CronPage } from './pages/CronPage'
+import { EntityPage } from './pages/EntityPage'
 import { LIGHT, DARK, applyTheme } from './theme'
 
 export default function App() {
@@ -92,6 +96,25 @@ export default function App() {
                 先在「连接」页连一台设备
               </div>
             )
+          ) : page === '主机管理' ? (
+            <HostsPage sessions={sessions} onConnect={() => {}} reloadSessions={reload} />
+          ) : page === '脚本库' ? (
+            <ScriptsPage sessions={sessions} />
+          ) : page === '计划任务' ? (
+            <CronPage sid={active} sessions={sessions} />
+          ) : page === '凭证管理' ? (
+            <EntityPage entity="creds" title="凭证管理"
+              fields={[{ key: 'id', label: 'ID' }, { key: 'name', label: '名称' },
+                { key: 'kind', label: '类型', options: ['password', 'key'] },
+                { key: 'user', label: '用户' }, { key: 'secret', label: '密钥/口令', type: 'password' },
+                { key: 'note', label: '备注' }]} />
+          ) : page === '代理池' ? (
+            <EntityPage entity="proxies" title="代理池"
+              fields={[{ key: 'id', label: 'ID' }, { key: 'name', label: '名称' },
+                { key: 'kind', label: '类型', options: ['socks5', 'http', 'ssh'] },
+                { key: 'host', label: '主机' }, { key: 'port', label: '端口' },
+                { key: 'user', label: '用户' }, { key: 'cred_id', label: '凭证 ID' },
+                { key: 'parent_id', label: '上级代理' }, { key: 'note', label: '备注' }]} />
           ) : (
             <FeaturePage name={page} sid={active} />
           )}

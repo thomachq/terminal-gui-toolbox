@@ -77,6 +77,16 @@ def main():
         st, sess = req(port, "GET", "/v1/sessions", token)
         chk(st == 200 and any(x.get("id") == sid for x in sess.get("sessions", [])),
             "会话出现在列表里")
+        # 通用实体 CRUD 桥
+        st, ents = req(port, "GET", "/v1/tools/store", token)
+        chk(st == 200 and len(ents.get("entities", [])) == 5, "store 列出 5 个实体")
+        for entity in ("hosts", "creds", "scripts", "proxies", "audit"):
+            st, lst = req(port, "GET", f"/v1/tools/store/{entity}", token)
+            chk(st == 200 and isinstance(lst.get(entity), list),
+                f"store/{entity} 读到真实数据", f"{lst.get('count')} 条")
+        st, r = req(port, "GET", "/v1/tools/store/creds/get?key=__none__", token)
+        chk(st == 404, "不存在的记录返回 404")
+
         # core 白名单桥（Electron 全功能迁移的适配层）
         st, cat = req(port, "GET", "/v1/tools/core/catalog", token)
         chk(st == 200 and cat.get("count", 0) >= 50,

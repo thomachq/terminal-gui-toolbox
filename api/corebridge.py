@@ -33,8 +33,11 @@ REGISTRY: dict[str, tuple[str, str, bool, str]] = {
     "cron.replace_raw":      ("cronjob", "replace_raw", False, "替换一行 cron"),
     "cron.build_line":       ("cronjob", "build_job_line", False, "构造 cron 行"),
     "cron.backup_cmd":       ("cronjob", "backup_cmd", False, "写前备份命令"),
+    "cron.write_cmd_for":    ("cronjob", "write_cmd_for", False, "生成写回 crontab/文件的命令"),
     "cron.rollback_hint":    ("cronjob", "rollback_hint", False, "回滚命令"),
     "cron.job_id":           ("cronjob", "job_id", False, "任务稳定 ID"),
+    "cron.parse_bundle":     ("cronjob", "parse_bundle", False, "解析一次读全的输出"),
+    "cron.jobs_from_bundle": ("cronjob", "jobs_from_bundle", False, "从 bundle 构造任务列表"),
     # ---- 路由表 ----
     "routes.prefix_to_mask": ("routes", "prefix_to_mask", False, "CIDR 转掩码"),
     "routes.dst_to_net_mask":("routes", "dst_to_net_mask", False, "目标转网络/掩码"),

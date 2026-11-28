@@ -99,6 +99,8 @@ TOOLS = [
      "desc": "删文件/目录 {path, dir?}"},
     {"m": "POST", "path": "/v1/tools/files/rename",
      "desc": "改名/移动 {path, to}"},
+    {"m": "GET", "path": "/v1/tools/store/<entity>",
+     "desc": "档案/凭证/脚本/代理/审计的通用 CRUD（?key=）"},
     {"m": "GET", "path": "/v1/tools/core/catalog",
      "desc": "core 函数白名单清单（Electron 全功能迁移适配层）"},
     {"m": "POST", "path": "/v1/tools/core",
@@ -156,6 +158,14 @@ class ToolKit:
     def __init__(self, pool, data_dir):
         self.pool = pool
         self.data_dir = Path(data_dir)
+        self._stores = None   # 惰性建，避免没 data/ 时导入失败
+
+    @property
+    def stores(self):
+        if self._stores is None:
+            from api.storebridge import StoreBridge
+            self._stores = StoreBridge(self.data_dir)
+        return self._stores
 
     # ------------------------------------------------------------ 路由
     def route(self, method: str, parts: list[str], qs: dict, body: dict):
@@ -185,6 +195,10 @@ class ToolKit:
         if name == "files":
             return self._files(method, parts[1:], qs, body)
 
+        # 通用实体 CRUD（档案/凭证/脚本/代理/审计）
+        if name == "store":
+            return self._store_route(method, parts[1:], qs, body)
+
         # core 函数白名单桥（Electron 全功能迁移用；core 一行不重写）
         if name == "core":
             from api import corebridge as CB
@@ -205,6 +219,29 @@ class ToolKit:
 
         raise _Fail(404, f"没有这个工具：{name or '(空)'}",
                     "GET /v1/tools 看完整能力清单")
+
+    # ------------------------------------------------------------ 实体 CRUD
+    def _store_route(self, method, rest, qs, body):
+        entity = rest[0] if rest else ""
+        action = rest[1] if len(rest) > 1 else ""
+        try:
+            sb = self.stores
+            if not entity and method == "GET":
+                return 200, {"entities": list(("hosts", "creds", "scripts", "proxies", "audit"))}
+            if method == "GET" and not action:
+                rows = sb.tail(int(_q(qs, "limit") or 50)) if entity == "audit" else sb.list(entity)
+                return 200, {entity: rows, "count": len(rows)}
+            if method == "GET" and action == "get":
+                return 200, {"record": sb.get(entity, _q(qs, "key"))}
+            if method == "POST" and not action:
+                return 200, sb.upsert(entity, body)
+            if method == "DELETE" and not action:
+                return 200, sb.remove(entity, _q(qs, "key") or str(body.get("key") or ""))
+            raise _Fail(405, f"store 不支持 {method} /{'/'.join(rest)}")
+        except KeyError as e:
+            raise _Fail(404, str(e))
+        except (ValueError, TypeError) as e:
+            raise _Fail(400, str(e))
 
     # ------------------------------------------------------------ 连接
     def _conn(self, qs: dict, body: dict | None = None):
