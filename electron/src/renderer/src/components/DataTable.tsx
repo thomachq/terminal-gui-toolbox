@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Search } from 'lucide-react'
 
 export type Column<T> = {
@@ -16,6 +16,22 @@ export function DataTable<T extends Record<string, unknown>>({
   columns, rows, rowKey, onRowClick, selectedKey, searchKeys = [], toolbar, height = 520
 }: Props<T>) {
   const [q, setQ] = useState('')
+  const [widths, setWidths] = useState<Record<string, number>>({})
+  const colDrag = useRef<{ key: string; start: number; initial: number } | null>(null)
+
+  useEffect(() => {
+    const move = (e: MouseEvent) => {
+      if (!colDrag.current) return
+      const d = e.clientX - colDrag.current.start
+      const k = colDrag.current.key
+      setWidths((w) => ({ ...w, [k]: Math.max(60, colDrag.current!.initial + d) }))
+    }
+    const up = () => { colDrag.current = null }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+    return () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up) }
+  }, [])
+
   const filtered = useMemo(() => {
     if (!q.trim()) return rows
     const needle = q.trim().toLowerCase()
@@ -42,9 +58,19 @@ export function DataTable<T extends Record<string, unknown>>({
           <thead className="sticky top-0 z-10" style={{ background: 'var(--alt)' }}>
             <tr>
               {columns.map((c) => (
-                <th key={c.key} className="text-left font-medium px-4 py-2.5 text-xs"
-                  style={{ color: 'var(--text-dim)', borderBottom: '1px solid var(--border)', width: c.width }}>
+                <th key={c.key} className="text-left font-medium px-4 py-2.5 text-xs relative"
+                  style={{ color: 'var(--text-dim)', borderBottom: '1px solid var(--border)',
+                    width: widths[c.key] ?? c.width }}>
                   {c.title}
+                  <span
+                    onMouseDown={(e) => {
+                      e.preventDefault(); e.stopPropagation()
+                      colDrag.current = { key: c.key, start: e.clientX,
+                        initial: widths[c.key] ?? c.width ?? 120 }
+                    }}
+                    className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400"
+                    style={{ background: colDrag.current?.key === c.key ? 'var(--brand)' : 'transparent' }}
+                    title="拖动调整列宽" />
                 </th>
               ))}
             </tr>

@@ -34,7 +34,7 @@ type Props = {
 
 export function Sidebar({ page, onPage, sessions, activeLabel, dark, onTheme }: Props) {
   return (
-    <aside className="w-[132px] shrink-0 h-full flex flex-col overflow-y-auto"
+    <aside className="w-full h-full flex flex-col overflow-y-auto"
       style={{ background: 'var(--card)', borderRight: '1px solid var(--border)' }}>
       <div className="px-3 py-3 flex items-center gap-2" style={{ borderBottom: '1px solid var(--border)' }}>
         <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0" style={{ background: 'var(--brand)' }}>

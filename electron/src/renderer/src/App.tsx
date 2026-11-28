@@ -6,6 +6,7 @@ import { TopBar } from './components/TopBar'
 import { AssistantDock } from './components/AssistantDock'
 import { LogDock } from './components/LogDock'
 import { StatusBar } from './components/StatusBar'
+import { Splitter } from './components/Splitter'
 import { ConnectionsPage } from './pages/ConnectionsPage'
 import { TerminalPage } from './pages/TerminalPage'
 import { FeaturePage } from './pages/FeaturePage'
@@ -24,6 +25,9 @@ export default function App() {
   const [dark, setDark] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(true)
   const [logCollapsed, setLogCollapsed] = useState(true)
+  const [sidebarW, setSidebarW] = useState(132)
+  const [assistantW, setAssistantW] = useState(300)
+  const [logH, setLogH] = useState(176)
 
   const toggleTheme = () => {
     const next = !dark
@@ -105,13 +109,29 @@ export default function App() {
       <TopBar sessions={sessions} active={active} onActive={setActive}
         assistantOpen={assistantOpen} onAssistant={() => setAssistantOpen(!assistantOpen)} />
       <div className="flex-1 min-h-0 flex">
-        <Sidebar page={page} onPage={setPage} sessions={sessions.length}
-          activeLabel={label} dark={dark} onTheme={toggleTheme} />
+        <div style={{ width: sidebarW, flexShrink: 0 }} className="h-full">
+          <Sidebar page={page} onPage={setPage} sessions={sessions.length}
+            activeLabel={label} dark={dark} onTheme={toggleTheme} />
+        </div>
+        <Splitter dir="horizontal" size={sidebarW} onSize={setSidebarW}
+          min={104} max={280} storageKey="ttb.sidebar.width" />
         <div className="flex-1 min-w-0 flex flex-col">
           <div className="flex-1 min-h-0 overflow-auto p-5">{content()}</div>
-          <LogDock collapsed={logCollapsed} onToggle={() => setLogCollapsed(!logCollapsed)} />
+          {!logCollapsed && (
+            <Splitter dir="vertical" size={logH} onSize={setLogH}
+              min={60} max={420} storageKey="ttb.log.height" invert />
+          )}
+          <div style={logCollapsed ? undefined : { height: logH, flexShrink: 0 }}>
+            <LogDock collapsed={logCollapsed} onToggle={() => setLogCollapsed(!logCollapsed)} />
+          </div>
         </div>
-        {assistantOpen && <AssistantDock />}
+        {assistantOpen && (<>
+          <Splitter dir="horizontal" size={assistantW} onSize={setAssistantW}
+            min={240} max={560} storageKey="ttb.assistant.width" invert />
+          <div style={{ width: assistantW, flexShrink: 0 }} className="h-full">
+            <AssistantDock />
+          </div>
+        </>)}
       </div>
       <StatusBar />
     </div>

@@ -18,7 +18,7 @@ export function AssistantDock() {
   }
 
   return (
-    <aside className="w-[300px] shrink-0 flex flex-col"
+    <aside className="w-full flex flex-col"
       style={{ background: 'var(--card)', borderLeft: '1px solid var(--border)' }}>
       <div className="flex items-center gap-2 px-4 py-3" style={{ borderBottom: '1px solid var(--border)' }}>
         <div className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: 'var(--brand-soft)' }}>
