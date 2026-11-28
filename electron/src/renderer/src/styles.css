@@ -1,20 +1,38 @@
 @import "tailwindcss";
 
 :root {
-  color-scheme: dark;
+  /* 默认 = wbtui.py 的 LIGHT（clear-blue） */
+  --page: #F5F9FF; --card: #FFFFFF; --alt: #F4F8FE;
+  --border: #DCE8FF; --border2: #C9DCF7;
+  --brand: #3A66AC; --brand-deep: #22406E; --brand-hover: #4E79BE;
+  --brand-soft: #E6EFFF; --brand-soft2: #DCEAFF;
+  --text: #001F4F; --text-dim: #5B7093; --text-mute: #8A9BB5;
+  --ok: #12855C; --ok-soft: #E4F5EC;
+  --warn: #9A7412; --warn-soft: #FCF3D7;
+  --err: #D93B34; --err-soft: #FDECEB;
+  --input-bg: #FFFFFF; --input-border: #DCE8FF;
+  --console-bg: #0E1A2B; --console-fg: #D7E3F4;
+  --shadow: #E8F0FE;
   font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
 }
 
-body {
-  margin: 0;
-  background: #0b0f19;
-  color: #e5e7eb;
-  overflow: hidden;
-}
-
-.xterm { height: 100%; padding: 12px 14px; }
-.xterm .xterm-viewport { background: transparent !important; }
-
+body { margin: 0; background: var(--page); color: var(--text); overflow: hidden; }
+.xterm { height: 100%; padding: 12px 14px; background: var(--console-bg) !important; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: #334155; border-radius: 8px; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* 与原版 RoundButton / Card 对应的可复用类 */
+.tt-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border-radius: 10px; padding: 7px 14px; font-size: 13px; font-weight: 500;
+  border: 1px solid transparent; transition: all .15s; cursor: pointer;
+}
+.tt-btn-primary { background: var(--brand); color: #fff; box-shadow: 0 2px 8px rgba(58,102,172,.18); }
+.tt-btn-primary:hover { background: var(--brand-hover); }
+.tt-btn-ghost { background: var(--card); color: var(--text-dim); border-color: var(--border); }
+.tt-btn-ghost:hover { background: var(--brand-soft); color: var(--brand); }
+.tt-card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 2px 12px var(--shadow); }
+.tt-input { background: var(--input-bg); border: 1px solid var(--input-border); color: var(--text);
+  border-radius: 10px; padding: 7px 11px; font-size: 13px; outline: none; }
+.tt-input:focus { border-color: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft); }

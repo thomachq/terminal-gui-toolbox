@@ -21,17 +21,18 @@ export function TerminalPage({ sid, label }: Props) {
     const t = new XTerm({
       fontFamily: 'Cascadia Code, Consolas, monospace', fontSize: 13,
       cursorBlink: true, scrollback: 5000,
-      theme: { background: '#0b1220', foreground: '#d7dee9', cursor: '#a78bfa',
-        selectionBackground: '#5b21b655', green: '#4ade80', red: '#f87171' }
+      theme: { background: '#0E1A2B', foreground: '#D7E3F4', cursor: '#7DD3FC',
+        selectionBackground: '#3A66AC55', green: '#86EFAC', red: '#FCA5A5',
+        cyan: '#7DD3FC' }
     })
     const fit = new FitAddon()
     t.loadAddon(fit)
     t.open(host.current)
     fit.fit()
     term.current = t
-    const prompt = () => t.write(`\r\n\x1b[38;2;167;139;250m${label}\x1b[0m \x1b[38;2;52;211;153m❯\x1b[0m `)
-    t.writeln('\x1b[38;2;148;163;184mTerminal GUI Toolbox · Electron Phase 1\x1b[0m')
-    t.writeln('\x1b[38;2;100;116;139m命令式终端：每条命令走 /v1/sessions/<id>/exec，与 Tk 版行为一致\x1b[0m')
+    const prompt = () => t.write(`\r\n\x1b[38;2;125;211;252m${label}\x1b[0m \x1b[38;2;134;239;172m❯\x1b[0m `)
+    t.writeln('\x1b[38;2;143;163;191mTerminal GUI Toolbox · Electron（与经典版共用内核）\x1b[0m')
+    t.writeln('\x1b[38;2;143;163;191m命令式终端：每条命令走内核会话，与经典版行为一致\x1b[0m')
     prompt()
 
     const sub = t.onData(async (data) => {
@@ -71,17 +72,18 @@ export function TerminalPage({ sid, label }: Props) {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="h-14 shrink-0 flex items-center gap-3 px-6 border-b border-slate-800/80 bg-[#0e1420]">
-        <TerminalSquare size={17} className="text-violet-400" />
-        <span className="text-sm text-slate-200">{label}</span>
-        <span className="text-[11px] text-slate-500">{sid.slice(0, 8)}</span>
+      <div className="h-14 shrink-0 flex items-center gap-3 px-6"
+        style={{ background: 'var(--card)', borderBottom: '1px solid var(--border)' }}>
+        <TerminalSquare size={17} style={{ color: 'var(--brand)' }} />
+        <span className="text-sm font-medium" style={{ color: 'var(--text)' }}>{label}</span>
+        <span className="text-[11px]" style={{ color: 'var(--text-mute)' }}>{sid.slice(0, 8)}</span>
         {disconnected && (
-          <span className="ml-auto flex items-center gap-1.5 text-xs text-red-400">
+          <span className="ml-auto flex items-center gap-1.5 text-xs" style={{ color: 'var(--err)' }}>
             <CircleAlert size={14} /> 会话已断开，请回连接页重连
           </span>
         )}
       </div>
-      <div ref={host} className="flex-1 min-h-0 bg-[#0b1220]" />
+      <div ref={host} className="flex-1 min-h-0" style={{ background: 'var(--console-bg)' }} />
     </div>
   )
 }
