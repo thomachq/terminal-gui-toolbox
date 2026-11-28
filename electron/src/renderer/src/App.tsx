@@ -15,6 +15,7 @@ import { ScriptsPage } from './pages/ScriptsPage'
 import { CronPage } from './pages/CronPage'
 import { EntityPage } from './pages/EntityPage'
 import { LIGHT, DARK, applyTheme } from './theme'
+import { ALL_PAGES } from './components/Sidebar'
 
 export default function App() {
   const [ready, setReady] = useState(false)
@@ -37,6 +38,16 @@ export default function App() {
   useEffect(() => {
     const d = localStorage.getItem('ttb-theme') === 'dark'
     setDark(d); applyTheme(d ? DARK : LIGHT)
+  }, [])
+
+  useEffect(() => {
+    window.ttb.onMenu((action) => {
+      if ((ALL_PAGES as readonly string[]).includes(action)) {
+        setPage(action as Page)
+      } else if (action === '关于') {
+        window.alert('Terminal GUI Toolbox v1.0.40\nElectron 外壳 · Python 内核（与经典版共用数据）')
+      }
+    })
   }, [])
 
   const reload = useCallback(async () => {

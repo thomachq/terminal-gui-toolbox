@@ -12,6 +12,7 @@ declare global {
     ttb: {
       config: () => Promise<Config>
       openClassic: () => Promise<{ ok: boolean; error?: string }>
+      onMenu: (fn: (action: string) => void) => void
     }
   }
 }

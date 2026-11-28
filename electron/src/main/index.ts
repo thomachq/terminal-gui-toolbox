@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu } from 'electron'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -37,7 +37,10 @@ function startBridge(): Promise<BridgeInfo> {
       return
     }
     const child = spawn(pythonExe(), [bridgeScript], {
-      cwd: repoRoot, env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      cwd: repoRoot,
+      // 显式告诉桥去读用户真实在用的数据目录（与经典版同一份档案）
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8',
+             TB_DATA_DIR: process.env.TTB_DATA_DIR || 'D:\\Tools\\Terminal-GUI-Toolbox\\data' },
       stdio: ['ignore', 'pipe', 'pipe']
     })
     bridge = child
@@ -111,7 +114,48 @@ ipcMain.handle('ttb:open-classic', () => {
   return { ok: true }
 })
 
+/** 中文菜单：替换 Electron 默认的 File/Edit/View/Window/Help 英文菜单栏。 */
+function installChineseMenu(): void {
+  const send = (action: string) => {
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('ttb:menu', action)
+  }
+  const tpl: Electron.MenuItemConstructorOptions[] = [
+    { label: '文件', submenu: [
+      { label: '连接设备', click: () => send('连接') },
+      { label: '主机管理', click: () => send('主机管理') },
+      { type: 'separator' },
+      { label: '退出', accelerator: 'Alt+F4', role: 'quit' }
+    ] },
+    { label: '编辑', submenu: [
+      { label: '撤销', accelerator: 'Ctrl+Z', role: 'undo' },
+      { label: '重做', accelerator: 'Ctrl+Y', role: 'redo' },
+      { type: 'separator' },
+      { label: '复制', accelerator: 'Ctrl+C', role: 'copy' },
+      { label: '粘贴', accelerator: 'Ctrl+V', role: 'paste' },
+      { label: '全选', accelerator: 'Ctrl+A', role: 'selectAll' }
+    ] },
+    { label: '视图', submenu: [
+      { label: '连接页', click: () => send('连接') },
+      { label: '终端页', click: () => send('终端') },
+      { label: '脚本库', click: () => send('脚本库') },
+      { label: '计划任务', click: () => send('计划任务') },
+      { type: 'separator' },
+      { label: '刷新', accelerator: 'F5', role: 'reload' },
+      { label: '开发者工具', accelerator: 'F12', role: 'toggleDevTools' }
+    ] },
+    { label: '窗口', submenu: [
+      { label: '最小化', role: 'minimize' },
+      { label: '关闭', role: 'close' }
+    ] },
+    { label: '帮助', submenu: [
+      { label: '关于', click: () => send('关于') }
+    ] }
+  ]
+  Menu.setApplicationMenu(Menu.buildFromTemplate(tpl))
+}
+
 app.whenReady().then(() => {
+  installChineseMenu()
   createWindow().catch((e) => console.error('启动失败', e))
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow().catch(() => {})
